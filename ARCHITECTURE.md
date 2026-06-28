@@ -113,4 +113,19 @@ The goal is 80%-grunt-work → 20%-review, fully auditable — not zero-human.
 ## Build status
 - **Phase 1 front door** — built (`index.js`): folder pipeline, reuse engine,
   generate + optional local-JMeter run/validate.
-- **Phases 2-5 hardening** — specced above; layered on next.
+- **Phase 2 local runner** — built (`src/runner.js`): config-driven `--run`
+  with credentials / data files / target over the reused `runFeedbackLoop`;
+  emits a GREEN/needs-attention verdict. Engine untouched.
+- **Phase 3 hardening** — built (`src/generate.js`, the local app's own
+  generation so it can inject what the orchestrator can't):
+  - 3a/3b **state pollution** — discover user-input fields, synthesize a
+    unique-per-row pool, wire a CSV Data Set (`_data.csv`, `_parameters.json`).
+  - 3c **ghost sources** — surfaced; the JMeter renderer already rewrites
+    client-minted values inline (`${__UUID}`/`${__time}`/…). Report +
+    `_ghosts.json`.
+  - 3d **cookie-jar** — already handled by the engine (Cookie Manager emitted +
+    correlation covers cookies it can't carry). **Elastic polling** — detected
+    + reported (`_polling.json`); auto-emitting a While Controller needs engine
+    IR/renderer support (deferred to avoid disturbing the current app).
+- **Phases 4-5** — Gemini escalation + headless verify (`--run` already does a
+  bounded headless loop); LLM escalation for un-repaired failures is next.

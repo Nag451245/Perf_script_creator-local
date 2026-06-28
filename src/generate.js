@@ -27,6 +27,35 @@ const { suggestParameterizations } = E.paramAdvisor;
 const { synthesizeCsv } = E.dataSynth;
 const { detectClientSideDynamic } = E.clientSide;
 
+// Elastic polling (blueprint #3): a run of >=3 consecutive requests to the same
+// method+path (query stripped, so cache-busted poll URLs still match) is a
+// poll loop. The engine can't yet EMIT a While Controller (no renderer support,
+// and adding it would touch the current app), so we detect + report with a
+// termination hint for the user to wrap manually.
+function detectPolling(flat) {
+    const keyOf = (e) => {
+        let p = e.request?.url || '';
+        try { p = new URL(e.request.url).pathname; } catch { /* keep raw */ }
+        return `${(e.request?.method || 'GET').toUpperCase()} ${p}`;
+    };
+    const keys = flat.map(keyOf);
+    const groups = [];
+    let i = 0;
+    while (i < keys.length) {
+        let j = i;
+        while (j + 1 < keys.length && keys[j + 1] === keys[i]) j++;
+        const count = j - i + 1;
+        if (count >= 3) {
+            groups.push({
+                endpoint: keys[i], count,
+                hint: 'Wrap these in a While Controller that exits when the terminal state appears in the response (status/done/ready flag).',
+            });
+        }
+        i = j > i ? j + 1 : i + 1;
+    }
+    return groups;
+}
+
 function generate(entriesRaw, pages, outDir, name, { dataRows = 10 } = {}) {
     fs.mkdirSync(outDir, { recursive: true });
 
@@ -65,6 +94,10 @@ function generate(entriesRaw, pages, outDir, name, { dataRows = 10 } = {}) {
     const serverOrigin = new Set(corrs.map(c => c.value).filter(Boolean));
     const ghosts = detectClientSideDynamic(flat, serverOrigin) || [];
     if (ghosts.length) fs.writeFileSync(path.join(outDir, `${name}_ghosts.json`), JSON.stringify(ghosts, null, 2));
+
+    // Elastic polling loops (advisory — see detectPolling).
+    const polling = detectPolling(flat);
+    if (polling.length) fs.writeFileSync(path.join(outDir, `${name}_polling.json`), JSON.stringify(polling, null, 2));
 
     // 4. Parameterization + unique data (state-pollution defense). Discover
     //    user-input fields, synthesize a multi-row pool, wire one CSV Data Set.
@@ -105,11 +138,11 @@ function generate(entriesRaw, pages, outDir, name, { dataRows = 10 } = {}) {
     fs.writeFileSync(jmxPath, xml);
 
     return {
-        jmxPath, flat, csvFile, candidates, ghosts,
+        jmxPath, flat, csvFile, candidates, ghosts, polling,
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
             correlations: corrs.length, parameterized: params.length,
-            clientSideGhosts: ghosts.length,
+            clientSideGhosts: ghosts.length, pollingLoops: polling.length,
             samplers: vr.totalSamplers, extractors: vr.totalExtractors, orphans: vr.orphanReferences.length,
         },
     };

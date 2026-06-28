@@ -1,0 +1,1 @@
+{ "jmeterHome": "D:/apache-jmeter-5.6.3", "maxIterations": 1, "run": { "credentials": { "username": "demo", "password": "pw" } } }

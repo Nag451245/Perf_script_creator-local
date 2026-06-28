@@ -22,7 +22,8 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { HarParser, orchestrator, jmeterDetector, recordingXml } = require('./src/engine');
+const { HarParser, orchestrator, recordingXml } = require('./src/engine');
+const { runValidate } = require('./src/runner');
 
 const ROOT = __dirname;
 const INPUT = path.join(ROOT, 'input');
@@ -93,25 +94,27 @@ async function processHar(file) {
     } catch (e) { rec(`recording.xml skipped: ${e.message}`); }
 
     if (DO_RUN) {
-        const jmeterBinPath = jmeterDetector.detect();
-        if (!jmeterBinPath) {
-            rec('JMeter not found — set JMETER_HOME or add jmeter to PATH. Falling back to generate-only.');
-        } else {
-            rec(`JMeter: ${jmeterBinPath} — running bounded feedback loop (max ${MAX_ITER})…`);
-            try {
-                const result = await orchestrator.runAgent({
-                    entries, pages, jmeterBinPath, maxIterations: MAX_ITER,
-                    outputDir: outDir, sourceName: name,
-                    onIteration: (s) => rec(`  [iter] ${JSON.stringify(s).slice(0, 200)}`),
-                });
-                fs.writeFileSync(path.join(outDir, `${name}_report.json`), JSON.stringify(result, null, 2));
-                rec(`DONE — success=${result.success} iterations=${result.iterationsRun} ` +
-                    `passed/failed not shown here; see report.json`);
+        try {
+            rec(`running bounded feedback loop (max ${MAX_ITER})…`);
+            const out = await runValidate({
+                entries, pages, outDir, name,
+                runCfg: CONFIG.run || {},
+                maxIterations: MAX_ITER,
+                onLog: rec,
+            });
+            if (!out.ok) {
+                rec(`cannot run: ${out.error} — falling back to generate-only.`);
+            } else {
+                fs.writeFileSync(path.join(outDir, `${name}_report.json`), JSON.stringify(out.result, null, 2));
+                const reqs = (out.result.samples || []).filter(s => !s.isTransaction);
+                const passed = reqs.filter(s => s.success).length;
+                rec(`DONE — verdict=${out.result.success ? 'GREEN' : 'needs attention'} · ` +
+                    `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
                 return;
-            } catch (e) {
-                rec(`feedback loop error: ${e.message} — falling back to generate-only.`);
             }
+        } catch (e) {
+            rec(`feedback loop error: ${e.message} — falling back to generate-only.`);
         }
     }
 

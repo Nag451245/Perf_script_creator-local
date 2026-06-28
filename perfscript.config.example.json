@@ -1,7 +1,8 @@
 {
   "_comment": "Copy to perfscript.config.json (gitignored) and fill in. All optional.",
 
-  "jmeterHome": "D:\\apache-jmeter-5.6.3",
+  "_jmeterHome_note": "Use forward slashes (valid in JSON + Node on Windows).",
+  "jmeterHome": "D:/apache-jmeter-5.6.3",
   "maxIterations": 3,
 
   "gemini": {

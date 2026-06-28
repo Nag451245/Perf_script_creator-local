@@ -25,6 +25,7 @@ const udvInjector = E.req('src/modules/udv-injector');
 const { filterForGeneration } = E.req('src/modules/correlation-relevance');
 const { suggestParameterizations } = E.paramAdvisor;
 const { synthesizeCsv } = E.dataSynth;
+const { detectClientSideDynamic } = E.clientSide;
 
 function generate(entriesRaw, pages, outDir, name, { dataRows = 10 } = {}) {
     fs.mkdirSync(outDir, { recursive: true });
@@ -55,6 +56,15 @@ function generate(entriesRaw, pages, outDir, name, { dataRows = 10 } = {}) {
         gbp.get(pid).push(e);
     }
     const groups = order.map(pid => ({ name: (pageById.get(pid)?.title) || 'Transaction', type: 'transaction', entries: gbp.get(pid) }));
+
+    // Ghost sources (blueprint #2): client-minted values (UUID/timestamp/trace/
+    // cache-buster) with no server origin. The JMeter renderer ALREADY rewrites
+    // these inline (guid->${__UUID}, _=->${__time}, …), so this only surfaces
+    // them for the report — pass correlated values as server-origin so already-
+    // correlated dynamics aren't mislabeled as ghosts.
+    const serverOrigin = new Set(corrs.map(c => c.value).filter(Boolean));
+    const ghosts = detectClientSideDynamic(flat, serverOrigin) || [];
+    if (ghosts.length) fs.writeFileSync(path.join(outDir, `${name}_ghosts.json`), JSON.stringify(ghosts, null, 2));
 
     // 4. Parameterization + unique data (state-pollution defense). Discover
     //    user-input fields, synthesize a multi-row pool, wire one CSV Data Set.
@@ -95,10 +105,11 @@ function generate(entriesRaw, pages, outDir, name, { dataRows = 10 } = {}) {
     fs.writeFileSync(jmxPath, xml);
 
     return {
-        jmxPath, flat, csvFile, candidates,
+        jmxPath, flat, csvFile, candidates, ghosts,
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
             correlations: corrs.length, parameterized: params.length,
+            clientSideGhosts: ghosts.length,
             samplers: vr.totalSamplers, extractors: vr.totalExtractors, orphans: vr.orphanReferences.length,
         },
     };

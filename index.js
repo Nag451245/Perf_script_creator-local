@@ -125,7 +125,7 @@ async function processHar(file) {
         fs.writeFileSync(path.join(outDir, `${name}_report.json`), JSON.stringify(gen.stats, null, 2));
         rec(`generated JMX — ${gen.stats.samplers} samplers, ${gen.stats.correlations} correlations, ` +
             `${gen.stats.parameterized} parameterized field(s)${gen.csvFile ? ` → ${gen.csvFile}` : ''}, ` +
-            `${gen.stats.orphans} orphan(s)`);
+            `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ${gen.stats.orphans} orphan(s)`);
     } catch (e) {
         rec(`GENERATE FAILED: ${e.message}`);
     }

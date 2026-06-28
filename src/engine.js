@@ -36,4 +36,5 @@ module.exports = {
     stripListenerFilenames: eng('src/modules/strip-listener-filenames').stripListenerFilenames,
     paramAdvisor: eng('src/modules/parameterization-advisor'), // { suggestParameterizations }
     dataSynth: eng('src/modules/test-data-synthesizer'),       // { synthesizeCsv, classifyValue, ... }
+    clientSide: eng('src/modules/client-side-detector'),       // { detectClientSideDynamic, ... }
 };

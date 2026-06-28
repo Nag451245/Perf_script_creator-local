@@ -33,4 +33,6 @@ module.exports = {
     jmeterDetector: eng('src/services/jmeter-detector'),   // { detect, getInfo, ... }
     recordingXml: eng('src/modules/recording-xml-generator'), // { generate }
     stripListenerFilenames: eng('src/modules/strip-listener-filenames').stripListenerFilenames,
+    paramAdvisor: eng('src/modules/parameterization-advisor'), // { suggestParameterizations }
+    dataSynth: eng('src/modules/test-data-synthesizer'),       // { synthesizeCsv, classifyValue, ... }
 };

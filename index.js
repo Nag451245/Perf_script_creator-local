@@ -22,7 +22,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { HarParser, orchestrator, recordingXml } = require('./src/engine');
+const { HarParser, orchestrator, recordingXml, paramAdvisor, dataSynth } = require('./src/engine');
 const { runValidate } = require('./src/runner');
 
 const ROOT = __dirname;
@@ -92,6 +92,22 @@ async function processHar(file) {
         );
         rec('wrote recording.xml');
     } catch (e) { rec(`recording.xml skipped: ${e.message}`); }
+
+    // State-pollution defense (blueprint #1): discover user-input fields and
+    // synthesize a UNIQUE-per-row data pool so iterative replays don't collide
+    // on 409s (one row's data per virtual user / iteration). Reuses the engine's
+    // advisor + synthesizer; emitted as artifacts for review/wiring.
+    try {
+        const candidates = paramAdvisor.suggestParameterizations(entries) || [];
+        if (candidates.length) {
+            const vars = candidates.map(c => ({ name: c.name, sample: c.value }));
+            fs.writeFileSync(path.join(outDir, `${name}_data.csv`), dataSynth.synthesizeCsv(vars, 10));
+            fs.writeFileSync(path.join(outDir, `${name}_parameters.json`), JSON.stringify(candidates, null, 2));
+            rec(`discovered ${candidates.length} data field(s) → wrote ${name}_data.csv (10 rows) + ${name}_parameters.json`);
+        } else {
+            rec('no user-input data fields discovered');
+        }
+    } catch (e) { rec(`data synthesis skipped: ${e.message}`); }
 
     if (DO_RUN) {
         try {

@@ -44,6 +44,7 @@ if (CONFIG.gemini && CONFIG.gemini.apiKey && !process.env.GOOGLE_API_KEY) proces
 const { HarParser, recordingXml } = require('./src/engine');
 const { generate } = require('./src/generate');
 const { runValidate } = require('./src/runner');
+const { writeHtmlReport } = require('./src/report');
 
 const args = process.argv.slice(2);
 const DO_RUN = args.includes('--run');
@@ -105,9 +106,12 @@ async function processHar(file) {
                 fs.writeFileSync(path.join(outDir, `${name}_report.json`), JSON.stringify(out.result, null, 2));
                 const reqs = (out.result.samples || []).filter(s => !s.isTransaction);
                 const passed = reqs.filter(s => s.success).length;
-                rec(`DONE — verdict=${out.result.success ? 'GREEN' : 'needs attention'} · ` +
+                const verdict = out.result.success ? 'GREEN' : 'needs attention';
+                rec(`DONE — verdict=${verdict} · ` +
                     `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
+                writeHtmlReport(outDir, name, { mode: 'generate + run', verdict, stats: out.stats, samples: out.result.samples || [] });
+                rec(`open ${name}_report.html for a summary`);
                 return;
             }
         } catch (e) {
@@ -123,6 +127,9 @@ async function processHar(file) {
             `${gen.stats.parameterized} parameterized field(s)${gen.csvFile ? ` → ${gen.csvFile}` : ''}, ` +
             `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ` +
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
+        fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
+        writeHtmlReport(outDir, name, { mode: 'generate only', verdict: 'generated', stats: gen.stats, samples: [] });
+        rec(`open ${name}_report.html for a summary`);
     } catch (e) {
         rec(`GENERATE FAILED: ${e.message}`);
     }

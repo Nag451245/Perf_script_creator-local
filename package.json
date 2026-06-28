@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node index.js",
     "watch": "node index.js --watch",
-    "run-and-validate": "node index.js --run"
+    "run-and-validate": "node index.js --run",
+    "test": "node --test"
   },
   "engines": { "node": ">=18.0.0" }
 }

@@ -138,7 +138,7 @@ function generate(entriesRaw, pages, outDir, name, { dataRows = 10 } = {}) {
     fs.writeFileSync(jmxPath, xml);
 
     return {
-        jmxPath, flat, csvFile, candidates, ghosts, polling,
+        jmxPath, flat, csvFile, candidates, ghosts, polling, correlations: corrs,
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
             correlations: corrs.length, parameterized: params.length,

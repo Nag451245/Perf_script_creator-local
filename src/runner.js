@@ -14,6 +14,42 @@ const path = require('path');
 const { jmeterDetector, ENGINE_ROOT } = require('./engine');
 const { generate } = require('./generate');
 const { runFeedbackLoop } = require(path.join(ENGINE_ROOT, 'src/execution/feedbackLoop'));
+const aiService = require(path.join(ENGINE_ROOT, 'src/services/ai-service'));
+
+// Phase 4 — LLM escalation. The deterministic loop disables what it can't
+// repair; for those still-failing requests, ask the engine's ai-service
+// (Gemini) for specific fixes. Strictly opt-in: no GOOGLE_API_KEY => isEnabled()
+// is false => returns [] (clean no-op). Engine untouched; this is a post-loop
+// advisory, written to <name>_llm_suggestions.json for human review.
+async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLog }) {
+    const failures = (result.samples || [])
+        .filter(s => !s.isTransaction && s.success === false)
+        .map((s, i) => ({
+            samplerName: s.label || s.name,
+            samplerIndex: s.index != null ? s.index : i,
+            responseCode: s.responseCode,
+            responseMessage: s.responseMessage,
+            failureMessage: s.failureMessage || s.assertionMessage || s.rootCause,
+            category: s.rootCause || s.category,
+            unresolvedVariables: s.unresolvedVariables || [],
+        }));
+    if (!failures.length) return;
+    if (!aiService.isEnabled()) {
+        onLog(`LLM escalation skipped — no Gemini key (set gemini.apiKey / GOOGLE_API_KEY) · ${failures.length} unresolved failure(s)`);
+        return;
+    }
+    try {
+        const jmxContent = fs.readFileSync(jmxPath, 'utf8');
+        const out = await aiService.analyzeFailuresAndSuggestFixes(failures, jmxContent, correlations || []);
+        const fixes = Array.isArray(out) ? out : (out && out.fixes) || [];
+        if (fixes.length) {
+            fs.writeFileSync(path.join(outDir, `${name}_llm_suggestions.json`), JSON.stringify(fixes, null, 2));
+            onLog(`LLM suggested ${fixes.length} fix(es) → ${name}_llm_suggestions.json`);
+        } else {
+            onLog('LLM escalation returned no actionable fixes');
+        }
+    } catch (e) { onLog(`LLM escalation error: ${e.message}`); }
+}
 
 function deriveBaseUrl(entries) {
     for (const e of entries || []) {
@@ -72,7 +108,17 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     };
 
     const result = await runFeedbackLoop(config, gen.flat);
+
+    // Phase 4: if anything is still failing after the deterministic loop,
+    // escalate to the LLM (opt-in via Gemini key).
+    if (!result.success) {
+        await escalateToLlm({
+            result, jmxPath: result.finalJmxPath || gen.jmxPath,
+            correlations: gen.correlations, outDir, name, onLog,
+        });
+    }
+
     return { ok: true, result, jmxPath: result.finalJmxPath || gen.jmxPath, stats: gen.stats };
 }
 
-module.exports = { runValidate, deriveBaseUrl };
+module.exports = { runValidate, deriveBaseUrl, escalateToLlm };

@@ -28,6 +28,7 @@ function eng(rel) { return require(path.join(ENGINE_ROOT, rel)); }
 
 module.exports = {
     ENGINE_ROOT,
+    req: eng, // generic engine-module loader for src/generate.js
     HarParser: eng('src/modules/har-parser'),
     orchestrator: eng('src/services/agent-orchestrator'), // { runAgent, generateCorrelatedJmx }
     jmeterDetector: eng('src/services/jmeter-detector'),   // { detect, getInfo, ... }

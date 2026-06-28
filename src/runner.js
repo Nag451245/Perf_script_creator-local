@@ -11,7 +11,8 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { orchestrator, jmeterDetector, ENGINE_ROOT } = require('./engine');
+const { jmeterDetector, ENGINE_ROOT } = require('./engine');
+const { generate } = require('./generate');
 const { runFeedbackLoop } = require(path.join(ENGINE_ROOT, 'src/execution/feedbackLoop'));
 
 function deriveBaseUrl(entries) {
@@ -26,10 +27,12 @@ function deriveBaseUrl(entries) {
  * @returns {Promise<{ok, error?, result?, jmxPath?, stats?}>}
  */
 async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxIterations = 3, onLog = () => {} }) {
-    // 1. Generate the correlated JMX (reused engine). Writes into outDir; a
-    //    relative CSV in the JMX resolves against the JMX's directory = outDir.
-    const gen = orchestrator.generateCorrelatedJmx(entries, pages, outDir, name);
-    onLog(`generated ${path.basename(gen.jmxPath)} — ${gen.stats.samplers} samplers, ${gen.stats.correlations} correlations`);
+    // 1. Generate the correlated + parameterized JMX (local generate). Writes
+    //    into outDir; the synthesized data CSV + a relative CSV Data Set in the
+    //    JMX resolve against the JMX's directory = outDir.
+    const gen = generate(entries, pages, outDir, name);
+    onLog(`generated ${path.basename(gen.jmxPath)} — ${gen.stats.samplers} samplers, ` +
+        `${gen.stats.correlations} correlations, ${gen.stats.parameterized} parameterized`);
 
     // 2. Stage data files next to the JMX so CSV Data Sets resolve.
     for (const src of (runCfg.dataFiles || [])) {

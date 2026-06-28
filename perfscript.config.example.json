@@ -1,0 +1,18 @@
+{
+  "_comment": "Copy to perfscript.config.json (gitignored) and fill in. All optional.",
+
+  "jmeterHome": "D:\\apache-jmeter-5.6.3",
+  "maxIterations": 3,
+
+  "gemini": {
+    "_comment": "Used in Phase 4 (ghost-source classification + JSR223 synthesis). Leave blank to disable AI escalation.",
+    "apiKey": ""
+  },
+
+  "run": {
+    "_comment": "Phase 2 (--run against a live target). Not yet wired — documented so the shape is stable.",
+    "targetBaseUrlOverride": "",
+    "credentials": { "username": "", "password": "" },
+    "dataFiles": []
+  }
+}

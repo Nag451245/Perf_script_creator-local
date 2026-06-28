@@ -33,6 +33,17 @@ Output per input file lands in `output/<name>/`:
 - `<name>_report.json` — correlations/samplers stats (and run results with `--run`)
 - `log.txt` — what happened, step by step
 
+## Configuration (optional)
+Copy `perfscript.config.example.json` → `perfscript.config.json` (gitignored)
+to set things without command-line flags:
+- `jmeterHome` — JMeter location for `--run` (or set `JMETER_HOME`)
+- `maxIterations` — default feedback-loop budget (1–5)
+- `gemini.apiKey` — enables Phase 4 AI escalation (or set `GOOGLE_API_KEY`)
+- `run.*` — target override / credentials / data files for Phase 2 (shape is
+  stable; wiring lands with the local runner)
+
+Secrets can equivalently come from the environment (see `.env.example`).
+
 ## Status
 Phase 1 (folder pipeline over the reused engine) is built and runnable.
 Phases 2-5 (segment-replay state isolation, ghost-source JSR223 synthesis,

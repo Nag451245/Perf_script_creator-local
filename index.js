@@ -31,8 +31,30 @@ const OUTPUT = path.join(ROOT, 'output');
 const args = process.argv.slice(2);
 const DO_RUN = args.includes('--run');
 const WATCH = args.includes('--watch');
+
+// Optional local config (gitignored). Holds machine/run settings + secrets
+// so nothing has to be passed on the command line. See
+// perfscript.config.example.json. Secrets can also come from the environment.
+function loadConfig() {
+    const p = path.join(ROOT, 'perfscript.config.json');
+    if (!fs.existsSync(p)) return {};
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+    catch (e) { log(`WARNING: perfscript.config.json is not valid JSON (${e.message}) — ignoring it.`); return {}; }
+}
+const CONFIG = loadConfig();
+
+// JMeter location: config wins, then existing env. Set it for the engine's
+// detector before it runs.
+if (CONFIG.jmeterHome && !process.env.JMETER_HOME) process.env.JMETER_HOME = CONFIG.jmeterHome;
+// Gemini key for Phase 4 escalation (read by the engine's ai-service).
+if (CONFIG.gemini && CONFIG.gemini.apiKey && !process.env.GOOGLE_API_KEY) {
+    process.env.GOOGLE_API_KEY = CONFIG.gemini.apiKey;
+}
+
 const iterFlag = args.indexOf('--iterations');
-const MAX_ITER = iterFlag >= 0 ? Math.min(5, Math.max(1, Number(args[iterFlag + 1]) || 3)) : 3;
+const MAX_ITER = iterFlag >= 0
+    ? Math.min(5, Math.max(1, Number(args[iterFlag + 1]) || 3))
+    : Math.min(5, Math.max(1, Number(CONFIG.maxIterations) || 3));
 
 const processed = new Set();
 

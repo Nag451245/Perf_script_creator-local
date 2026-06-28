@@ -15,6 +15,17 @@ generation, the feedback loop) — it does not copy or modify the current app.
 - **JMeter** (only needed for `--run`): set `JMETER_HOME` or put `jmeter` on PATH.
 
 ## Usage
+
+**Easiest (Windows):** double-click `perfscript.cmd`, or from a terminal:
+```bat
+perfscript            :: generate scripts from every HAR in input\
+perfscript --run      :: also validate with local JMeter
+perfscript --watch    :: process files as they appear
+```
+The launcher finds Node automatically (PATH or common install locations) — no
+setup needed if Node is installed anywhere typical.
+
+**Or call Node directly:**
 ```bash
 # 1) Generate scripts from every HAR in input/ (no execution)
 node index.js
@@ -63,3 +74,11 @@ Phases 1–5 are built and runnable (see ARCHITECTURE.md for details):
 
 Deferred (needs engine IR/renderer changes, kept out to not disturb the current
 app): auto-emitting While Controllers for polling, cross-environment host rewrite.
+
+## Distribution
+`perfscript.cmd` is the supported way to run without PATH setup. A fully
+standalone single `.exe` (Node SEA) is **not** provided because the app requires
+the engine checkout (`backend/` + its `node_modules`) at runtime by design — an
+`.exe` would still need those on disk, so it adds build complexity without
+removing the real dependency. To share with a teammate, copy this folder + the
+engine checkout (or point `PERFSCRIPT_ENGINE` at theirs); they just need Node.

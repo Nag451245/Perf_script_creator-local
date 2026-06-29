@@ -142,19 +142,20 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
     const failures = [];
     const appliedSet = new Set();
 
-    // Harvest model: a value can surface in ANY live response — including a
-    // FOLLOWED redirect (e.g. the auth `code` lands in /iam/callback, which we
-    // reach by following 302s, not by replaying it). So after every live
-    // response we try to resolve any not-yet-resolved link by its boundary.
-    const unresolved = new Set(links);
+    // Latest-wins model: a value can surface in ANY live response (incl. a
+    // FOLLOWED redirect — the auth `code` lands in /iam/callback). At consume
+    // time we extract it from the MOST RECENT prior live response that yields a
+    // match by its boundary. This is correct for ROTATING tokens (a fresh
+    // x-csrf-token per response — same as a JMeter extractor that overwrites the
+    // var on every response) and still works for once-only values.
     const liveTextOf = (r) => (Object.entries(r.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n')) + '\n' + (r.body || '');
-    const harvest = (r) => {
-        if (!r) return;
-        const txt = liveTextOf(r);
-        for (const lk of [...unresolved]) {
-            const live = extractByBoundary(txt, lk.boundary);
-            if (live != null && live !== '') { vars[lk.varName] = live; unresolved.delete(lk); }
+    const liveResponses = [];   // live response texts, in order
+    const latestValue = (boundary) => {
+        for (let j = liveResponses.length - 1; j >= 0; j--) {
+            const v = extractByBoundary(liveResponses[j], boundary);
+            if (v != null && v !== '') return v;
         }
+        return null;
     };
 
     for (let i = 0; i < entries.length; i++) {
@@ -181,7 +182,9 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
             let urlS = clone.request.url;
             let bodyS = clone.request.postData && clone.request.postData.text;
             for (const lk of consumed) {
-                if (vars[lk.varName] == null) continue;     // producer hasn't run/extracted yet
+                const live = latestValue(lk.boundary);      // most-recent producer value (rotating-safe)
+                if (live == null) continue;                 // not produced yet
+                vars[lk.varName] = live;
                 const ref = '${' + lk.varName + '}';
                 if (urlS && urlS.includes(lk.value)) urlS = urlS.split(lk.value).join(ref);
                 if (bodyS && bodyS.includes(lk.value)) bodyS = bodyS.split(lk.value).join(ref);
@@ -199,12 +202,12 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
             // Follow the LIVE redirect chain (cookies accumulate in cookieJar),
             // so auth0's /authorize/resume → /iam/callback → ... resolve with the
             // server's fresh state/code instead of our recorded stale ones.
-            harvest(r);
+            liveResponses.push(liveTextOf(r));
             let curUrl = reqEntry.request.url; let hops = 0;
             while (r && r.status >= 300 && r.status < 400 && r.headers && r.headers.location && hops < 12) {
                 curUrl = new URL(r.headers.location, curUrl).toString();
                 r = await replayOne({ entry: { request: { method: 'GET', url: curUrl, headers: [] } }, vars, cookieJar, targetBaseUrl, insecure, timeoutMs });
-                harvest(r);   // harvest from each followed hop (the auth code lands here)
+                liveResponses.push(liveTextOf(r));   // the auth code lands in a followed hop
                 hops++;
             }
         } catch (err) {

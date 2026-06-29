@@ -14,12 +14,16 @@ const esc = (s) => String(s == null ? '' : s)
 
 const ARTIFACTS = [
     ['.jmx', 'JMeter script'],
-    ['.recording.xml', 'Recording (full bodies)'],
+    ['.recording.xml', 'Recording (full bodies, secrets scrubbed)'],
+    ['_secrets.json', 'Original secret values (gitignored)'],
     ['_data.csv', 'Synthesized data pool'],
     ['_parameters.json', 'Parameterization candidates'],
     ['_ghosts.json', 'Client-side (ghost) values'],
     ['_polling.json', 'Detected polling loops'],
     ['_llm_suggestions.json', 'LLM fix suggestions'],
+    ['_baseline_diff.json', 'Baseline vs test diff (status / length / shape)'],
+    ['_reasoning.md', 'Reasoning trace'],
+    ['_reasoning.json', 'Reasoning trace (structured)'],
     ['_report.json', 'Raw report (JSON)'],
     ['log.txt', 'Run log'],
 ];
@@ -31,10 +35,13 @@ function statCard(label, value) {
 /**
  * @param outDir folder the run wrote into
  * @param name   base name
- * @param data   { mode, verdict, stats, samples }
+ * @param data   { mode, verdict, stats, samples, baselineDiff?, correlations?, dualHar?, loadProfile?, reasoning? }
  */
 function writeHtmlReport(outDir, name, data = {}) {
-    const { mode = 'generate', verdict = 'generated', stats = {}, samples = [] } = data;
+    const {
+        mode = 'generate', verdict = 'generated', stats = {}, samples = [],
+        baselineDiff = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [],
+    } = data;
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
     const failures = reqs.filter(s => s.success === false);
@@ -45,8 +52,11 @@ function writeHtmlReport(outDir, name, data = {}) {
         statCard('Samplers', stats.samplers ?? '–'),
         statCard('Correlations', stats.correlations ?? '–'),
         statCard('Parameterized', stats.parameterized ?? '–'),
-        statCard('Ghost values', stats.clientSideGhosts ?? '–'),
-        statCard('Polling loops', stats.pollingLoops ?? '–'),
+        statCard('Native extractors', stats.nativeExtractorsPlanned ?? '–'),
+        statCard('Ghost synths', stats.ghostSynthesizers ?? stats.clientSideGhosts ?? '–'),
+        statCard('Polling loops', stats.whileControllers ?? stats.pollingLoops ?? '–'),
+        statCard('Assertions', stats.assertions ?? '–'),
+        statCard('Pacing timers', stats.pacingTimers ?? '–'),
         statCard('Orphans', stats.orphans ?? '–'),
     ].join('');
 
@@ -65,6 +75,93 @@ function writeHtmlReport(outDir, name, data = {}) {
             return fs.existsSync(full) ? `<li><a href="${esc(file)}">${esc(file)}</a> — ${esc(desc)}</li>` : '';
         })
         .filter(Boolean).join('');
+
+    // Dashboard link (jmeter -g produces dashboard/index.html)
+    const dashLink = fs.existsSync(path.join(outDir, 'dashboard', 'index.html'))
+        ? `<p><a href="dashboard/index.html">▸ Open JMeter HTML dashboard (full perf metrics)</a></p>`
+        : '';
+
+    // Load profile callout: what shape will this script actually drive?
+    let loadProfileSection = '';
+    if (loadProfile && (loadProfile.users || loadProfile.rampUpSec || loadProfile.holdSec || loadProfile.loops)) {
+        const bits = [
+            loadProfile.users     != null ? `${loadProfile.users} user${loadProfile.users === 1 ? '' : 's'}` : null,
+            loadProfile.rampUpSec != null ? `ramp-up ${loadProfile.rampUpSec}s` : null,
+            loadProfile.holdSec   != null ? `hold ${loadProfile.holdSec}s` : null,
+            loadProfile.loops     != null ? `${loadProfile.loops} loop${loadProfile.loops === 1 ? '' : 's'}` : null,
+        ].filter(Boolean);
+        loadProfileSection = `<h2>Load profile</h2><p>${esc(bits.join(' · '))}</p>
+            <p class="muted">Applied to the first Thread Group. ${loadProfile.holdSec ? 'A hold duration overrides finite loops (scheduler enabled).' : ''}</p>`;
+    }
+
+    // Correlation table: which variables came from where, and how. Counts
+    // alone don't help a reviewer decide if the correlations are sound.
+    let correlationSection = '';
+    if (Array.isArray(correlations) && correlations.length) {
+        const rows = correlations.slice(0, 200).map(c => {
+            const variable = c.variableName || c.refname || c.name || c.value || '?';
+            const source = c.sourceUrl || c.source || c.sourceSampler || (c.origin && (c.origin.sampler || c.origin.label)) || '?';
+            const sink   = c.targetUrl || c.sink || c.targetSampler || c.location || '';
+            const type   = c.extractorType || c.type || c.kind || '';
+            const conf   = (c.confidence != null) ? Number(c.confidence).toFixed(2) : '';
+            return `<tr><td><code>${esc(variable)}</code></td><td>${esc(source)}</td><td>${esc(sink)}</td><td>${esc(type)}</td><td>${esc(conf)}</td></tr>`;
+        }).join('');
+        const note = correlations.length > 200 ? `<p class="muted">Showing first 200 of ${correlations.length}.</p>` : '';
+        correlationSection = `<h2>Correlations (${correlations.length})</h2>
+            <table><thead><tr><th>Variable</th><th>Source</th><th>Sink</th><th>Type</th><th>Confidence</th></tr></thead>
+            <tbody>${rows}</tbody></table>${note}`;
+    }
+
+    // Dual-recording dynamics panel: the Phase 1 signal everyone wants but
+    // never sees. Lists every value that differed across the two runs and
+    // where it surfaced — the reviewer's primary scan for "is this script
+    // safe to run repeatedly?"
+    let dualHarSection = '';
+    if (dualHar && dualHar.dynamicsByName && Object.keys(dualHar.dynamicsByName).length) {
+        const names = Object.entries(dualHar.dynamicsByName).slice(0, 100);
+        const rows = names.map(([n, list]) => {
+            const sample = list[0] || {};
+            const where = sample.location || (sample.origin && sample.origin.location) || '';
+            return `<tr><td><code>${esc(n)}</code></td><td>${esc(String(sample.value1 || '').slice(0, 60))}</td><td>${esc(String(sample.value2 || '').slice(0, 60))}</td><td>${esc(where)}</td><td>${list.length}</td></tr>`;
+        }).join('');
+        const truncated = Object.keys(dualHar.dynamicsByName).length > 100
+            ? `<p class="muted">Showing first 100 of ${Object.keys(dualHar.dynamicsByName).length}.</p>` : '';
+        dualHarSection = `<h2>Dual-recording dynamics (${dualHar.dynamicValueCount || 0} unique values)</h2>
+            <p class="muted">Values that differed between the two recorded runs of ${esc(dualHar.run2File || 'run2')}. These are the highest-confidence dynamic-parameter candidates.</p>
+            <table><thead><tr><th>Name</th><th>Run 1</th><th>Run 2</th><th>Where</th><th>Hits</th></tr></thead>
+            <tbody>${rows}</tbody></table>${truncated}`;
+    }
+
+    // Reasoning trace summary (one row per phase/action). Full text lives in
+    // the .md / .json artifacts; this panel just gives a reviewer the gist.
+    let reasoningSection = '';
+    if (Array.isArray(reasoning) && reasoning.length) {
+        const rows = reasoning.slice(0, 30).map(r =>
+            `<tr><td>${esc(r.phase)}</td><td>${esc(r.hypothesis)}</td><td>${esc(r.action)}</td></tr>`
+        ).join('');
+        const truncated = reasoning.length > 30 ? `<p class="muted">Showing first 30 of ${reasoning.length} reasoning step(s).</p>` : '';
+        reasoningSection = `<h2>Reasoning</h2>
+            <table><thead><tr><th>Phase</th><th>Hypothesis</th><th>Action</th></tr></thead>
+            <tbody>${rows}</tbody></table>${truncated}`;
+    }
+
+    // Baseline diff section: surface drift the status-only verdict misses
+    let driftSection = '';
+    if (baselineDiff && baselineDiff.samplesCompared > 0) {
+        if (baselineDiff.drift.length === 0) {
+            driftSection = `<h2>Baseline vs test</h2><p class="muted">${baselineDiff.samplesCompared} sampler(s) compared — no drift (status, body length, JSON shape all match recording).</p>`;
+        } else {
+            const rows = baselineDiff.drift.map(d => `
+                <tr><td>${esc(d.sampler)}</td><td>${d.issues.map(i =>
+                    i.kind === 'statusDiff' ? `status ${i.recorded}→${i.observed}` :
+                    i.kind === 'lengthDriftPct' ? `body ${i.recorded}B→${i.observed}B (${i.pct}%)` :
+                    i.kind === 'shapeDiff' ? `JSON shape changed` : esc(JSON.stringify(i))
+                ).join(', ')}</td></tr>`).join('');
+            driftSection = `<h2>Baseline vs test — drift on ${baselineDiff.drift.length}/${baselineDiff.samplesCompared}</h2>
+                <table><thead><tr><th>Sampler</th><th>Drift</th></tr></thead><tbody>${rows}</tbody></table>
+                <p class="muted">Drift means the live response did not match what the recording captured. "200 OK" alone can hide login pages returned in place of dashboards, empty lists in place of data, etc.</p>`;
+        }
+    }
 
     const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -97,11 +194,23 @@ function writeHtmlReport(outDir, name, data = {}) {
 
   <div class="grid">${cards}</div>
 
+  ${loadProfileSection}
+
+  ${dashLink}
+
   <h2>Request results</h2>
   <table><thead><tr><th></th><th>Sampler</th><th>Code</th><th>Message</th></tr></thead>
   <tbody>${reqRows}</tbody></table>
 
   ${failures.length ? `<h2>Failures (${failures.length})</h2><ul>${failures.map(f => `<li><b>${esc(f.label || f.name)}</b> — ${esc(f.responseCode || '')} ${esc(f.responseMessage || f.failureMessage || '')}</li>`).join('')}</ul>` : ''}
+
+  ${dualHarSection}
+
+  ${correlationSection}
+
+  ${reasoningSection}
+
+  ${driftSection}
 
   <h2>Artifacts</h2>
   <ul>${artifactItems || '<li class="muted">none</li>'}</ul>

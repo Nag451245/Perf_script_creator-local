@@ -11,9 +11,17 @@
   },
 
   "run": {
-    "_comment": "Phase 2 (--run against a live target). Not yet wired — documented so the shape is stable.",
+    "_comment": "Phase 2 (--run against a live target).",
     "targetBaseUrlOverride": "",
     "credentials": { "username": "", "password": "" },
-    "dataFiles": []
+    "dataFiles": [],
+
+    "_loadProfile_comment": "Optional load shape. Honored at both generate-only and --run. holdSec forces infinite loops + scheduler (whichever finishes first wins — don't combine finite loops with a duration). Omit any field to keep the engine default.",
+    "loadProfile": {
+      "users": 10,
+      "rampUpSec": 30,
+      "holdSec": 300,
+      "loops": 1
+    }
   }
 }

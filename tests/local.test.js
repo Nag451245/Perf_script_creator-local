@@ -17,6 +17,15 @@ const { HarParser } = require('../src/engine');
 const { generate } = require('../src/generate');
 const { writeHtmlReport } = require('../src/report');
 const { escalateToLlm } = require('../src/runner');
+const { groupInputs } = require('../src/ingest');
+const { knownDefinedVars, planExtractor, _internal: extractorsInternal } = require('../src/extractors');
+const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun } = require('../src/transforms');
+const { scrubRecordingXml } = require('../src/scrubber');
+const { rewriteHost } = require('../src/host-rewrite');
+const { diffRunAgainstRecording, _internal: verifierInternal } = require('../src/verifier');
+const { replayAll, _internal: replayInternal } = require('../src/fast-replay');
+const { applyLlmPatches } = require('../src/llm-patcher');
+const { writeHtmlReport: writeHtmlReportFn } = require('../src/report');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
 function parse(har) {
@@ -109,4 +118,428 @@ test('LLM escalation: clean no-op without a Gemini key', async () => {
     });
     assert.ok(logs.some(l => /skipped — no Gemini key/.test(l)), 'should log a skip without a key');
     assert.ok(!fs.existsSync(path.join(out, 't_llm_suggestions.json')), 'no suggestions file without a key');
+});
+
+/* ─────────── New tests (ingest, extractors, transforms, scrubber, verifier) ─────────── */
+
+test('ingest groups: dual-HAR pair + JMX+sidecar + single HAR', () => {
+    const files = ['/in/foo__run1.har', '/in/foo__run2.har', '/in/login.jmx', '/in/login.recording.xml', '/in/standalone.har'];
+    const units = groupInputs(files);
+    const kinds = units.map(u => u.kind).sort();
+    assert.deepStrictEqual(kinds, ['dual-har', 'har', 'jmx']);
+    const jmx = units.find(u => u.kind === 'jmx');
+    assert.strictEqual(jmx.secondary, '/in/login.recording.xml', 'JMX must be paired with its sidecar');
+    const pair = units.find(u => u.kind === 'dual-har');
+    assert.strictEqual(pair.primary, '/in/foo__run1.har');
+    assert.strictEqual(pair.secondary, '/in/foo__run2.har');
+});
+
+test('orphan filtering: CSV-defined vars are not auto-repaired (no JSR223 dump)', () => {
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/login', {
+            reqHeaders: [{ name: 'Content-Type', value: 'application/x-www-form-urlencoded' }],
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'username=alice&password=hunter2' },
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'login');
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+    assert.strictEqual((xml.match(/<JSR223PostProcessor\b/g) || []).length, 0, 'no bogus auto-repair JSR223 blocks');
+    assert.ok(gen.stats.falseOrphansFiltered >= 2, `expected >=2 false-orphans filtered, got ${gen.stats.falseOrphansFiltered}`);
+});
+
+test('extractor planner: locates value in earlier JSON response, emits JSONPostProcessor', () => {
+    const e1 = entry('POST', 'https://app.test/auth', { body: '{"token":"abcdef123456"}' });
+    const e2 = entry('GET', 'https://app.test/me', { reqHeaders: [{ name: 'X-Token', value: 'abcdef123456' }] });
+    const flat = [e1, e2];
+    const plan = planExtractor('myToken', [{ name: 'myToken', value: 'abcdef123456' }], flat, 1);
+    assert.ok(plan, 'should return an extractor plan');
+    assert.strictEqual(plan.type, 'json', 'JSON body → JSONPostProcessor');
+    assert.match(plan.block, /JSONPostProcessor/);
+    assert.match(plan.block, /\$\.token/);
+});
+
+test('knownDefinedVars detects CSVDataSet columns even with a wide block', () => {
+    const xml = `
+        <CSVDataSet><stringProp name="delimiter">,</stringProp><stringProp name="fileEncoding">UTF-8</stringProp>
+        <stringProp name="filename">data.csv</stringProp><boolProp name="ignoreFirstLine">true</boolProp>
+        <boolProp name="quotedData">false</boolProp><boolProp name="recycle">true</boolProp>
+        <stringProp name="shareMode">shareMode.all</stringProp><boolProp name="stopThread">false</boolProp>
+        <stringProp name="variableNames">a,b,c</stringProp>
+        </CSVDataSet>`;
+    const def = knownDefinedVars(xml);
+    assert.ok(def.has('a') && def.has('b') && def.has('c'), 'should detect CSV columns even when block is wider than 200 chars');
+});
+
+test('wrapPollingInWhileController: wraps consecutive same-endpoint samplers', () => {
+    const fakeXml = `
+        <HTTPSamplerProxy testname="Step 01 - POST /job"></HTTPSamplerProxy><hashTree/>
+        <HTTPSamplerProxy testname="Step 02 - GET /status"></HTTPSamplerProxy><hashTree/>
+        <HTTPSamplerProxy testname="Step 03 - GET /status"></HTTPSamplerProxy><hashTree/>
+        <HTTPSamplerProxy testname="Step 04 - GET /status"></HTTPSamplerProxy><hashTree/>`;
+    const out = wrapPollingInWhileController(fakeXml, [{ endpoint: 'GET /status', count: 3, startOrder: 1 }]);
+    assert.strictEqual(out.wrapped, 1);
+    assert.match(out.xml, /<WhileController/);
+    assert.match(out.xml, /Polling: GET \/status/);
+});
+
+test('ghost synthesizer: refuses HMAC/signing-key fields (no fake generation)', () => {
+    const fakeXml = `<ThreadGroup></ThreadGroup>\n<hashTree>\n</hashTree>`;
+    const { refused } = injectGhostSynthesizers(fakeXml, [
+        { paramName: 'x-signature-hmac', sampleValue: 'abc', kind: 'CLIENT_GUID' },
+    ]);
+    assert.ok(refused.length === 1, 'HMAC-named field should be refused');
+    assert.match(refused[0].reason, /signing key/);
+});
+
+test('ghost synthesizer: emits per-thread JSR223 PreProcessor for x-request-id UUID', () => {
+    const fakeXml = `<ThreadGroup></ThreadGroup>\n<hashTree>\n</hashTree>`;
+    const { xml, injected } = injectGhostSynthesizers(fakeXml, [
+        { paramName: 'x-request-id', sampleValue: '3f2504e0-4f89-41d3-9a0c-0305e82c3301', kind: 'X_REQUEST_ID' },
+    ]);
+    assert.strictEqual(injected, 1);
+    assert.match(xml, /JSR223PreProcessor/);
+    assert.match(xml, /java\.util\.UUID\.randomUUID/);
+});
+
+test('assertion miner: emits ResponseAssertion when recording has stable text', () => {
+    const fakeXml = `<HTTPSamplerProxy testname="GET /api/x"></HTTPSamplerProxy><hashTree/>`;
+    const e = entry('GET', 'https://app.test/api/x', { body: '{"status":"OK","message":"Welcome back"}' });
+    const out = injectAssertionsFromMined(fakeXml, [e]);
+    assert.ok(out.injected >= 1, 'should inject at least one assertion');
+    assert.match(out.xml, /<ResponseAssertion/);
+});
+
+test('Gaussian timers: derives mean+stdev from per-page HAR gaps', () => {
+    const fakeXml = `<TransactionController testname="Login"></TransactionController>\n<hashTree>\n</hashTree>`;
+    const entries = [
+        { startedDateTime: '2026-01-01T00:00:00.000Z', time: 100, pageref: 'p1', request: { url: 'a', method: 'GET' }, response: {} },
+        { startedDateTime: '2026-01-01T00:00:03.000Z', time: 100, pageref: 'p1', request: { url: 'b', method: 'GET' }, response: {} },
+        { startedDateTime: '2026-01-01T00:00:06.000Z', time: 100, pageref: 'p1', request: { url: 'c', method: 'GET' }, response: {} },
+    ];
+    const out = injectGaussianTimers(fakeXml, entries, [{ id: 'p1', title: 'Login' }]);
+    assert.strictEqual(out.injected, 1);
+    assert.match(out.xml, /<GaussianRandomTimer/);
+});
+
+test('listener strip: disables GUI listeners + appends SimpleDataWriter', () => {
+    const fakeXml = `<ResultCollector guiclass="ViewResultsFullVisualizer" enabled="true"></ResultCollector><ResultCollector guiclass="StatVisualizer" enabled="true"></ResultCollector>\n    </hashTree>\n  </hashTree>`;
+    const out = stripGuiListenersForRun(fakeXml, 'C:/tmp/final.jtl');
+    assert.strictEqual(out.disabled, 2);
+    assert.match(out.xml, /SimpleDataWriter/);
+    assert.ok(!/enabled="true"[^>]*>(?:[\s\S](?!SimpleDataWriter))*?ResultCollector/.test(out.xml.replace(/SimpleDataWriter[\s\S]*$/, '')), 'all GUI listeners disabled');
+});
+
+test('scrubber: redacts password, Authorization, api_key — keeps tokens intact', () => {
+    const xml = `<samplerData>POST https://x/login
+username=alice&amp;password=hunter2</samplerData>
+<requestHeader>Authorization: Bearer eyJhbGciOiJIUzI1NiJ9</requestHeader>
+<responseData>{"username":"alice","api_key":"sk_live_abc","session":"keep-me"}</responseData>`;
+    const { xml: out, hits } = scrubRecordingXml(xml);
+    assert.match(out, /password=\*\*\*REDACTED\*\*\*/);
+    assert.match(out, /Authorization:\s*\*\*\*REDACTED\*\*\*/);
+    assert.match(out, /"api_key"\s*:\s*"\*\*\*REDACTED\*\*\*"/);
+    assert.doesNotMatch(out, /keep-me.*REDACTED/, '"session" is not in the secret list');
+    assert.ok(hits.length >= 3, `expected >=3 redactions, got ${hits.length}`);
+});
+
+test('host rewrite: only the primary host is repointed, third-party hosts unchanged', () => {
+    const xml = `<HTTPSamplerProxy><stringProp name="HTTPSampler.domain">prod.example.com</stringProp><stringProp name="HTTPSampler.protocol">https</stringProp><stringProp name="HTTPSampler.port"></stringProp></HTTPSamplerProxy>
+<HTTPSamplerProxy><stringProp name="HTTPSampler.domain">cdn.thirdparty.com</stringProp><stringProp name="HTTPSampler.protocol">https</stringProp><stringProp name="HTTPSampler.port"></stringProp></HTTPSamplerProxy>`;
+    const out = rewriteHost(xml, 'prod.example.com', 'https://staging.example.com');
+    assert.strictEqual(out.count, 1);
+    assert.match(out.xml, /staging\.example\.com/);
+    assert.match(out.xml, /cdn\.thirdparty\.com/, 'third-party host must be left alone');
+});
+
+test('verifier shape diff: detects JSON-key-set divergence', () => {
+    assert.strictEqual(verifierInternal.safeJsonShape('{"a":1,"b":2}'), 'a,b');
+    assert.strictEqual(verifierInternal.safeJsonShape('{"b":2,"a":1}'), 'a,b', 'key order should not matter');
+    assert.notStrictEqual(verifierInternal.safeJsonShape('{"a":1}'), verifierInternal.safeJsonShape('{"b":1}'));
+});
+
+test('fast-replay substituteVars: only replaces ${KNOWN} vars', () => {
+    const out = replayInternal.substituteVars('hi ${name}, ts=${ts}, keep=${UNKNOWN}', { name: 'alice', ts: '42' });
+    assert.strictEqual(out, 'hi alice, ts=42, keep=${UNKNOWN}');
+});
+
+test('fast-replay cookie jar: round-trips Set-Cookie within the same host', () => {
+    const jar = new Map();
+    replayInternal.rememberSetCookie(jar, 'app.test', 'SESSION=abc; Path=/');
+    replayInternal.rememberSetCookie(jar, 'app.test', ['CSRF=xyz; HttpOnly']);
+    const cookieHeader = replayInternal.joinCookies(jar, 'app.test');
+    assert.match(cookieHeader, /SESSION=abc/);
+    assert.match(cookieHeader, /CSRF=xyz/);
+    assert.strictEqual(replayInternal.joinCookies(jar, 'other.test'), '', 'cookies are host-scoped');
+});
+
+test('reasoning trace: written as both .json and .md when steps were taken', () => {
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/login', {
+            reqHeaders: [{ name: 'Content-Type', value: 'application/x-www-form-urlencoded' }],
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'username=alice&password=hunter2' },
+        }),
+    ]));
+    const out = tmp();
+    generate(entries, pages, out, 'login');
+    assert.ok(fs.existsSync(path.join(out, 'login_reasoning.json')), 'structured reasoning written');
+    assert.ok(fs.existsSync(path.join(out, 'login_reasoning.md')), 'markdown reasoning written');
+    const md = fs.readFileSync(path.join(out, 'login_reasoning.md'), 'utf8');
+    assert.match(md, /# Reasoning trace/);
+    assert.match(md, /Hypothesis/);
+});
+
+test('baseline diff: returns empty drift when no JTL is present', () => {
+    const out = tmp();
+    const r = diffRunAgainstRecording({ outDir: out, flatEntries: [] });
+    assert.strictEqual(r.jtlPath, null);
+    assert.strictEqual(r.drift.length, 0);
+});
+
+/* ─────────── Fix-pass tests (dual-JMX, load profile, cookie domain, patcher) ─────────── */
+
+test('ingest groups: dual-JMX pair (with sidecars) is detected as kind=dual-jmx', () => {
+    const files = [
+        '/in/foo__run1.jmx', '/in/foo__run1.recording.xml',
+        '/in/foo__run2.jmx', '/in/foo__run2.recording.xml',
+        '/in/standalone.har',
+    ];
+    const units = groupInputs(files);
+    const kinds = units.map(u => u.kind).sort();
+    assert.deepStrictEqual(kinds, ['dual-jmx', 'har'], `kinds should be dual-jmx + har, got ${kinds}`);
+    const dj = units.find(u => u.kind === 'dual-jmx');
+    assert.strictEqual(dj.primary, '/in/foo__run1.jmx');
+    assert.strictEqual(dj.secondary, '/in/foo__run2.jmx');
+    assert.strictEqual(dj.sidecars.primary, '/in/foo__run1.recording.xml');
+    assert.strictEqual(dj.sidecars.secondary, '/in/foo__run2.recording.xml');
+});
+
+test('ingest groups: dual-JMX without sidecars still detected (sidecars optional)', () => {
+    const files = ['/in/login__run1.jmx', '/in/login__run2.jmx'];
+    const units = groupInputs(files);
+    assert.strictEqual(units.length, 1);
+    assert.strictEqual(units[0].kind, 'dual-jmx');
+    assert.strictEqual(units[0].sidecars.primary, undefined);
+    assert.strictEqual(units[0].sidecars.secondary, undefined);
+});
+
+test('load profile: rewrites num_threads + ramp_time on first ThreadGroup', () => {
+    const xml = `
+        <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="TG" enabled="true">
+          <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+          <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController" testname="Loop Controller" enabled="true">
+            <boolProp name="LoopController.continue_forever">false</boolProp>
+            <stringProp name="LoopController.loops">1</stringProp>
+          </elementProp>
+          <stringProp name="ThreadGroup.num_threads">1</stringProp>
+          <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+          <boolProp name="ThreadGroup.scheduler">false</boolProp>
+          <stringProp name="ThreadGroup.duration"></stringProp>
+        </ThreadGroup>`;
+    const r = applyLoadProfile(xml, { users: 50, rampUpSec: 60, loops: 10 });
+    assert.match(r.xml, /num_threads">50</);
+    assert.match(r.xml, /ramp_time">60</);
+    assert.match(r.xml, /LoopController.loops">10</);
+    assert.match(r.xml, /ThreadGroup.scheduler">false</);
+    assert.strictEqual(r.applied.users, 50);
+    assert.strictEqual(r.applied.loops, 10);
+});
+
+test('load profile: holdSec enables scheduler + forces infinite loops', () => {
+    const xml = `
+        <ThreadGroup>
+          <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+            <boolProp name="LoopController.continue_forever">false</boolProp>
+            <stringProp name="LoopController.loops">1</stringProp>
+          </elementProp>
+          <stringProp name="ThreadGroup.num_threads">1</stringProp>
+          <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+          <boolProp name="ThreadGroup.scheduler">false</boolProp>
+          <stringProp name="ThreadGroup.duration"></stringProp>
+        </ThreadGroup>`;
+    const r = applyLoadProfile(xml, { users: 10, holdSec: 300, loops: 999 });
+    assert.match(r.xml, /num_threads">10</);
+    assert.match(r.xml, /ThreadGroup.duration">300</);
+    assert.match(r.xml, /ThreadGroup.scheduler">true</);
+    assert.match(r.xml, /LoopController.loops">-1</);
+    assert.match(r.xml, /LoopController.continue_forever">true</);
+    assert.strictEqual(r.applied.loops, undefined, 'loops should be ignored when holdSec is set');
+});
+
+test('load profile: empty profile is a no-op (applied=null)', () => {
+    const xml = `<ThreadGroup><stringProp name="ThreadGroup.num_threads">1</stringProp></ThreadGroup>`;
+    const r = applyLoadProfile(xml, {});
+    assert.strictEqual(r.applied, null);
+    assert.strictEqual(r.xml, xml);
+});
+
+test('load profile: idempotent (re-applying the same profile yields same XML)', () => {
+    const xml = `<ThreadGroup>
+      <stringProp name="ThreadGroup.num_threads">1</stringProp>
+      <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+    </ThreadGroup>`;
+    const a = applyLoadProfile(xml, { users: 25, rampUpSec: 15 });
+    const b = applyLoadProfile(a.xml, { users: 25, rampUpSec: 15 });
+    assert.strictEqual(a.xml, b.xml);
+});
+
+test('cookie domain match: bank.com cookie is NOT sent to evilbank.com', () => {
+    const { cookieDomainMatches } = replayInternal;
+    assert.strictEqual(cookieDomainMatches('bank.com', 'bank.com'), true);
+    assert.strictEqual(cookieDomainMatches('api.bank.com', 'bank.com'), true);
+    assert.strictEqual(cookieDomainMatches('api.bank.com', '.bank.com'), true);
+    assert.strictEqual(cookieDomainMatches('evilbank.com', 'bank.com'), false, 'suffix-confusion must be blocked');
+    assert.strictEqual(cookieDomainMatches('bank.com.evil', 'bank.com'), false);
+    assert.strictEqual(cookieDomainMatches('', 'bank.com'), false);
+});
+
+test('LLM patcher: addExtractor (JSON) inserts a JSONPostProcessor after the named sampler', () => {
+    const xml = `<HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="Step 01 - POST /auth" enabled="true"></HTTPSamplerProxy>\n<hashTree/>`;
+    const r = applyLlmPatches(xml, [{
+        kind: 'addExtractor', sampler: 'Step 01 - POST /auth',
+        variable: 'token', type: 'json', path: '$.token',
+    }]);
+    assert.strictEqual(r.applied.length, 1);
+    assert.strictEqual(r.skipped.length, 0);
+    assert.match(r.xml, /<JSONPostProcessor\b/);
+    assert.match(r.xml, /JSONPostProcessor\.referenceNames">token</);
+    assert.match(r.xml, /\$\.token/);
+});
+
+test('LLM patcher: replaceValueWithVar swaps literal inside stringProp content only', () => {
+    const xml =
+        `<HTTPSamplerProxy testname="Step 01 - GET /me" enabled="true">` +
+        `<stringProp name="HTTPSampler.path">/users/abc123def</stringProp>` +
+        `<stringProp name="HTTPSampler.method">GET</stringProp>` +
+        `</HTTPSamplerProxy>`;
+    const r = applyLlmPatches(xml, [{
+        kind: 'replaceValueWithVar', sampler: 'Step 01 - GET /me',
+        value: 'abc123def', variable: 'userId',
+    }]);
+    assert.strictEqual(r.applied.length, 1);
+    assert.match(r.xml, /\/users\/\$\{userId\}/);
+    assert.doesNotMatch(r.xml, /abc123def/);
+});
+
+test('LLM patcher: refuses short value (would shred XML)', () => {
+    const xml = `<HTTPSamplerProxy testname="x" enabled="true"><stringProp name="x">abc</stringProp></HTTPSamplerProxy>`;
+    const r = applyLlmPatches(xml, [{ kind: 'replaceValueWithVar', value: 'a', variable: 'v' }]);
+    assert.strictEqual(r.applied.length, 0);
+    assert.strictEqual(r.skipped[0].reason, 'value_too_short');
+});
+
+test('LLM patcher: setSamplerEnabled flips the enabled attribute on a named sampler', () => {
+    const xml = `<HTTPSamplerProxy testname="Bad Step" enabled="true"></HTTPSamplerProxy>`;
+    const r = applyLlmPatches(xml, [{ kind: 'setSamplerEnabled', sampler: 'Bad Step', enabled: false }]);
+    assert.strictEqual(r.applied.length, 1);
+    assert.match(r.xml, /testname="Bad Step" enabled="false"/);
+});
+
+test('LLM patcher: unknown kind is recorded as skipped (no silent drop)', () => {
+    const xml = `<x/>`;
+    const r = applyLlmPatches(xml, [{ kind: 'rewriteGroovyScript', script: 'whatever' }]);
+    assert.strictEqual(r.applied.length, 0);
+    assert.strictEqual(r.skipped[0].reason, 'unsupported_kind');
+    assert.strictEqual(r.skipped[0].kind, 'rewriteGroovyScript');
+});
+
+test('LLM patcher: lenient input — `action`/`samplerName`/`refname` aliases are normalized', () => {
+    const xml = `<HTTPSamplerProxy testname="Step 02" enabled="true"></HTTPSamplerProxy>\n<hashTree/>`;
+    const r = applyLlmPatches(xml, [{
+        action: 'addExtractor', samplerName: 'Step 02',
+        refname: 'sessionId', type: 'json', jsonPath: '$.session.id',
+    }]);
+    assert.strictEqual(r.applied.length, 1, JSON.stringify(r.skipped));
+    assert.match(r.xml, /sessionId/);
+});
+
+test('HTML report: load profile + correlation table + dual-recording panel render when data is present', () => {
+    const out = tmp();
+    const reportPath = writeHtmlReportFn(out, 'demo', {
+        mode: 'generate only (har)', verdict: 'generated',
+        stats: { samplers: 2, correlations: 1 },
+        samples: [],
+        correlations: [{
+            variableName: 'token', sourceUrl: 'POST /auth', targetUrl: 'GET /me',
+            extractorType: 'json', confidence: 0.93,
+        }],
+        dualHar: {
+            run2File: 'foo__run2.har', dynamicValueCount: 1,
+            dynamicsByName: { csrf: [{ value1: 'aaaa', value2: 'bbbb', location: 'body', origin: { sampler: 'GET /', location: 'body' } }] },
+        },
+        loadProfile: { users: 25, rampUpSec: 30, holdSec: 120 },
+        reasoning: [{ phase: 'extractors', hypothesis: 'token from POST /auth', action: 'emitted JSONPostProcessor' }],
+    });
+    const html = fs.readFileSync(reportPath, 'utf8');
+    assert.match(html, /Load profile/);
+    assert.match(html, /25 users/);
+    assert.match(html, /ramp-up 30s/);
+    assert.match(html, /hold 120s/);
+    assert.match(html, /Correlations \(1\)/);
+    assert.match(html, /token/);
+    assert.match(html, /Dual-recording dynamics/);
+    assert.match(html, /csrf/);
+    assert.match(html, /Reasoning/);
+});
+
+test('assertion miner: stringProp names are stable (assert_0, assert_1) — no Math.random churn', () => {
+    const fakeXml = `<HTTPSamplerProxy testname="GET /api/x" enabled="true"></HTTPSamplerProxy><hashTree/>`;
+    const e = entry('GET', 'https://app.test/api/x', { body: '{"status":"OK","message":"Welcome back, Alice"}' });
+    const r1 = injectAssertionsFromMined(fakeXml, [e]);
+    const r2 = injectAssertionsFromMined(fakeXml, [e]);
+    assert.strictEqual(r1.xml, r2.xml, 'two runs over the same input should produce identical XML');
+    assert.match(r1.xml, /name="assert_0"/);
+});
+
+test('polling while: when terminator is provided, it overrides the counter condition', () => {
+    const fakeXml = `
+        <HTTPSamplerProxy testname="Step 01 - GET /s"></HTTPSamplerProxy><hashTree/>
+        <HTTPSamplerProxy testname="Step 02 - GET /s"></HTTPSamplerProxy><hashTree/>
+        <HTTPSamplerProxy testname="Step 03 - GET /s"></HTTPSamplerProxy><hashTree/>`;
+    const terminator = '${__jexl3(vars.get("status") != "PENDING")}';
+    const out = wrapPollingInWhileController(fakeXml, [{ endpoint: 'GET /s', count: 3, startOrder: 0, terminator }]);
+    assert.strictEqual(out.wrapped, 1);
+    assert.ok(out.xml.includes('vars.get(&quot;status&quot;)'), 'WhileController should use the terminator');
+});
+
+test('fast-replay E2E: replays against an embedded HTTP server and substitutes ${vars}', async () => {
+    const http = require('http');
+    let received = null;
+    const server = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', c => chunks.push(c));
+        req.on('end', () => {
+            received = { method: req.method, url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') };
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, echoed: received.url }));
+        });
+    });
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    try {
+        const entries = [{
+            startedDateTime: '2026-01-01T00:00:00.000Z', time: 5,
+            request: {
+                method: 'GET', url: `http://127.0.0.1:${port}/api/users/abc?token=$\{TOK\}`,
+                headers: [{ name: 'X-Run', value: '${RUN}' }], queryString: [], cookies: [], headersSize: -1, bodySize: 0,
+            },
+            response: { status: 200, statusText: 'OK', headers: [], cookies: [], content: { size: 0, mimeType: 'application/json', text: '{"ok":true}' }, redirectURL: '', headersSize: -1, bodySize: 0 },
+            cache: {}, timings: {},
+        }];
+        const r = await replayAll({ entries, vars: { TOK: 'real-token', RUN: '7' } });
+        assert.strictEqual(r.samples.length, 1);
+        assert.strictEqual(r.samples[0].status, 200);
+        assert.match(received.url, /token=real-token/, 'var substitution applied to URL');
+        assert.strictEqual(received.headers['x-run'], '7', 'var substitution applied to header');
+    } finally {
+        await new Promise(r => server.close(r));
+    }
+});
+
+test('engine API contract: src/engine.js exports every member of the documented surface', () => {
+    const E = require('../src/engine');
+    for (const k of ['HarParser', 'orchestrator', 'jmeterDetector', 'recordingXml', 'stripListenerFilenames',
+                     'paramAdvisor', 'dataSynth', 'clientSide', 'jmxSource', 'jtlParser', 'harComparator', 'assertionMiner']) {
+        assert.ok(E[k], `engine surface missing: ${k}`);
+    }
 });

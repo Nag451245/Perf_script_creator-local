@@ -34,21 +34,36 @@ const OUTPUT = path.join(ROOT, 'output');
 function loadConfig() {
     const p = path.join(ROOT, 'perfscript.config.json');
     if (!fs.existsSync(p)) return {};
-    try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+    // Strip a leading UTF-8 BOM — Windows editors / PowerShell Out-File add one
+    // and it makes JSON.parse throw, silently dropping the whole config.
+    try { return JSON.parse(fs.readFileSync(p, 'utf8').replace(/^﻿/, '')); }
     catch (e) { console.warn(`WARNING: perfscript.config.json is not valid JSON (${e.message}) — ignoring it.`); return {}; }
 }
 const CONFIG = loadConfig();
 if (CONFIG.jmeterHome && !process.env.JMETER_HOME) process.env.JMETER_HOME = CONFIG.jmeterHome;
+// Pin the Java that JMeter uses. JMeter 5.6.3's bundled Groovy can't compile
+// JSR223 under Java 22+ (class major >= 66) — it silently produces ZERO samples.
+// IMPORTANT: jmeter.bat does NOT honor JAVA_HOME; it launches `java.exe` from
+// PATH. So pinning a JDK 8-21 means PREPENDING its bin to PATH (we also set
+// JAVA_HOME for tools that do respect it).
+if (CONFIG.javaHome) {
+    process.env.JAVA_HOME = CONFIG.javaHome;
+    process.env.PATH = path.join(CONFIG.javaHome, 'bin') + path.delimiter + (process.env.PATH || '');
+}
 if (CONFIG.gemini && CONFIG.gemini.apiKey && !process.env.GOOGLE_API_KEY) process.env.GOOGLE_API_KEY = CONFIG.gemini.apiKey;
 
-const { HarParser, recordingXml } = require('./src/engine');
+const { recordingXml } = require('./src/engine');
 const { generate } = require('./src/generate');
 const { runValidate } = require('./src/runner');
 const { writeHtmlReport } = require('./src/report');
+const { groupInputs, loadUnit } = require('./src/ingest');
+const { scrubRecordingXml } = require('./src/scrubber');
+const { replayAll } = require('./src/fast-replay');
 
 const args = process.argv.slice(2);
 const DO_RUN = args.includes('--run');
 const WATCH = args.includes('--watch');
+const FAST_LOOP = args.includes('--fast-loop');
 
 const iterFlag = args.indexOf('--iterations');
 const MAX_ITER = iterFlag >= 0
@@ -58,38 +73,84 @@ const MAX_ITER = iterFlag >= 0
 const processed = new Set();
 
 function log(line) { process.stdout.write(`${line}\n`); }
-function safeName(file) {
-    return path.basename(file).replace(/\.har$/i, '').replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 60);
+function safeName(name) {
+    return String(name || '').replace(/[^a-zA-Z0-9-_]/g, '_').slice(0, 60);
 }
 
-async function processHar(file) {
-    const name = safeName(file);
+async function processUnit(unit) {
+    const name = safeName(unit.name);
     const outDir = path.join(OUTPUT, name);
     fs.mkdirSync(outDir, { recursive: true });
     const lines = [];
     const rec = (s) => { lines.push(s); log(`   ${s}`); };
 
-    log(`\n▶ ${path.basename(file)}`);
-    let har;
+    let inputLabel;
+    if (unit.kind === 'dual-har') {
+        inputLabel = `${path.basename(unit.primary)} + ${path.basename(unit.secondary)} (dual-recording, HAR)`;
+    } else if (unit.kind === 'dual-jmx') {
+        const sc1 = unit.sidecars?.primary ? ` (+${path.basename(unit.sidecars.primary)})` : '';
+        const sc2 = unit.sidecars?.secondary ? ` (+${path.basename(unit.sidecars.secondary)})` : '';
+        inputLabel = `${path.basename(unit.primary)}${sc1} + ${path.basename(unit.secondary)}${sc2} (dual-recording, JMX)`;
+    } else if (unit.secondary) {
+        inputLabel = `${path.basename(unit.primary)} + ${path.basename(unit.secondary)} (JMX + response side)`;
+    } else {
+        inputLabel = path.basename(unit.primary);
+    }
+    log(`\n▶ ${inputLabel}`);
+
+    let loaded;
     try {
-        har = new HarParser().parseFromBuffer(fs.readFileSync(file));
+        loaded = await loadUnit(unit);
     } catch (e) {
         rec(`PARSE FAILED: ${e.message}`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
         return;
     }
-    const entries = (har.log && har.log.entries) || [];
-    const pages = (har.log && har.log.pages) || [];
-    rec(`parsed ${entries.length} entries, ${pages.length} pages`);
+    const { entries, pages, mode, notes } = loaded;
+    rec(`mode=${mode} · parsed ${entries.length} entries, ${pages.length} pages`);
+    if (notes.dualHar) rec(`dual-recording variance: ${notes.dualHar.dynamicValueCount} dynamic values across the two runs`);
+    if (notes.dualHarError) rec(`dual-recording comparison failed (${notes.dualHarError}) — continuing with first recording only`);
+    if (notes.jmxJtl) rec(`JMX paired with ${notes.jmxJtl.sidecar}: ${notes.jmxJtl.paired}/${entries.length} response sides matched`);
+    if (notes.jmxJtlError) rec(notes.jmxJtlError);
 
     // Recording XML sidecar (full request/response bodies for reference).
+    // Scrub obvious secrets (password / Authorization / *token*) so the
+    // artifact is shareable; originals to a gitignored sibling for replay.
     try {
-        fs.writeFileSync(
-            path.join(outDir, `${name}.recording.xml`),
-            recordingXml.generate(entries, { sourceFile: name })
-        );
-        rec('wrote recording.xml');
+        const raw = recordingXml.generate(entries, { sourceFile: name });
+        const { xml: scrubbed, hits } = scrubRecordingXml(raw);
+        fs.writeFileSync(path.join(outDir, `${name}.recording.xml`), scrubbed);
+        if (hits.length) {
+            fs.writeFileSync(
+                path.join(outDir, `${name}_secrets.json`),
+                JSON.stringify({ note: 'gitignored — original values redacted from recording.xml', hits }, null, 2)
+            );
+            rec(`wrote recording.xml · scrubbed ${hits.length} secret field(s) -> ${name}_secrets.json`);
+        } else {
+            rec('wrote recording.xml');
+        }
     } catch (e) { rec(`recording.xml skipped: ${e.message}`); }
+
+    const genOpts = { dualHarHints: notes };
+
+    // Optional pre-flight: replay the recording against the target with our
+    // Node-only fast-replay engine. Catches the obvious "doesn't even respond"
+    // class of failures in <1s without booting JMeter. Honest pre-flight only;
+    // the full --run still owns "is this script good enough to ship."
+    if (FAST_LOOP) {
+        const runCfg = CONFIG.run || {};
+        const targetBase = (runCfg.targetBaseUrlOverride || '').trim() || null;
+        if (!targetBase) {
+            rec('--fast-loop skipped: run.targetBaseUrlOverride is required to pick a target.');
+        } else {
+            rec(`fast-replay → ${targetBase} (Node, no JMeter)`);
+            try {
+                const fr = await replayAll({ entries, targetBaseUrl: targetBase, insecure: !!(runCfg.fastReplay && runCfg.fastReplay.insecure), onLog: rec });
+                fs.writeFileSync(path.join(outDir, `${name}_fast_replay.json`), JSON.stringify(fr, null, 2));
+                rec(`fast-replay: ${fr.samples.filter(s => s.success).length}/${fr.samples.length} ok · drift=${fr.drift.length} · errors=${fr.errors.length} · ${fr.durationMs}ms`);
+            } catch (e) { rec(`fast-replay error: ${e.message}`); }
+        }
+    }
 
     if (DO_RUN) {
         try {
@@ -99,6 +160,7 @@ async function processHar(file) {
                 runCfg: CONFIG.run || {},
                 maxIterations: MAX_ITER,
                 onLog: rec,
+                genOpts,
             });
             if (!out.ok) {
                 rec(`cannot run: ${out.error} — falling back to generate-only.`);
@@ -110,7 +172,15 @@ async function processHar(file) {
                 rec(`DONE — verdict=${verdict} · ` +
                     `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
-                writeHtmlReport(outDir, name, { mode: 'generate + run', verdict, stats: out.stats, samples: out.result.samples || [] });
+                writeHtmlReport(outDir, name, {
+                    mode: `generate + run (${mode})`, verdict,
+                    stats: out.stats, samples: out.result.samples || [],
+                    baselineDiff: out.baselineDiff,
+                    correlations: out.correlations || [],
+                    dualHar: notes.dualHar || null,
+                    loadProfile: (out.stats && out.stats.loadProfile) || null,
+                    reasoning: out.reasoning || [],
+                });
                 rec(`open ${name}_report.html for a summary`);
                 return;
             }
@@ -121,14 +191,21 @@ async function processHar(file) {
 
     // Generate-only path.
     try {
-        const gen = generate(entries, pages, outDir, name);
+        const gen = generate(entries, pages, outDir, name, genOpts);
         fs.writeFileSync(path.join(outDir, `${name}_report.json`), JSON.stringify(gen.stats, null, 2));
         rec(`generated JMX — ${gen.stats.samplers} samplers, ${gen.stats.correlations} correlations, ` +
             `${gen.stats.parameterized} parameterized field(s)${gen.csvFile ? ` → ${gen.csvFile}` : ''}, ` +
             `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ` +
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
-        writeHtmlReport(outDir, name, { mode: 'generate only', verdict: 'generated', stats: gen.stats, samples: [] });
+        writeHtmlReport(outDir, name, {
+            mode: `generate only (${mode})`, verdict: 'generated',
+            stats: gen.stats, samples: [],
+            correlations: gen.correlations || [],
+            dualHar: notes.dualHar || null,
+            loadProfile: gen.loadProfile || null,
+            reasoning: gen.reasoning || [],
+        });
         rec(`open ${name}_report.html for a summary`);
     } catch (e) {
         rec(`GENERATE FAILED: ${e.message}`);
@@ -137,12 +214,21 @@ async function processHar(file) {
 }
 
 async function scanOnce() {
-    const files = fs.readdirSync(INPUT).filter(f => /\.har$/i.test(f)).map(f => path.join(INPUT, f));
-    const fresh = files.filter(f => !processed.has(f));
+    const all = fs.readdirSync(INPUT)
+        .filter(f => /\.(har|jmx|xml|jtl)$/i.test(f))
+        .map(f => path.join(INPUT, f));
+    const units = groupInputs(all);
+    const fresh = units.filter(u => !processed.has(u.primary));
     if (fresh.length === 0 && !WATCH) {
-        log(`No .har files in ${INPUT}. Drop recordings there and re-run.`);
+        log(`No HAR / JMX files in ${INPUT}. Drop recordings there and re-run.`);
     }
-    for (const f of fresh) { processed.add(f); await processHar(f); }
+    for (const u of fresh) {
+        processed.add(u.primary);
+        if (u.secondary) processed.add(u.secondary);
+        if (u.sidecars?.primary) processed.add(u.sidecars.primary);
+        if (u.sidecars?.secondary) processed.add(u.sidecars.secondary);
+        await processUnit(u);
+    }
 }
 
 (async () => {
@@ -153,7 +239,17 @@ async function scanOnce() {
     await scanOnce();
     if (WATCH) {
         log(`\nWatching ${INPUT} … (Ctrl+C to stop)`);
-        setInterval(scanOnce, 3000);
+        // Serialized poll loop: the next scan only schedules AFTER the
+        // current one settles. setInterval would re-enter if a scan took
+        // longer than the interval (large HAR + --run + --fast-loop can
+        // easily exceed 3s), racing on `processed` and double-writing
+        // outputs. Chained setTimeout is the right primitive here.
+        const tick = async () => {
+            try { await scanOnce(); }
+            catch (e) { log(`watch scan error: ${e.message}`); }
+            setTimeout(tick, 3000);
+        };
+        setTimeout(tick, 3000);
     } else {
         log('\nDone.');
     }

@@ -6,3 +6,5 @@ input/*
 *.log
 .env
 perfscript.config.json
+**/*_secrets.json
+**/_baseline_diff.json

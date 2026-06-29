@@ -500,6 +500,32 @@ function applyLoadProfile(xml, profile = {}) {
  *
  * @returns {{ xml: string, disabled: number, writerJtlPath: string }}
  */
+/**
+ * Disable (comment-out equivalent) samplers whose domain+path matches any of
+ * `patterns`. Used to drop un-replayable IdP plumbing (auth0 /authorize/resume,
+ * /interceptor/, jwt create-cookie) that should be auto-followed via redirects
+ * rather than replayed with stale single-use tokens. Sets enabled="false" so
+ * the sampler stays in the JMX for review (re-enable in GUI), JMeter just skips it.
+ *
+ * @returns {{ xml, disabled, hits: string[] }}
+ */
+function disableSamplersByPattern(xml, patterns) {
+    if (!Array.isArray(patterns) || patterns.length === 0) return { xml, disabled: 0, hits: [] };
+    let disabled = 0; const hits = [];
+    const out = xml.replace(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g, (m, attrs, inner) => {
+        const path = (inner.match(/<stringProp name="HTTPSampler\.path">([^<]*)</) || [])[1] || '';
+        const domain = (inner.match(/<stringProp name="HTTPSampler\.domain">([^<]*)</) || [])[1] || '';
+        const name = (attrs.match(/testname="([^"]*)"/) || [])[1] || '';
+        const hay = `${domain}${path} ${name}`;
+        if (patterns.some(p => hay.includes(p)) && /enabled="true"/.test(attrs)) {
+            disabled++; hits.push((name || path).slice(0, 60));
+            return `<HTTPSamplerProxy${attrs.replace('enabled="true"', 'enabled="false"')}>${inner}</HTTPSamplerProxy>`;
+        }
+        return m;
+    });
+    return { xml: out, disabled, hits };
+}
+
 function stripGuiListenersForRun(xml, jtlPath) {
     let disabled = 0;
     const out = xml.replace(/<ResultCollector\b([^>]*?)enabled="true"([^>]*)>/g, (_m, a, b) => {
@@ -535,6 +561,7 @@ function stripGuiListenersForRun(xml, jtlPath) {
 }
 
 module.exports = {
+    disableSamplersByPattern,
     wrapPollingInWhileController,
     injectGhostSynthesizers,
     injectAssertionsFromMined,

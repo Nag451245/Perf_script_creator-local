@@ -98,7 +98,7 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
  *
  * @returns {Promise<{ ok:boolean, dir?:string, error?:string }>}
  */
-function generateHtmlDashboard({ jmeterBinPath, jtlPath, outDir, onLog = () => {} }) {
+function generateHtmlDashboard({ jmeterBinPath, jtlPath, outDir, onLog = () => {}, timeoutMs = 60_000 }) {
     return new Promise(resolve => {
         if (!jmeterBinPath || !jtlPath || !fs.existsSync(jtlPath)) {
             return resolve({ ok: false, error: 'missing jmeter binary or JTL' });
@@ -113,14 +113,25 @@ function generateHtmlDashboard({ jmeterBinPath, jtlPath, outDir, onLog = () => {
         const args = ['-g', q(jtlPath), '-o', q(dashDir)];
         const child = spawn(cmd, args, { windowsHide: true, shell: useShell });
         let stderr = '';
+        let done = false;
+        const finish = (result) => { if (done) return; done = true; clearTimeout(timer); resolve(result); };
+        // HARD timeout: jmeter -g can hang on malformed or huge JTLs, or when
+        // the bundled report templates miss a value. Without this the parent
+        // node process sits forever (we hit this exact bug — the whole --run
+        // looked "stuck" after a clean iteration finished).
+        const timer = setTimeout(() => {
+            try { child.kill('SIGKILL'); } catch { /* ignore */ }
+            onLog(`dashboard timed out after ${timeoutMs}ms; killed`);
+            finish({ ok: false, error: `jmeter -g timed out after ${timeoutMs}ms` });
+        }, timeoutMs);
         child.stderr.on('data', d => { stderr += String(d); });
-        child.on('error', err => resolve({ ok: false, error: err.message }));
+        child.on('error', err => finish({ ok: false, error: err.message }));
         child.on('exit', code => {
             if (code === 0 && fs.existsSync(path.join(dashDir, 'index.html'))) {
                 onLog(`dashboard ready: dashboard/index.html`);
-                resolve({ ok: true, dir: dashDir });
+                finish({ ok: true, dir: dashDir });
             } else {
-                resolve({ ok: false, error: `jmeter -g exit ${code}: ${stderr.split('\n').slice(-3).join(' ')}` });
+                finish({ ok: false, error: `jmeter -g exit ${code}: ${stderr.split('\n').slice(-3).join(' ')}` });
             }
         });
     });

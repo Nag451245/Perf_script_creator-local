@@ -244,10 +244,16 @@ async function loadUnit(unit) {
  */
 function compareAndAnnotate(har1, har2, secondaryPath, notes, okKey, errKey) {
     try {
+        // HarComparator.compare() returns { matchedPairs, totalRequests,
+        // dynamicValues, summary, … }. Accept the engine's current shape AND
+        // a plain-array shape (for forward-compat / mocked inputs).
         const cmp = new HarComparator().compare(har1, har2);
+        const dynamicList = Array.isArray(cmp)
+            ? cmp
+            : (cmp && Array.isArray(cmp.dynamicValues) ? cmp.dynamicValues : []);
         const dynamicValues = new Set();
         const dynamicsByName = new Map();
-        for (const dv of cmp || []) {
+        for (const dv of dynamicList) {
             if (dv.value1) dynamicValues.add(String(dv.value1));
             if (dv.value2) dynamicValues.add(String(dv.value2));
             const name = dv.paramName || dv.name || dv.location || 'unknown';
@@ -264,6 +270,7 @@ function compareAndAnnotate(har1, har2, secondaryPath, notes, okKey, errKey) {
         }
         notes[okKey] = {
             run2File: path.basename(secondaryPath),
+            matchedPairs: (cmp && cmp.matchedPairs) || undefined,
             dynamicValueCount: dynamicValues.size,
             dynamicsByName: Object.fromEntries(dynamicsByName),
         };

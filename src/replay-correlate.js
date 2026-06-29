@@ -113,7 +113,18 @@ function buildLinks(entries) {
  * LIVE REPLAY with correlation + verification.
  * @returns {Promise<{ applied, verified, failures, samples, reachedEnd, links, orphans }>}
  */
-async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = true, timeoutMs, onLog = () => {} }) {
+// Un-replayable IdP/SPA plumbing — handled server-side via the redirect chain +
+// cookies, NOT by replaying the explicit call. Confirmed against a human-fixed
+// JMX (these were the calls disabled there). Skipping them + following redirects
+// is how the session actually establishes. (L3 would learn these automatically
+// via disable-and-verify; this is the curated seed set.)
+const PLUMBING = [
+    'authorize/resume', '/iam/callback', '/interceptor/', 'user/iam/authorize',
+    '/oauth/token', 'create-cookie', '/redirect/', 'ohttp_gateway',
+    'domainreliability', 'safebrowsing', 'passwordsleakcheck', '.dynatrace.', 'gvt2.com',
+];
+
+async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = true, timeoutMs, skipPatterns = PLUMBING, onLog = () => {} }) {
     const { links, orphans } = buildLinks(entries);
     onLog(`pre-pass: ${links.length} producer→consumer link(s), ${orphans.length} orphan value(s) (client-gen/synth candidates)`);
 
@@ -130,11 +141,36 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
     const samples = [];
     const failures = [];
     const appliedSet = new Set();
-    let reachedEnd = true;
+
+    // Harvest model: a value can surface in ANY live response — including a
+    // FOLLOWED redirect (e.g. the auth `code` lands in /iam/callback, which we
+    // reach by following 302s, not by replaying it). So after every live
+    // response we try to resolve any not-yet-resolved link by its boundary.
+    const unresolved = new Set(links);
+    const liveTextOf = (r) => (Object.entries(r.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n')) + '\n' + (r.body || '');
+    const harvest = (r) => {
+        if (!r) return;
+        const txt = liveTextOf(r);
+        for (const lk of [...unresolved]) {
+            const live = extractByBoundary(txt, lk.boundary);
+            if (live != null && live !== '') { vars[lk.varName] = live; unresolved.delete(lk); }
+        }
+    };
 
     for (let i = 0; i < entries.length; i++) {
         const e = entries[i];
         if (!e.request || !e.request.url) continue;
+
+        // Skip recorded redirect HOPS (recorded 3xx). The browser followed them
+        // automatically; replaying them explicitly resends a stale single-use
+        // state/code → 401. We follow the LIVE redirect chain from the initiator
+        // instead (below), which carries the fresh values + cookies. This is the
+        // "let it follow redirects" technique that makes the IdP plumbing work.
+        const recStatusEarly = Number(e.response && e.response.status || 0);
+        if (recStatusEarly >= 300 && recStatusEarly < 400) { samples.push({ index: i, url: e.request.url, status: 'skipped-redirect-hop', success: true }); continue; }
+
+        // Skip un-replayable plumbing (handled via redirects + cookies).
+        if (skipPatterns.some(p => (e.request.url || '').includes(p))) { samples.push({ index: i, url: e.request.url, status: 'skipped-plumbing', success: true }); continue; }
 
         // Apply correlations: rewrite a COPY of the entry, replacing recorded
         // literals with ${var} so fast-replay substitutes the LIVE value.
@@ -160,6 +196,17 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
         let r;
         try {
             r = await replayOne({ entry: reqEntry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs });
+            // Follow the LIVE redirect chain (cookies accumulate in cookieJar),
+            // so auth0's /authorize/resume → /iam/callback → ... resolve with the
+            // server's fresh state/code instead of our recorded stale ones.
+            harvest(r);
+            let curUrl = reqEntry.request.url; let hops = 0;
+            while (r && r.status >= 300 && r.status < 400 && r.headers && r.headers.location && hops < 12) {
+                curUrl = new URL(r.headers.location, curUrl).toString();
+                r = await replayOne({ entry: { request: { method: 'GET', url: curUrl, headers: [] } }, vars, cookieJar, targetBaseUrl, insecure, timeoutMs });
+                harvest(r);   // harvest from each followed hop (the auth code lands here)
+                hops++;
+            }
         } catch (err) {
             samples.push({ index: i, url: e.request.url, status: 0, error: err.message, success: false });
             continue;
@@ -171,16 +218,6 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
         const diverged = recStatus && recStatus < 400 && r.status >= 400;
         samples.push({ index: i, url: e.request.url, status: r.status, recStatus, success: ok });
         if (diverged) failures.push({ index: i, url: e.request.url, status: r.status, recStatus });
-
-        // Harvest: extract LIVE values this response produces, by boundary.
-        const produces = linksByProducer.get(i) || [];
-        if (produces.length) {
-            const liveText = (Object.entries(r.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n')) + '\n' + (r.body || '');
-            for (const lk of produces) {
-                const live = extractByBoundary(liveText, lk.boundary);
-                if (live != null) vars[lk.varName] = live;
-            }
-        }
     }
 
     const verified = [...appliedSet].length;

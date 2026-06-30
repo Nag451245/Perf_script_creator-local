@@ -172,35 +172,6 @@ function verifyExtractor(der, value, entries) {
     return false;
 }
 
-// A response-capture regex for a rolling-token updater, derived from the extractor.
-function rollingPattern(der) {
-    if (der.kind === 'json') { const key = der.expr.replace('$..', ''); return `"${key}"\\s*:\\s*"([^"]+)"`; }
-    if (der.kind === 'css') { const nm = (der.expr.match(/\[name="([^"]+)"\]/) || [])[1]; return nm ? `name="${nm}"[^>]*value="([^"]+)"` : null; }
-    if (der.kind === 'regex') return der.expr;
-    return null;
-}
-
-// Inject a THREAD-SCOPE JSR223 PostProcessor that refreshes a rotating token's
-// var from ANY response that contains it (conditional — never clobbers on miss).
-// This is the correct JMeter pattern for a rotating CSRF/token: one updater at
-// thread scope runs after every sampler, so the var is always the latest issued.
-function injectThreadScopePostProc(xml, varName, pattern) {
-    const script = `def s=prev.getResponseDataAsString(); def m=(s=~/${pattern}/); if(m.find()){ vars.put("${varName}", m.group(1)); }`;
-    const block = `
-      <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="Roll ${escXml(varName)} (rotating token)" enabled="true">
-        <stringProp name="cacheKey">true</stringProp>
-        <stringProp name="filename"></stringProp>
-        <stringProp name="parameters"></stringProp>
-        <stringProp name="script">${escXml(script)}</stringProp>
-        <stringProp name="scriptLanguage">groovy</stringProp>
-      </JSR223PostProcessor>
-      <hashTree/>`;
-    const m = xml.match(/<\/ThreadGroup>\s*<hashTree>/);
-    if (!m) return xml;
-    const at = m.index + m[0].length;
-    return xml.slice(0, at) + block + xml.slice(at);
-}
-
 // Index JMX samplers with their domain+path so we can match a producer entry.
 function indexJmxSamplers(xml) {
     const out = [];
@@ -246,57 +217,44 @@ function correlateJmx(jmxXml, dynamics, entries) {
         varFor.set(k, v); return v;
     };
 
-    // Var name from the extractor's SOURCE field (so x-csrf-token / X-CSRF-TOKEN /
-    // csrfToken all collapse to one var when they read the same response field).
-    const varNameFromDer = (der) => {
-        if (der.kind === 'json') return der.expr.replace('$..', '').replace(/[^A-Za-z0-9_]/g, '_');
-        if (der.kind === 'css') return ((der.expr.match(/\[name="([^"]+)"\]/) || [])[1] || 'v').replace(/[^A-Za-z0-9_]/g, '_');
-        return ((der.expr.match(/^([\w-]+)[=:]/) || [])[1] || 'v').replace(/[^A-Za-z0-9_]/g, '_');
-    };
-
-    // Build VERIFIED plans grouped by EXTRACTOR IDENTITY (same source field), not
-    // by request param name. This merges a value that appears under several names
-    // (csrfToken in a JSON response, x-csrf-token in a header) into ONE var. A
-    // group with MULTIPLE distinct values = a ROTATING token (fresh each response).
-    const byExtractor = new Map(); // key -> { der, values:Set, varName }
+    // Pass 1: derive + inject extractors (reverse document order so offsets hold).
+    const plans = [];
     for (const d of dynamics) {
-        const der = deriveExtractor(d.value, entries, '');
-        if (der.kind === 'synthesize') { synthesize.push({ name: d.name, value: d.value, reason: 'client-generated' }); continue; }
-        if (!verifyExtractor(der, d.value, entries)) { synthesize.push({ name: d.name, value: d.value, reason: 'extractor-unverified' }); continue; }
-        const key = `${der.kind}|${der.expr}|${der.useHeaders ? 1 : 0}`;
-        if (!byExtractor.has(key)) byExtractor.set(key, { der, values: new Set(), varName: varNameFromDer(der) });
-        byExtractor.get(key).values.add(d.value);
+        const varName = nameVar(d.name, d.value);
+        const der = deriveExtractor(d.value, entries, varName);
+        if (der.kind === 'synthesize') { synthesize.push({ name: d.name, value: d.value, var: varName }); continue; }
+        // Only wire extractors that VERIFIABLY capture the recorded value — never
+        // substitute a ${var} backed by a non-matching extractor (it would inject
+        // the DEFAULT and break the request).
+        if (!verifyExtractor(der, d.value, entries)) { synthesize.push({ name: d.name, value: d.value, var: varName, reason: 'extractor-unverified' }); continue; }
+        plans.push({ d, der, varName });
     }
-    const byName = byExtractor; // (grouped by extractor; iterate the same way)
-
-    // value -> var map for substitution (all values of a name map to its one var).
-    const valToVar = new Map();
-    for (const [, g] of byName) for (const v of g.values) valToVar.set(v, g.varName);
-
-    for (const [name, g] of byName) {
-        if (g.values.size > 1) {
-            // ROTATING: one thread-scope updater (always-latest), no per-producer extractor.
-            const pat = rollingPattern(g.der);
-            if (pat) {
-                xml = injectThreadScopePostProc(xml, g.varName, pat);
-                applied.push({ name, var: g.varName, kind: g.der.kind, mode: 'rolling', values: g.values.size });
-                continue;
-            }
-        }
-        // ONE-SHOT: inject the extractor into its producer sampler's hashTree.
+    // Inject each extractor INTO its producer sampler's child hashTree (the only
+    // valid place for a post-processor). Match producer entry → JMX sampler by
+    // path; use the engine's injectAfterSampler (takes sampler ORDER, re-indexes
+    // each call, so iterating is safe — we don't add samplers).
+    for (const p of plans) {
         const samplers = indexJmxSamplers(xml);
-        const prodPath = pathOf(g.der.producerUrl);
+        const prodPath = pathOf(p.der.producerUrl);
         const order = samplers.findIndex(s => s.path && (s.path.split('?')[0] === prodPath || s.path.startsWith(prodPath)));
         if (order < 0) continue;
-        const next = injectAfterSampler(xml, order, extractorXml({ ...g.der, refName: g.varName }));
-        if (next && next !== xml) { xml = next; applied.push({ name, var: g.varName, kind: g.der.kind, mode: 'oneshot' }); }
+        const next = injectAfterSampler(xml, order, extractorXml(p.der));
+        if (next && next !== xml) {
+            xml = next;
+            applied.push({ name: p.d.name, var: p.varName, kind: p.der.kind, producer: prodPath });
+        }
     }
 
-    // Substitute every recorded value with its ${var} — SCOPED to request fields
-    // (HTTPSamplerProxy + HeaderManager) so we don't corrupt extractors/structure.
+    // Pass 2: substitute recorded values with ${var} — SCOPED to request fields
+    // (HTTPSamplerProxy + HeaderManager blocks) only. A global replace corrupts
+    // extractor regexes/testnames/structure and degrades the script; scoping
+    // keeps it to where requests actually send the value.
     const applyScoped = (block) => {
         let b = block;
-        for (const [v, vr] of valToVar) { if (b.includes(v)) { b = b.split(v).join('${' + vr + '}'); n++; } }
+        for (const p of plans) {
+            const ref = '${' + p.varName + '}';
+            if (b.includes(p.d.value)) { b = b.split(p.d.value).join(ref); n++; }
+        }
         return b;
     };
     xml = xml

@@ -135,6 +135,43 @@ function extractorXml(d) {
             <hashTree/>`;
 }
 
+/**
+ * VERIFY the derived extractor actually captures the recorded value from the
+ * recorded producer response. If it doesn't, we must NOT wire it — substituting
+ * ${var} for a non-matching extractor injects the DEFAULT (e.g. state_NOTFOUND)
+ * into the request and breaks it (this is exactly what degraded login). Only
+ * verified extractors get applied; everything else is left as the input had it.
+ */
+function verifyExtractor(der, value, entries) {
+    const e = entries.find(x => (x.request && x.request.url) === der.producerUrl)
+        || entries.find(x => pathOf(x.request && x.request.url) === pathOf(der.producerUrl));
+    if (!e) return false;
+    const r = e.response || {};
+    const body = (r.content && r.content.text) || '';
+    const hdrs = (r.headers || []).map(h => `${h.name}: ${h.value}`).join('\n');
+    try {
+        if (der.kind === 'regex') {
+            const hay = der.useHeaders ? hdrs : (body + '\n' + hdrs);
+            const m = hay.match(new RegExp(der.expr));
+            return !!(m && m[1] === value);
+        }
+        if (der.kind === 'css') {
+            const nameM = der.expr.match(/\[name="([^"]+)"\]/);
+            if (!nameM) return false;
+            const name = nameM[1];
+            const m = body.match(new RegExp('name="' + escRe(name) + '"[^>]*value="([^"]*)"'))
+                || body.match(new RegExp('value="([^"]*)"[^>]*name="' + escRe(name) + '"'));
+            return !!(m && m[1] === value);
+        }
+        if (der.kind === 'json') {
+            const key = der.expr.replace('$..', '');
+            const m = body.match(new RegExp('"' + escRe(key) + '"\\s*:\\s*"([^"]*)"'));
+            return !!(m && m[1] === value);
+        }
+    } catch { return false; }
+    return false;
+}
+
 // Index JMX samplers with their domain+path so we can match a producer entry.
 function indexJmxSamplers(xml) {
     const out = [];
@@ -186,6 +223,10 @@ function correlateJmx(jmxXml, dynamics, entries) {
         const varName = nameVar(d.name, d.value);
         const der = deriveExtractor(d.value, entries, varName);
         if (der.kind === 'synthesize') { synthesize.push({ name: d.name, value: d.value, var: varName }); continue; }
+        // Only wire extractors that VERIFIABLY capture the recorded value — never
+        // substitute a ${var} backed by a non-matching extractor (it would inject
+        // the DEFAULT and break the request).
+        if (!verifyExtractor(der, d.value, entries)) { synthesize.push({ name: d.name, value: d.value, var: varName, reason: 'extractor-unverified' }); continue; }
         plans.push({ d, der, varName });
     }
     // Inject each extractor INTO its producer sampler's child hashTree (the only

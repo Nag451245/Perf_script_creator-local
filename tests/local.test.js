@@ -19,7 +19,7 @@ const { writeHtmlReport } = require('../src/report');
 const { escalateToLlm } = require('../src/runner');
 const { groupInputs } = require('../src/ingest');
 const { knownDefinedVars, planExtractor, _internal: extractorsInternal } = require('../src/extractors');
-const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun } = require('../src/transforms');
+const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun, rewireClientMintedOauthVars } = require('../src/transforms');
 const { scrubRecordingXml } = require('../src/scrubber');
 const { rewriteHost } = require('../src/host-rewrite');
 const { diffRunAgainstRecording, _internal: verifierInternal } = require('../src/verifier');
@@ -542,4 +542,135 @@ test('engine API contract: src/engine.js exports every member of the documented 
                      'paramAdvisor', 'dataSynth', 'clientSide', 'jmxSource', 'jtlParser', 'harComparator', 'assertionMiner']) {
         assert.ok(E[k], `engine surface missing: ${k}`);
     }
+});
+
+// ─── rewireClientMintedOauthVars ────────────────────────────────────
+// Regression for the real-world Auth0 OAuth chain: the engine often adds
+// a RegexExtractor for `state` / `nonce` (it sees the same value across
+// two recordings and assumes it can be extracted from a response). But
+// those values are client-minted CSRF tokens, so the extractor never
+// fires and ${state} resolves to "". This transform strips the dud
+// extractor and adds a JSR223 PreProcessor that mints fresh values.
+
+function makeOauthJmx(extractorRefname = 'state', urlHasAuthorize = true) {
+    // Realistic OAuth2 /authorize entry URL: has client_id + response_type +
+    // redirect_uri alongside state/nonce. The transform requires those
+    // hallmarks before treating the URL as an OAuth2 entry call.
+    const path = urlHasAuthorize
+        ? '/authorize?response_type=code&amp;client_id=abc&amp;redirect_uri=cb&amp;state=${state}&amp;nonce=${nonce}'
+        : '/api/users?state=${state}';
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0">
+  <hashTree>
+    <TestPlan testname="t" enabled="true"><stringProp name="x">y</stringProp></TestPlan>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">1</stringProp>
+      </ThreadGroup>
+      <hashTree>
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="GET /authorize" enabled="true">
+          <stringProp name="HTTPSampler.path">${path}</stringProp>
+          <stringProp name="HTTPSampler.method">GET</stringProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="ext ${extractorRefname}" enabled="true">
+            <stringProp name="RegexExtractor.refname">${extractorRefname}</stringProp>
+            <stringProp name="RegexExtractor.regex">noop()</stringProp>
+            <stringProp name="RegexExtractor.template">$1$</stringProp>
+          </RegexExtractor>
+          <hashTree/>
+        </hashTree>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>`;
+}
+
+test('OAuth rewire: strips dud state extractor + injects per-iteration synthesizer', () => {
+    const xml = makeOauthJmx('state', true);
+    const r = rewireClientMintedOauthVars(xml);
+    assert.ok(r.rewired.includes('state'), 'state should be rewired');
+    assert.ok(r.rewired.includes('nonce'), 'nonce (used in URL) should also be synthesized');
+    assert.doesNotMatch(r.xml, /<RegexExtractor[^>]*>[\s\S]*?refname">state</,
+        'the dud state RegexExtractor must be gone');
+    assert.match(r.xml, /OAuth state\/nonce synthesizer/, 'PreProcessor inserted');
+    // script lives inside a <stringProp>, so " gets XML-encoded as &quot;
+    assert.match(r.xml, /vars\.put\(&quot;state&quot;,\s*hex32\(\)\)/);
+    assert.match(r.xml, /vars\.put\(&quot;nonce&quot;,\s*hex32\(\)\)/);
+    assert.match(r.xml, /state=\$\{state\}.*nonce=\$\{nonce\}/, 'URL var-refs are preserved');
+});
+
+test('OAuth rewire: no-op when state extractor exists but no /authorize URL uses it', () => {
+    const xml = makeOauthJmx('state', /* urlHasAuthorize */ false);
+    const r = rewireClientMintedOauthVars(xml);
+    assert.strictEqual(r.rewired.length, 0, 'safety guard: must NOT touch non-OAuth state vars');
+    assert.match(r.xml, /<RegexExtractor[^>]*>[\s\S]*?refname">state</,
+        'extractor for unrelated state var must stay intact');
+    assert.doesNotMatch(r.xml, /OAuth state\/nonce synthesizer/);
+});
+
+test('OAuth rewire: idempotent (running twice does not double-inject)', () => {
+    const once = rewireClientMintedOauthVars(makeOauthJmx('state', true)).xml;
+    const twice = rewireClientMintedOauthVars(once).xml;
+    const occurrences = (twice.match(/OAuth state\/nonce synthesizer/g) || []).length;
+    assert.strictEqual(occurrences, 1, 'must not inject duplicate PreProcessor');
+});
+
+test('OAuth rewire: suffixed names (state_2, nonce_2) are LEFT ALONE — those are IdP session tokens needing extraction', () => {
+    // Real-world: Auth0 universal login issues a JWT-style state in the
+    // /authorize 302 Location header (state_2, state_3, …). It MUST be
+    // extracted from the response, not client-minted. We deliberately
+    // do not touch those — only the bare OAuth2 `state` / `nonce`.
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan><hashTree>
+  <TestPlan/>
+  <hashTree>
+    <ThreadGroup testname="tg" enabled="true"></ThreadGroup>
+    <hashTree>
+      <HTTPSamplerProxy testname="s1" enabled="true">
+        <stringProp name="HTTPSampler.path">/authorize?response_type=code&amp;client_id=abc&amp;redirect_uri=x&amp;state=\${state_2}&amp;nonce=\${nonce_2}</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree>
+        <RegexExtractor enabled="true">
+          <stringProp name="RegexExtractor.refname">state_2</stringProp>
+        </RegexExtractor>
+        <hashTree/>
+        <RegexExtractor enabled="true">
+          <stringProp name="RegexExtractor.refname">nonce_2</stringProp>
+        </RegexExtractor>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</hashTree></jmeterTestPlan>`;
+    const r = rewireClientMintedOauthVars(xml);
+    assert.deepStrictEqual(r.rewired, [], 'must NOT clobber suffixed IdP-session vars');
+    assert.match(r.xml, /<stringProp name="RegexExtractor\.refname">state_2/,
+        'state_2 extractor must remain so server-issued value can be captured');
+    assert.match(r.xml, /<stringProp name="RegexExtractor\.refname">nonce_2/);
+});
+
+test('OAuth rewire: only fires for /authorize URLs with OAuth2 hallmarks (client_id/response_type/redirect_uri)', () => {
+    // A generic `/authorize?token=x` (e.g. an internal API endpoint that
+    // happens to have "authorize" in the path) should NOT trigger.
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan><hashTree>
+  <TestPlan/>
+  <hashTree>
+    <ThreadGroup testname="tg" enabled="true"></ThreadGroup>
+    <hashTree>
+      <HTTPSamplerProxy testname="s1" enabled="true">
+        <stringProp name="HTTPSampler.path">/api/authorize?state=\${state}&amp;token=x</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree>
+        <RegexExtractor enabled="true">
+          <stringProp name="RegexExtractor.refname">state</stringProp>
+        </RegexExtractor>
+        <hashTree/>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</hashTree></jmeterTestPlan>`;
+    const r = rewireClientMintedOauthVars(xml);
+    assert.deepStrictEqual(r.rewired, [], 'safety: must not rewire on /authorize without OAuth2 query hallmarks');
 });

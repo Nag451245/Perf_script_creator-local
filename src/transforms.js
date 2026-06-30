@@ -450,6 +450,106 @@ function setBoolProp(block, name, value) {
  * @returns {{ xml: string, applied: object|null }}  the resolved profile that
  *   was written (or null if no profile keys were given).
  */
+/* ─────────────────────────────────────────────────────────────────
+ * 5b. Rewire client-minted OAuth vars (state/nonce) that the engine
+ *     mis-classified as server-extractable.
+ *
+ * The engine's correlator sometimes adds a RegexExtractor for `state` or
+ * `nonce` (because it sees the same value in multiple requests across
+ * the two recordings). But OAuth `state`/`nonce` are CLIENT-MINTED
+ * anti-CSRF tokens — there's no response to extract them from, so the
+ * extractor never fires, ${state} resolves to "", and /authorize
+ * returns 401. Cascading: no auth code → no bearer → every later API
+ * call returns 401.
+ *
+ * The fix is the opposite of extraction: mint a fresh value at the
+ * start of each iteration via a JSR223 PreProcessor at ThreadGroup
+ * scope, then let Auth0 echo it back (the round-trip works because
+ * state/nonce are opaque to the server).
+ *
+ * Safety: only rewires a refname when ${refname} appears in at least
+ * one URL containing `/authorize` (canonical OAuth marker), so we don't
+ * accidentally clobber unrelated `state` variables.
+ *
+ * @returns {{ xml: string, rewired: string[] }}
+ * ─────────────────────────────────────────────────────────────────── */
+const OAUTH_REWIRE_SENTINEL = 'OAuth state/nonce synthesizer (perfscript-local)';
+
+function rewireClientMintedOauthVars(xml) {
+    // Idempotency: if our sentinel PreProcessor is already in the XML,
+    // this transform has already run — bail out so we don't double-inject.
+    if (xml.includes(OAUTH_REWIRE_SENTINEL)) return { xml, rewired: [] };
+    // Only rewire the BARE OAuth2 client-side state/nonce. Suffixed
+    // variants (state_2, state_3, …) are almost always Auth0/OIDC
+    // universal-login session tokens that the IdP issues server-side
+    // and round-trips through the login form — those legitimately
+    // require extraction from the prior response. Clobbering them with
+    // client-minted random values breaks the IdP session entirely.
+    const refnameRe = /^(state|nonce)$/i;
+    // The OAuth2 /authorize entry call has a specific query-string
+    // shape (scope, response_type, client_id, redirect_uri). Require
+    // at least one of those alongside the state var so we don't
+    // mistake an unrelated `state` for the OAuth2 one.
+    const authorizeUrlRe = /<stringProp name="HTTPSampler\.path">([^<]*\/authorize\?[^<]*(?:client_id|response_type|redirect_uri)[^<]*)<\/stringProp>/g;
+    const authorizeUrls = [...xml.matchAll(authorizeUrlRe)].map(m => m[1]);
+    const varsUsedInAuthorize = new Set();
+    for (const url of authorizeUrls) {
+        for (const m of url.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g)) {
+            if (refnameRe.test(m[1])) varsUsedInAuthorize.add(m[1]);
+        }
+    }
+    if (varsUsedInAuthorize.size === 0) return { xml, rewired: [] };
+
+    const rewired = [];
+
+    // Strip any RegexExtractor whose refname is in our set. They're
+    // mis-classified — they extract from an unrelated response and
+    // produce empty strings.
+    let out = xml.replace(/<RegexExtractor\b[^>]*>[\s\S]*?<\/RegexExtractor>\s*<hashTree\/>\s*/g, (block) => {
+        const refMatch = block.match(/<stringProp name="RegexExtractor\.refname">([^<]+)<\/stringProp>/);
+        if (!refMatch) return block;
+        const refname = refMatch[1];
+        if (!varsUsedInAuthorize.has(refname)) return block;
+        rewired.push(refname);
+        return ''; // strip the dud extractor entirely
+    });
+
+    if (rewired.length === 0 && varsUsedInAuthorize.size === 0) {
+        return { xml, rewired: [] };
+    }
+
+    // Build a single PreProcessor that mints fresh values for all OAuth
+    // vars at iteration start. 32-char lowercase hex matches the format
+    // browsers/SDKs typically emit (and Auth0 accepts anything opaque).
+    const allVars = [...new Set([...varsUsedInAuthorize, ...rewired])];
+    const scriptLines = [
+        'def rand = new java.security.SecureRandom()',
+        'def hex32 = { -> String.format("%032x", new java.math.BigInteger(128, rand)) }',
+        ...allVars.map(v => `vars.put("${v}", hex32())`),
+    ];
+    const script = scriptLines.join('\n');
+
+    const preproc =
+        '\n      <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" ' +
+        `testname="${OAUTH_REWIRE_SENTINEL}" enabled="true">\n` +
+        '        <stringProp name="cacheKey">true</stringProp>\n' +
+        '        <stringProp name="filename"></stringProp>\n' +
+        '        <stringProp name="parameters"></stringProp>\n' +
+        '        <stringProp name="script">' + escXmlAttr(script) + '</stringProp>\n' +
+        '        <stringProp name="scriptLanguage">groovy</stringProp>\n' +
+        '      </JSR223PreProcessor>\n' +
+        '      <hashTree/>\n';
+
+    // Splice at the top of the first ThreadGroup's hashTree, so the
+    // PreProcessor runs once per iteration BEFORE any HTTP sampler.
+    const tgMatch = out.match(/<ThreadGroup\b[\s\S]*?<\/ThreadGroup>\s*<hashTree>/);
+    if (!tgMatch) return { xml: out, rewired }; // no ThreadGroup, nothing to splice
+    const insertAt = tgMatch.index + tgMatch[0].length;
+    out = out.slice(0, insertAt) + preproc + out.slice(insertAt);
+
+    return { xml: out, rewired: allVars };
+}
+
 function applyLoadProfile(xml, profile = {}) {
     const users     = Number.isFinite(+profile.users)     ? Math.max(1, parseInt(profile.users, 10))     : null;
     const rampUpSec = Number.isFinite(+profile.rampUpSec) ? Math.max(0, parseInt(profile.rampUpSec, 10)) : null;
@@ -564,6 +664,7 @@ module.exports = {
     disableSamplersByPattern,
     wrapPollingInWhileController,
     injectGhostSynthesizers,
+    rewireClientMintedOauthVars,
     injectAssertionsFromMined,
     injectGaussianTimers,
     applyLoadProfile,

@@ -15,6 +15,8 @@
  * Pure string/JMX surgery; no app-specific hardcoding — the field NAME and
  * location come from the recordings, so it generalizes to any app.
  */
+const { injectAfterSampler } = require('./extractors');
+
 const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const escXml = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -186,23 +188,20 @@ function correlateJmx(jmxXml, dynamics, entries) {
         if (der.kind === 'synthesize') { synthesize.push({ name: d.name, value: d.value, var: varName }); continue; }
         plans.push({ d, der, varName });
     }
-    // inject after producer samplers
-    const samplers = indexJmxSamplers(xml);
-    const injections = [];
+    // Inject each extractor INTO its producer sampler's child hashTree (the only
+    // valid place for a post-processor). Match producer entry → JMX sampler by
+    // path; use the engine's injectAfterSampler (takes sampler ORDER, re-indexes
+    // each call, so iterating is safe — we don't add samplers).
     for (const p of plans) {
+        const samplers = indexJmxSamplers(xml);
         const prodPath = pathOf(p.der.producerUrl);
-        const s = samplers.find(s => s.path && (s.path.split('?')[0] === prodPath || s.path.startsWith(prodPath)));
-        if (!s) continue;
-        injections.push({ at: s.end, block: extractorXml(p.der) });
-        applied.push({ name: p.d.name, var: p.varName, kind: p.der.kind, producer: prodPath });
-    }
-    injections.sort((a, b) => b.at - a.at);
-    for (const inj of injections) {
-        // insert the extractor block right after the sampler's </HTTPSamplerProxy>
-        // (JMeter needs the post-processor inside the sampler's sibling hashTree;
-        // for simplicity we place it immediately after, which JMeter treats as a
-        // following element — acceptable for generated scripts).
-        xml = xml.slice(0, inj.at) + inj.block + xml.slice(inj.at);
+        const order = samplers.findIndex(s => s.path && (s.path.split('?')[0] === prodPath || s.path.startsWith(prodPath)));
+        if (order < 0) continue;
+        const next = injectAfterSampler(xml, order, extractorXml(p.der));
+        if (next && next !== xml) {
+            xml = next;
+            applied.push({ name: p.d.name, var: p.varName, kind: p.der.kind, producer: prodPath });
+        }
     }
 
     // Pass 2: substitute every recorded value with ${var} in request fields.

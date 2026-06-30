@@ -204,13 +204,22 @@ function correlateJmx(jmxXml, dynamics, entries) {
         }
     }
 
-    // Pass 2: substitute every recorded value with ${var} in request fields.
-    for (const p of plans) {
-        const ref = '${' + p.varName + '}';
-        xml = xml.split(p.d.value).join(ref);
-        n++;
-    }
-    return { xml, applied, synthesize };
+    // Pass 2: substitute recorded values with ${var} — SCOPED to request fields
+    // (HTTPSamplerProxy + HeaderManager blocks) only. A global replace corrupts
+    // extractor regexes/testnames/structure and degrades the script; scoping
+    // keeps it to where requests actually send the value.
+    const applyScoped = (block) => {
+        let b = block;
+        for (const p of plans) {
+            const ref = '${' + p.varName + '}';
+            if (b.includes(p.d.value)) { b = b.split(p.d.value).join(ref); n++; }
+        }
+        return b;
+    };
+    xml = xml
+        .replace(/<HTTPSamplerProxy[\s\S]*?<\/HTTPSamplerProxy>/g, applyScoped)
+        .replace(/<HeaderManager[\s\S]*?<\/HeaderManager>/g, applyScoped);
+    return { xml, applied, synthesize, substitutions: n };
 }
 
 module.exports = { identifyDynamics, deriveExtractor, correlateJmx, _internal: { indexJmxSamplers, extractorXml } };

@@ -69,6 +69,8 @@ function listInputs() {
         .map(f => ({ name: f, size: fs.statSync(path.join(INPUT, f)).size }));
 }
 
+const THIRD_PARTY = /dynatrace|pendo|gvt2|beacons|googleapis|gstatic|safebrowsing|launchdarkly|newrelic|nr-data|ruxit|gravatar|\/bf\?|\/rb_|domainreliability|ohttp_gateway/i;
+
 function listOutputs() {
     if (!fs.existsSync(OUTPUT)) return [];
     return fs.readdirSync(OUTPUT, { withFileTypes: true })
@@ -78,10 +80,31 @@ function listOutputs() {
             const files = fs.readdirSync(dir);
             const report = files.find(f => /_report\.html$/i.test(f));
             const jmx = files.find(f => /\.jmx$/i.test(f) && !/recording/i.test(f)) || files.find(f => /\.jmx$/i.test(f));
-            let verdict = '';
-            const rj = files.find(f => /_report\.json$/i.test(f));
-            if (rj) { try { const j = JSON.parse(fs.readFileSync(path.join(dir, rj), 'utf8')); verdict = j.success === true ? 'GREEN' : (j.success === false ? 'needs attention' : (j.verdict || '')); } catch { /**/ } }
-            return { name: d.name, report, jmx, verdict, mtime: fs.statSync(dir).mtimeMs };
+            const o = { name: d.name, report, jmx, verdict: '', kind: 'generated', mtime: fs.statSync(dir).mtimeMs };
+            const rjName = files.find(f => /_report\.json$/i.test(f));
+            if (rjName) {
+                try {
+                    const j = JSON.parse(fs.readFileSync(path.join(dir, rjName), 'utf8'));
+                    if (Array.isArray(j.samples)) {
+                        // Validate run — report pass/fail (excluding transactions + 3rd-party noise).
+                        const reqs = j.samples.filter(s => !s.isTransaction);
+                        const app = reqs.filter(s => !THIRD_PARTY.test(s.url || s.label || ''));
+                        o.kind = 'validated';
+                        o.total = app.length;
+                        o.passed = app.filter(s => s.success === true).length;
+                        o.failed = app.filter(s => s.success === false).length;
+                        o.verdict = j.success === true ? 'GREEN' : 'needs attention';
+                        o.failedTop = app.filter(s => s.success === false).slice(0, 12)
+                            .map(s => ({ label: (s.label || s.name || '').slice(0, 48), code: s.responseCode || '' }));
+                    } else {
+                        // Generate-only — surface build stats.
+                        o.verdict = 'generated';
+                        o.samplers = j.samplers; o.correlations = j.correlations;
+                        o.bodyCorrelations = j.bodyCorrelations; o.parameterized = j.parameterized;
+                    }
+                } catch { /* ignore malformed */ }
+            }
+            return o;
         })
         .sort((a, b) => b.mtime - a.mtime);
 }
@@ -202,6 +225,21 @@ ul{list-style:none;margin:0;padding:0}li{display:flex;justify-content:space-betw
 li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .tag{font-size:12px;padding:2px 8px;border-radius:20px;background:#223050;color:var(--mut)}
 .tag.ok{background:rgba(57,217,138,.15);color:var(--ok)}.tag.warn{background:rgba(255,180,84,.15);color:var(--warn)}
+.bar{height:9px;background:#0e1524;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:12px 0 6px;display:none}
+.bar.on{display:block}
+.bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--ok));transition:width .5s ease;border-radius:6px}
+.bar.indet>i{width:38%;animation:slide 1.1s infinite ease-in-out}
+.bar.err>i{background:#ff6b6b}
+@keyframes slide{0%{margin-left:-38%}100%{margin-left:100%}}
+.phase{font-size:13px;color:var(--ink);font-weight:600}.elapsed{color:var(--mut);font-size:12px;margin-left:8px}
+.sum{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:4px 0}
+.pill{font-size:12px;padding:2px 9px;border-radius:20px;background:#223050;color:var(--mut)}
+.pill.ok{background:rgba(57,217,138,.15);color:var(--ok)}.pill.bad{background:rgba(255,107,107,.16);color:#ff8a8a}
+.fails{margin:6px 0 0;max-height:150px;overflow:auto}
+.fails div{font:12px ui-monospace,Consolas,monospace;color:#ffb0b0;padding:3px 0;border-bottom:1px solid var(--line)}
+.acts{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
+.dl{background:var(--ok);color:#04140c;padding:7px 13px;border-radius:8px;font-weight:600;font-size:13px;text-decoration:none}
+.open{background:#223050;color:var(--ink);padding:7px 13px;border-radius:8px;font-size:13px;text-decoration:none}
 #log{background:#0a0f1a;border:1px solid var(--line);border-radius:10px;padding:12px;height:280px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;color:#c8d3ea}
 .drop{border:1.5px dashed var(--line);border-radius:10px;padding:18px;text-align:center;color:var(--mut);cursor:pointer}
 .drop.hi{border-color:var(--acc);color:var(--ink)}
@@ -223,7 +261,9 @@ li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:
     <button id="run" class="ghost">Generate + Validate (JMeter)</button>
     <button id="cancel" class="danger" style="display:none">Cancel</button>
    </div>
-   <p class="mut" style="font-size:13px">Generate = correlate &amp; build the .jmx. Validate = also execute it with local JMeter and report pass/fail.</p>
+   <div id="bar" class="bar"><i></i></div>
+   <div><span id="phase" class="phase"></span><span id="elapsed" class="elapsed"></span></div>
+   <p class="mut" style="font-size:13px">Generate = correlate &amp; build the .jmx. Validate = also execute it with local JMeter and report pass/fail. The final <code>.jmx</code> is always saved to <code>output\\&lt;name&gt;\\</code>.</p>
    <div id="status" class="mut"></div>
   </div>
   <div class="card full">
@@ -261,13 +301,34 @@ async function refresh(){
  const s=await j('/api/state');
  $('#inputs').innerHTML=s.inputs.length?s.inputs.map(f=>\`<li><span>\${esc(f.name)} <span class="mut">\${(f.size/1024|0)} KB</span></span><span class="x" onclick="del('\${esc(f.name)}')">remove</span></li>\`).join(''):'<li class="mut">No recordings yet.</li>';
  $('#outputs').innerHTML=s.outputs.length?s.outputs.map(o=>{
-   const t=o.verdict==='GREEN'?'<span class="tag ok">GREEN</span>':o.verdict?\`<span class="tag warn">\${esc(o.verdict)}</span>\`:'<span class="tag">generated</span>';
-   const links=[o.jmx?\`<a href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.jmx)}">.jmx</a>\`:'',o.report?\`<a href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.report)}" target="_blank">report</a>\`:''].filter(Boolean).join(' · ');
-   return \`<li><span>\${esc(o.name)} \${t}</span><span>\${links}</span></li>\`;
+   const t=o.verdict==='GREEN'?'<span class="tag ok">GREEN</span>':o.verdict==='needs attention'?'<span class="tag warn">needs attention</span>':'<span class="tag">generated</span>';
+   let summary='';
+   if(o.kind==='validated'){
+     const pct=o.total?Math.round(o.passed/o.total*100):0;
+     summary=\`<div class="sum"><span class="pill ok">\${o.passed} passed</span><span class="pill \${o.failed?'bad':''}">\${o.failed} failed</span><span class="pill">\${pct}% of \${o.total} app requests</span></div>\`;
+     if(o.failedTop&&o.failedTop.length){
+       summary+=\`<div class="fails"><div class="mut" style="border:0">What failed / needs fixing:</div>\${o.failedTop.map(f=>\`<div>\${esc(String(f.code||'ERR'))}  \${esc(f.label)}</div>\`).join('')}</div>\`;
+     }
+   } else {
+     summary=\`<div class="sum"><span class="pill">\${o.samplers||0} samplers</span><span class="pill ok">\${o.correlations||0} correlations\${o.bodyCorrelations?' (+'+o.bodyCorrelations+' body/session)':''}</span><span class="pill">\${o.parameterized||0} parameterized</span></div>\`;
+   }
+   const acts=[o.jmx?\`<a class="dl" href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.jmx)}">⬇ Download .jmx</a>\`:'',o.report?\`<a class="open" href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.report)}" target="_blank">Open report</a>\`:''].filter(Boolean).join('');
+   return \`<li style="flex-direction:column;align-items:stretch;gap:2px"><div class="row" style="justify-content:space-between"><b>\${esc(o.name)}</b> \${t}</div>\${summary}<div class="acts">\${acts}</div><div class="mut" style="font-size:12px">saved to output\\\\\${esc(o.name)}\\\\</div></li>\`;
  }).join(''):'<li class="mut">No results yet.</li>';
  $('#gen').disabled=$('#run').disabled=s.busy;
  $('#cancel').style.display=s.busy?'':'none';
  return s;
+}
+// Map the streamed log to a rough progress % + human phase label.
+function phaseOf(txt){
+ const has=r=>r.test(txt);
+ if(has(/DONE —|verdict=|report\\.html|Done\\./)) return {pct:100,label:'Finished'};
+ if(has(/\\[iter\\]|re-verifying|LLM/)) return {pct:85,label:'Validating (auto-fix loop)…'};
+ if(has(/running bounded feedback loop|target=|stripped .* listener|jmeter=/)) return {pct:70,label:'Running in JMeter…'};
+ if(has(/generated .*\\.jmx|samplers,/)) return {pct:55,label:'Built the .jmx — correlating…'};
+ if(has(/wrote recording|scrubbed/)) return {pct:35,label:'Extracting values…'};
+ if(has(/parsed \\d+ entries|mode=/)) return {pct:20,label:'Parsing recordings…'};
+ return {pct:8,label:'Starting…'};
 }
 async function loadCfg(){
  const c=await j('/api/config');
@@ -286,13 +347,21 @@ $('#cancel').onclick=async()=>{await fetch('/api/cancel',{method:'POST'});$('#st
 async function start(mode){
  const r=await j('/api/run?mode='+mode,{method:'POST'});
  if(r.error){$('#status').textContent=r.error;return}
- logEl.textContent='';$('#status').textContent='Running ('+mode+')…';
- let since=0;const id=r.id;
+ logEl.textContent='';$('#status').textContent='';
+ const bar=$('#bar'),fill=bar.querySelector('i'),phaseEl=$('#phase'),elEl=$('#elapsed');
+ bar.className='bar on indet';fill.style.width='8%';phaseEl.textContent='Starting…';
+ const t0=Date.now();let acc='';const id=r.id;let since=0;
+ const tick=setInterval(()=>{if(phaseEl.textContent.indexOf('Finished')<0)elEl.textContent=((Date.now()-t0)/1000|0)+'s elapsed'},1000);
  clearInterval(poll);
  poll=setInterval(async()=>{
   const d=await j('/api/log?id='+id+'&since='+since);
-  if(d.lines&&d.lines.length){since=d.total;logEl.textContent+=d.lines.join('\\n')+'\\n';logEl.scrollTop=logEl.scrollHeight}
-  if(d.done){clearInterval(poll);$('#status').textContent='Finished (exit '+d.code+').';refresh()}
+  if(d.lines&&d.lines.length){since=d.total;acc+=d.lines.join('\\n')+'\\n';logEl.textContent=acc;logEl.scrollTop=logEl.scrollHeight;
+    const ph=phaseOf(acc);fill.style.width=Math.max(8,ph.pct)+'%';phaseEl.textContent=ph.label;
+    if(ph.pct>=20)bar.classList.remove('indet');}
+  if(d.done){clearInterval(poll);poll=null;clearInterval(tick);
+    const ok=d.code===0;fill.style.width='100%';bar.className='bar on'+(ok?'':' err');
+    phaseEl.textContent=ok?'Finished ✓ — see Results below':'Finished with errors (exit '+d.code+')';
+    setTimeout(()=>{bar.className='bar'},3000);refresh()}
  },600);
 }
 $('#gen').onclick=()=>start('generate');

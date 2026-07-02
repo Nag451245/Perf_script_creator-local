@@ -13,10 +13,50 @@ const { spawn } = require('child_process');
 const ROOT = path.join(__dirname, '..');
 const INPUT = path.join(ROOT, 'input');
 const OUTPUT = path.join(ROOT, 'output');
-const PORT = Number(process.env.PERFSCRIPT_UI_PORT) || 7070;
+const CONFIG_PATH = path.join(ROOT, 'perfscript.config.json');
+const START_PORT = Number(process.env.PERFSCRIPT_UI_PORT) || 7070;
 
 fs.mkdirSync(INPUT, { recursive: true });
 fs.mkdirSync(OUTPUT, { recursive: true });
+
+// ── config (perfscript.config.json) — read/write only the run-relevant subset,
+// preserving everything else (jmeterHome, javaHome, gemini key, …).
+function readConfig() {
+    try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^﻿/, '')); }
+    catch { return {}; }
+}
+function readConfigForUi() {
+    const c = readConfig(); const run = c.run || {};
+    const lp = run.loadProfile || {};
+    return {
+        targetBaseUrl: run.targetBaseUrlOverride || '',
+        username: (run.credentials && run.credentials.username) || '',
+        hasPassword: !!(run.credentials && run.credentials.password),
+        loadProfile: { users: lp.users || '', rampUpSec: lp.rampUpSec || '', holdSec: lp.holdSec || '' },
+        jmeterHome: c.jmeterHome || '', javaHome: c.javaHome || '',
+    };
+}
+function writeConfigFromUi(body) {
+    const c = readConfig();
+    c.run = c.run || {};
+    if (typeof body.targetBaseUrl === 'string') c.run.targetBaseUrlOverride = body.targetBaseUrl.trim();
+    if (typeof body.username === 'string' || typeof body.password === 'string') {
+        c.run.credentials = c.run.credentials || {};
+        if (typeof body.username === 'string') c.run.credentials.username = body.username;
+        // Only overwrite the password when a non-empty one is supplied (the UI
+        // never reads it back, so an empty field means "leave unchanged").
+        if (typeof body.password === 'string' && body.password !== '') c.run.credentials.password = body.password;
+    }
+    const lp = body.loadProfile || {};
+    const num = (v) => (v === '' || v == null ? undefined : Math.max(0, parseInt(v, 10) || 0));
+    const prof = {};
+    if (num(lp.users) != null) prof.users = num(lp.users);
+    if (num(lp.rampUpSec) != null) prof.rampUpSec = num(lp.rampUpSec);
+    if (num(lp.holdSec) != null) prof.holdSec = num(lp.holdSec);
+    if (Object.keys(prof).length) c.run.loadProfile = prof; else delete c.run.loadProfile;
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2));
+    return { ok: true };
+}
 
 // In-memory run registry: id -> { mode, lines:[], done, code, startedAt }
 const runs = new Map();
@@ -89,12 +129,16 @@ function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
-    const u = new URL(req.url, `http://localhost:${PORT}`);
+    const u = new URL(req.url, 'http://localhost');
     const p = u.pathname;
     try {
         if (p === '/' && req.method === 'GET') return send(res, 200, PAGE, { 'Content-Type': 'text/html; charset=utf-8' });
         if (p === '/api/state' && req.method === 'GET') return send(res, 200, { inputs: listInputs(), outputs: listOutputs(), busy: !!activeChild });
+        if (p === '/api/config' && req.method === 'GET') return send(res, 200, readConfigForUi());
+        if (p === '/api/config' && req.method === 'POST') { const b = await readBody(req); return send(res, 200, writeConfigFromUi(JSON.parse(b.toString() || '{}'))); }
         if (p === '/api/run' && req.method === 'POST') { const r = startRun(u.searchParams.get('mode') || 'generate'); return send(res, r.error ? 409 : 200, r); }
+        if (p === '/api/cancel' && req.method === 'POST') { if (activeChild) { activeChild.kill(); return send(res, 200, { ok: true }); } return send(res, 200, { ok: false, error: 'no active run' }); }
+        if (p.startsWith('/out/') && req.method === 'GET') return serveOutputFile(res, decodeURIComponent(p.slice('/out/'.length)));
         if (p === '/api/log' && req.method === 'GET') {
             const id = Number(u.searchParams.get('id')); const since = Number(u.searchParams.get('since')) || 0;
             const rec = runs.get(id); if (!rec) return send(res, 404, { error: 'no such run' });
@@ -118,9 +162,22 @@ const server = http.createServer(async (req, res) => {
     } catch (e) { return send(res, 500, { error: e.message }); }
 });
 
-server.listen(PORT, () => {
-    process.stdout.write(`perfscript UI running →  http://localhost:${PORT}\n(input: ${INPUT})\nClose this window to stop the UI.\n`);
-});
+// Port fallback: if START_PORT is taken, try the next few before giving up.
+function listenWithFallback(port, attemptsLeft) {
+    server.once('error', (e) => {
+        if (e.code === 'EADDRINUSE' && attemptsLeft > 0) {
+            process.stdout.write(`port ${port} in use, trying ${port + 1}…\n`);
+            listenWithFallback(port + 1, attemptsLeft - 1);
+        } else {
+            process.stderr.write(`UI server failed to start: ${e.message}\n`);
+            process.exit(1);
+        }
+    });
+    server.listen(port, () => {
+        process.stdout.write(`\nperfscript UI running →  http://localhost:${port}\n(input: ${INPUT})\nClose this window to stop the UI.\n`);
+    });
+}
+listenWithFallback(START_PORT, 10);
 
 const PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>PerfScript</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -135,7 +192,11 @@ header h1{font-size:18px;margin:0;font-weight:650}header .sub{color:var(--mut);f
 .card h2{font-size:14px;margin:0 0 12px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
 button{font:inherit;border:0;border-radius:9px;padding:10px 16px;cursor:pointer;font-weight:600}
 .primary{background:var(--acc);color:#04101f}.ghost{background:#223050;color:var(--ink)}
+.danger{background:#5a2330;color:#ffb4b4}
 button:disabled{opacity:.5;cursor:not-allowed}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--mut)}
+input{font:inherit;background:#0e1524;border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--ink);min-width:180px}
+input.sm{min-width:80px;width:80px}code{background:#0e1524;padding:1px 5px;border-radius:5px}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 ul{list-style:none;margin:0;padding:0}li{display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
 li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
@@ -160,9 +221,26 @@ li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:
    <div class="row">
     <button id="gen" class="primary">Generate</button>
     <button id="run" class="ghost">Generate + Validate (JMeter)</button>
+    <button id="cancel" class="danger" style="display:none">Cancel</button>
    </div>
    <p class="mut" style="font-size:13px">Generate = correlate &amp; build the .jmx. Validate = also execute it with local JMeter and report pass/fail.</p>
    <div id="status" class="mut"></div>
+  </div>
+  <div class="card full">
+   <h2>Settings <span class="mut" style="text-transform:none;letter-spacing:0">— used by Generate + Validate</span></h2>
+   <div class="row">
+    <label>Target URL<input id="cfg-target" placeholder="https://stage.example.com"></label>
+    <label>Username<input id="cfg-user" placeholder="test user"></label>
+    <label>Password<input id="cfg-pass" type="password" placeholder="(unchanged)"></label>
+   </div>
+   <div class="row">
+    <label>Users<input id="cfg-users" type="number" min="1" class="sm"></label>
+    <label>Ramp-up (s)<input id="cfg-ramp" type="number" min="0" class="sm"></label>
+    <label>Hold (s)<input id="cfg-hold" type="number" min="0" class="sm"></label>
+    <button id="cfg-save" class="ghost">Save settings</button>
+    <span id="cfg-status" class="mut"></span>
+   </div>
+   <p class="mut" style="font-size:12.5px">Saved to <code>perfscript.config.json</code>. The password is write-only — never shown back.</p>
   </div>
   <div class="card full">
    <h2>Live log</h2>
@@ -184,12 +262,27 @@ async function refresh(){
  $('#inputs').innerHTML=s.inputs.length?s.inputs.map(f=>\`<li><span>\${esc(f.name)} <span class="mut">\${(f.size/1024|0)} KB</span></span><span class="x" onclick="del('\${esc(f.name)}')">remove</span></li>\`).join(''):'<li class="mut">No recordings yet.</li>';
  $('#outputs').innerHTML=s.outputs.length?s.outputs.map(o=>{
    const t=o.verdict==='GREEN'?'<span class="tag ok">GREEN</span>':o.verdict?\`<span class="tag warn">\${esc(o.verdict)}</span>\`:'<span class="tag">generated</span>';
-   const links=[o.jmx?\`<a href="/file?path=\${encodeURIComponent(o.name+'/'+o.jmx)}">.jmx</a>\`:'',o.report?\`<a href="/file?path=\${encodeURIComponent(o.name+'/'+o.report)}" target="_blank">report</a>\`:''].filter(Boolean).join(' · ');
+   const links=[o.jmx?\`<a href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.jmx)}">.jmx</a>\`:'',o.report?\`<a href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.report)}" target="_blank">report</a>\`:''].filter(Boolean).join(' · ');
    return \`<li><span>\${esc(o.name)} \${t}</span><span>\${links}</span></li>\`;
  }).join(''):'<li class="mut">No results yet.</li>';
  $('#gen').disabled=$('#run').disabled=s.busy;
+ $('#cancel').style.display=s.busy?'':'none';
  return s;
 }
+async function loadCfg(){
+ const c=await j('/api/config');
+ $('#cfg-target').value=c.targetBaseUrl||'';$('#cfg-user').value=c.username||'';
+ $('#cfg-pass').placeholder=c.hasPassword?'(saved — unchanged)':'password';
+ $('#cfg-users').value=c.loadProfile.users||'';$('#cfg-ramp').value=c.loadProfile.rampUpSec||'';$('#cfg-hold').value=c.loadProfile.holdSec||'';
+}
+async function saveCfg(){
+ const body={targetBaseUrl:$('#cfg-target').value,username:$('#cfg-user').value,password:$('#cfg-pass').value,
+   loadProfile:{users:$('#cfg-users').value,rampUpSec:$('#cfg-ramp').value,holdSec:$('#cfg-hold').value}};
+ await fetch('/api/config',{method:'POST',body:JSON.stringify(body)});
+ $('#cfg-pass').value='';$('#cfg-status').textContent='Saved.';setTimeout(()=>$('#cfg-status').textContent='',2500);loadCfg();
+}
+$('#cfg-save').onclick=saveCfg;
+$('#cancel').onclick=async()=>{await fetch('/api/cancel',{method:'POST'});$('#status').textContent='Cancelling…'};
 async function start(mode){
  const r=await j('/api/run?mode='+mode,{method:'POST'});
  if(r.error){$('#status').textContent=r.error;return}
@@ -211,5 +304,5 @@ drop.onclick=()=>file.click();file.onchange=()=>upload(file.files);
 drop.ondragover=e=>{e.preventDefault();drop.classList.add('hi')};
 drop.ondragleave=()=>drop.classList.remove('hi');
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('hi');upload(e.dataTransfer.files)};
-refresh();setInterval(()=>{if(!poll)refresh()},4000);
+refresh();loadCfg();setInterval(()=>{if(!poll)refresh()},4000);
 </script></body></html>`;

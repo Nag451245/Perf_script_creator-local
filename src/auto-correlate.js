@@ -21,13 +21,28 @@ const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const escXml = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-const NOISE_NAME = /^(content-length|user-agent|host|cache-control|accept|accept-.*|sec-.*|upgrade-insecure-requests|connection|referer|origin|x-goog.*|priority|pragma|dnt|te|date|content-type|x-client-data|cookie)$/i;
+// nonce/code/state + the PKCE pair are auth0/OIDC flow values — JMeter carries
+// them via redirect-following + the Cookie Manager, so they must NOT be
+// correlated (extracting/substituting them breaks the interactive login).
+const NOISE_NAME = /^(content-length|user-agent|host|cache-control|accept|accept-.*|sec-.*|upgrade-insecure-requests|connection|referer|origin|x-goog.*|priority|pragma|dnt|te|date|content-type|x-client-data|cookie|nonce|code|state|code_verifier|code_challenge|code_challenge_method|max_age|auth0.*|_auth0.*)$/i;
 const THIRDPARTY = /dynatrace|pendo|gvt2|beacons|googleapis|gstatic|safebrowsing|ruxit|newrelic|nr-data/i;
+
+// The JTL parser stores a POST/GraphQL body in request.queryString (array of
+// {name,value}) rather than postData.text — read both so body dynamics (e.g. the
+// GraphQL sessionId) are actually seen.
+function reqBody(e) {
+    const pd = e.request && e.request.postData && e.request.postData.text;
+    if (pd) return pd;
+    const qs = e.request && e.request.queryString;
+    if (Array.isArray(qs)) return qs.map(q => (q.name || '') + (q.value ? '=' + q.value : '')).join('&');
+    if (typeof qs === 'string') return qs;
+    return '';
+}
 
 function reqResBlob(e) {
     return [
         e.request && e.request.url,
-        e.request && e.request.postData && e.request.postData.text,
+        reqBody(e),
         (e.request && e.request.headers || []).map(h => `${h.name}=${h.value}`).join('|'),
         e.response && e.response.content && e.response.content.text,
         (e.response && e.response.headers || []).map(h => `${h.name}=${h.value}`).join('|'),
@@ -45,13 +60,19 @@ function identifyDynamics(e1, e2) {
         const k = `${name}::${val}`;
         if (!named.has(k)) named.set(k, { name, value: val });
     };
+    // Add a value AND any long token embedded in it, so "Token <sess>" also yields
+    // the bare <sess> (which is what a Set-Cookie produces and can correlate).
+    const addTok = (name, val) => {
+        add(name, val);
+        for (const mm of String(val).matchAll(/[A-Za-z0-9_-]{16,}/g)) if (mm[0] !== val) add(name, mm[0]);
+    };
     for (const e of e1) {
         const url = (e.request && e.request.url) || '';
         if (THIRDPARTY.test(url)) continue;
         try { const u = new URL(url); for (const [k, v] of u.searchParams) add(k, v); } catch { /* */ }
-        const body = (e.request && e.request.postData && e.request.postData.text) || '';
-        for (const m of body.matchAll(/"(\w+)"\s*:\s*"([^"]{10,})"/g)) add(m[1], m[2]);
-        for (const m of body.matchAll(/(\w+)=([^&\s"]{10,})/g)) add(m[1], decodeURIComponent(m[2]));
+        const body = reqBody(e);
+        for (const m of body.matchAll(/"(\w+)"\s*:\s*"([^"]{10,})"/g)) addTok(m[1], m[2]);
+        for (const m of body.matchAll(/(\w+)=([^&\s"]{10,})/g)) { let v = m[2]; try { v = decodeURIComponent(m[2]); } catch { /* not url-encoded */ } add(m[1], v); }
         for (const h of (e.request && e.request.headers) || []) add(h.name, h.value);
         const resp = (e.response && e.response.content && e.response.content.text) || '';
         for (const m of resp.matchAll(/"(\w+)"\s*:\s*"([^"]{10,})"/g)) add(m[1], m[2]);

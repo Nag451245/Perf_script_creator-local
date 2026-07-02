@@ -106,7 +106,7 @@ async function processUnit(unit) {
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
         return;
     }
-    const { entries, pages, mode, notes } = loaded;
+    const { entries, secondaryEntries, pages, mode, notes } = loaded;
     rec(`mode=${mode} · parsed ${entries.length} entries, ${pages.length} pages`);
     if (notes.dualHar) rec(`dual-recording variance: ${notes.dualHar.dynamicValueCount} dynamic values across the two runs`);
     if (notes.dualHarError) rec(`dual-recording comparison failed (${notes.dualHarError}) — continuing with first recording only`);
@@ -131,7 +131,7 @@ async function processUnit(unit) {
         }
     } catch (e) { rec(`recording.xml skipped: ${e.message}`); }
 
-    const genOpts = { dualHarHints: notes };
+    const genOpts = { dualHarHints: notes, secondaryEntries };
 
     // Optional pre-flight: replay the recording against the target with our
     // Node-only fast-replay engine. Catches the obvious "doesn't even respond"
@@ -193,7 +193,8 @@ async function processUnit(unit) {
     try {
         const gen = generate(entries, pages, outDir, name, genOpts);
         fs.writeFileSync(path.join(outDir, `${name}_report.json`), JSON.stringify(gen.stats, null, 2));
-        rec(`generated JMX — ${gen.stats.samplers} samplers, ${gen.stats.correlations} correlations, ` +
+        rec(`generated JMX — ${gen.stats.samplers} samplers, ${gen.stats.correlations} correlations` +
+            `${gen.stats.bodyCorrelations ? ` (+${gen.stats.bodyCorrelations} body/session)` : ''}, ` +
             `${gen.stats.parameterized} parameterized field(s)${gen.csvFile ? ` → ${gen.csvFile}` : ''}, ` +
             `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ` +
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);

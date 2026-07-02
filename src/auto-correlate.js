@@ -227,13 +227,16 @@ function correlateJmx(jmxXml, dynamics, entries) {
     // between "dynamic value to correlate" and "response data to ignore".
     dynamics = dynamics.filter(d => jmxXml.includes(d.value));
 
-    // Stable var name per (name,value) to avoid collisions across distinct values.
+    // Stable var name per (name,value) to avoid collisions across distinct values
+    // AND against variables the caller (e.g. the engine) already defined in the
+    // JMX — never clobber an existing ${var}, so this pass layers cleanly.
+    const preexisting = new Set([...jmxXml.matchAll(/\$\{([A-Za-z0-9_]+)\}/g)].map(m => m[1]));
     const varFor = new Map();
     const nameVar = (name, value) => {
         const k = `${name}::${value}`;
         if (varFor.has(k)) return varFor.get(k);
         let v = name.replace(/[^A-Za-z0-9_]/g, '_');
-        const used = new Set(varFor.values());
+        const used = new Set([...varFor.values(), ...preexisting]);
         if (used.has(v)) { let i = 2; while (used.has(`${v}_${i}`)) i++; v = `${v}_${i}`; }
         varFor.set(k, v); return v;
     };
@@ -284,4 +287,22 @@ function correlateJmx(jmxXml, dynamics, entries) {
     return { xml, applied, synthesize, substitutions: n };
 }
 
-module.exports = { identifyDynamics, deriveExtractor, correlateJmx, _internal: { indexJmxSamplers, extractorXml } };
+/**
+ * App integration entry point: given an already-generated JMX and BOTH recordings
+ * (variance pair), add the body/session correlations the engine's pass missed.
+ * Because correlateJmx's consumed-gate only touches values still LITERAL in the
+ * JMX, values the engine already turned into ${vars} are skipped automatically —
+ * this layers on top without conflict. Returns { xml, applied, synthesize }.
+ */
+function correlateBodyDynamics(jmxXml, primaryEntries, secondaryEntries) {
+    if (!Array.isArray(primaryEntries) || !Array.isArray(secondaryEntries) || !secondaryEntries.length) {
+        return { xml: jmxXml, applied: [], synthesize: [] };
+    }
+    const dynamics = identifyDynamics(primaryEntries, secondaryEntries);
+    return correlateJmx(jmxXml, dynamics, primaryEntries);
+}
+
+module.exports = {
+    identifyDynamics, deriveExtractor, correlateJmx, correlateBodyDynamics,
+    _internal: { indexJmxSamplers, extractorXml, reqBody, verifyExtractor },
+};

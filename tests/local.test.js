@@ -650,6 +650,75 @@ test('OAuth rewire: suffixed names (state_2, nonce_2) are LEFT ALONE — those a
     assert.match(r.xml, /<stringProp name="RegexExtractor\.refname">nonce_2/);
 });
 
+/* ─────────── auto-correlate convergence (body/session dynamics) ─────────── */
+const { identifyDynamics, correlateBodyDynamics, _internal: acInternal } = require('../src/auto-correlate');
+
+// Minimal recording entry in the HAR shape auto-correlate consumes. A POST body
+// is stored in queryString[] (matching the JTL parser), a Set-Cookie in the
+// response headers, so producers/consumers are discoverable.
+function recEntry(method, url, { body, setCookie, respBody, reqHeaders } = {}) {
+    return {
+        request: {
+            method, url, headers: reqHeaders || [], cookies: [],
+            queryString: body ? [{ name: body, value: '' }] : [],
+        },
+        response: {
+            status: 200,
+            headers: setCookie ? [{ name: 'Set-Cookie', value: setCookie }] : [],
+            content: { text: respBody || '' },
+        },
+    };
+}
+// Two recordings of the same flow with a different session value each run.
+const sessionRun = (sess) => [
+    recEntry('POST', 'https://app.test/login', { setCookie: `stgapp_sess=${sess}; Path=/; HttpOnly` }),
+    recEntry('POST', 'https://app.test/graphql', { body: `{"operationName":"Auth","variables":{"data":{"sessionId":"Token ${sess}"}}}` }),
+];
+
+test('auto-correlate: identifyDynamics finds a session value carried in a request BODY (queryString)', () => {
+    const dyn = identifyDynamics(sessionRun('a1b2c3d4e5f6g7h8i9j0k'), sessionRun('z9y8x7w6v5u4t3s2r1q0p'));
+    assert.ok(dyn.some(d => d.value === 'a1b2c3d4e5f6g7h8i9j0k'),
+        'the bare session token embedded in "Token <sess>" must be flagged dynamic');
+});
+
+test('auto-correlate: reqBody reads the POST body out of queryString[]', () => {
+    const body = acInternal.reqBody(recEntry('POST', 'https://x/y', { body: '{"a":"b"}' }));
+    assert.match(body, /"a":"b"/);
+});
+
+test('auto-correlate: correlateBodyDynamics substitutes session-in-body + wires a verified extractor', () => {
+    const e1 = sessionRun('a1b2c3d4e5f6g7h8i9j0k'), e2 = sessionRun('z9y8x7w6v5u4t3s2r1q0p');
+    const jmx = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="POST /login"><stringProp name="HTTPSampler.domain">app.test</stringProp><stringProp name="HTTPSampler.path">/login</stringProp></HTTPSamplerProxy>
+      <hashTree/>
+      <HTTPSamplerProxy testname="POST /graphql"><stringProp name="HTTPSampler.domain">app.test</stringProp><stringProp name="HTTPSampler.path">/graphql</stringProp><stringProp name="Argument.value">{"sessionId":"Token a1b2c3d4e5f6g7h8i9j0k"}</stringProp></HTTPSamplerProxy>
+      <hashTree/>
+    </hashTree></jmeterTestPlan>`;
+    const r = correlateBodyDynamics(jmx, e1, e2);
+    assert.ok(r.applied.length >= 1, `expected >=1 applied, got ${r.applied.length}`);
+    assert.doesNotMatch(r.xml, /a1b2c3d4e5f6g7h8i9j0k/, 'the literal session value must be replaced');
+    assert.match(r.xml, /\$\{[A-Za-z0-9_]+\}/, 'a ${var} must be substituted into the body');
+    assert.match(r.xml, /RegexExtractor|JSONPostProcessor|HtmlExtractor/, 'a verified extractor is injected');
+});
+
+test('auto-correlate: does NOT clobber a value the engine already turned into ${var}', () => {
+    const e1 = sessionRun('a1b2c3d4e5f6g7h8i9j0k'), e2 = sessionRun('z9y8x7w6v5u4t3s2r1q0p');
+    // Value already correlated (no literal in the JMX) → consumed-gate skips it.
+    const jmx = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="POST /graphql"><stringProp name="HTTPSampler.path">/graphql</stringProp><stringProp name="Argument.value">{"sessionId":"Token \${SESSION}"}</stringProp></HTTPSamplerProxy>
+      <hashTree/>
+    </hashTree></jmeterTestPlan>`;
+    const r = correlateBodyDynamics(jmx, e1, e2);
+    assert.strictEqual(r.applied.length, 0, 'nothing to do — value already a ${var}');
+    assert.strictEqual(r.xml, jmx, 'JMX unchanged');
+});
+
+test('auto-correlate: no-op without a second recording', () => {
+    const r = correlateBodyDynamics('<jmeterTestPlan/>', sessionRun('a1b2c3d4e5f6g7h8i9j0k'), []);
+    assert.strictEqual(r.applied.length, 0);
+    assert.strictEqual(r.xml, '<jmeterTestPlan/>');
+});
+
 test('OAuth rewire: only fires for /authorize URLs with OAuth2 hallmarks (client_id/response_type/redirect_uri)', () => {
     // A generic `/authorize?token=x` (e.g. an internal API endpoint that
     // happens to have "authorize" in the path) should NOT trigger.

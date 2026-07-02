@@ -163,6 +163,7 @@ async function loadUnit(unit) {
         compareAndAnnotate(har1, har2, unit.secondary, notes, 'dualHar', 'dualHarError');
         return {
             entries: har1.log?.entries || [],
+            secondaryEntries: har2.log?.entries || [],
             pages: har1.log?.pages || [],
             mode: 'dual-har', notes, sourceFile: unit.primary,
         };
@@ -208,6 +209,7 @@ async function loadUnit(unit) {
 
         return {
             entries: a.har.log.entries,
+            secondaryEntries: b.har.log.entries,
             pages: a.har.log.pages,
             mode: 'dual-jmx', notes, sourceFile: unit.primary,
         };

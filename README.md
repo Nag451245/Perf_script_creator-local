@@ -16,7 +16,17 @@ generation, the feedback loop) — it does not copy or modify the current app.
 
 ## Usage
 
-**Easiest (Windows):** double-click `perfscript.cmd`, or from a terminal:
+**Simple UI (Windows):** double-click **`perfscript-ui.cmd`** (or the *PerfScript
+UI* desktop shortcut). Your browser opens `http://localhost:7070` where you can
+drag-drop recordings, edit run settings (target / credentials / load profile),
+press **Generate** or **Generate + Validate**, watch the live log, cancel a run,
+and open the report / download the `.jmx`. Keep the console window open; close it
+to stop the server. (Port auto-falls-back if 7070 is busy.)
+
+**One-click validate:** double-click **`perfscript-run.cmd`** = generate + run
+through local JMeter in one shot.
+
+**CLI (Windows):** double-click `perfscript.cmd`, or from a terminal:
 ```bat
 perfscript            :: generate scripts from every HAR in input\
 perfscript --run      :: also validate with local JMeter
@@ -72,8 +82,19 @@ Phases 1–5 are built and runnable (see ARCHITECTURE.md for details):
 - **4** LLM fix escalation (opt-in) · **5** headless verify via the bounded
   `--run` feedback loop, summarized in the HTML report
 
-Deferred (needs engine IR/renderer changes, kept out to not disturb the current
-app): auto-emitting While Controllers for polling, cross-environment host rewrite.
+Cross-environment host rewrite is now **built** (recorded host → target, third-
+party hosts untouched). Deferred (needs engine IR/renderer changes): auto-
+emitting While Controllers for polling.
+
+## Development
+```bash
+npm test          # node --test — 52 tests over the app's own logic
+npm run ui        # start the web UI on :7070
+```
+A `pre-push` git hook runs the suite before every push (enabled by `npm install`,
+or `git config core.hooksPath githooks`). CI runs it too — see
+`.github/workflows/test.yml` (set the `ENGINE_REPO` Actions variable so CI can
+check out the engine).
 
 ## Distribution
 `perfscript.cmd` is the supported way to run without PATH setup. A fully

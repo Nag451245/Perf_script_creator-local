@@ -129,3 +129,26 @@ The goal is 80%-grunt-work → 20%-review, fully auditable — not zero-human.
     IR/renderer support (deferred to avoid disturbing the current app).
 - **Phases 4-5** — Gemini escalation + headless verify (`--run` already does a
   bounded headless loop); LLM escalation for un-repaired failures is next.
+
+## Update log (built since the phase notes above)
+- **Correlation convergence** — the variance/verify-gate/body-parsing correlator
+  (`src/auto-correlate.js`) is now wired into the app: `generate.js` runs it as a
+  final **body/session pass** when a 2nd recording is present, filling dynamics
+  the engine leaves literal (GraphQL `<queryString>` bodies, the
+  `sessionId:"Token <cookie>"` session-in-body class). Layers safely (consumed-
+  gate + extractor verification + no var-name clobber). Previously this lived in
+  a dev-only tool; the two correlators are now one.
+- **Cross-env host rewrite** — **built** (`src/host-rewrite.js`, applied in
+  `generate.js`): the recorded primary host is repointed to the target; third-
+  party hosts are left alone. (Supersedes the older "samplers still hit recorded
+  hosts / later phase" note.)
+- **Fast-replay pre-flight** — the Node replay engine now runs automatically in
+  `--run` (not only `--fast-loop`) when a target is set: cheap Phase-2
+  localization before the JVM boots.
+- **Load profile** — applies to **every** Thread Group (setUp/multi-TG safe).
+- **Web UI** (`src/ui-server.js`, `perfscript-ui.cmd`) — drag-drop recordings,
+  Generate / Generate+Validate, a settings panel (target/credentials/load
+  profile), live log, cancel, and links to the report + `.jmx`.
+- **Test gate** — `githooks/pre-push` runs the suite before every push;
+  `.github/workflows/test.yml` runs it in CI (set the `ENGINE_REPO` Actions
+  variable so CI can check out the engine). 52 tests, all green.

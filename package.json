@@ -6,9 +6,11 @@
   "bin": { "perfscript-local": "index.js" },
   "scripts": {
     "start": "node index.js",
+    "ui": "node src/ui-server.js",
     "watch": "node index.js --watch",
     "run-and-validate": "node index.js --run",
-    "test": "node --test"
+    "test": "node --test",
+    "prepare": "git config core.hooksPath githooks 2>/dev/null || true"
   },
   "engines": { "node": ">=18.0.0" }
 }

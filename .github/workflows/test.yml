@@ -1,0 +1,53 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout perfscript-local
+        uses: actions/checkout@v4
+
+      # The app reuses the external PerfScript engine (read-only). Tests exercise
+      # the real engine, so CI needs it checked out as a sibling. Set the repo
+      # variable ENGINE_REPO (Settings → Secrets and variables → Actions →
+      # Variables) to the engine repo, e.g. "Nag451245/jmeter-script-creator".
+      # Optionally set ENGINE_REF for a branch/tag (defaults to main).
+      - name: Checkout engine
+        if: ${{ vars.ENGINE_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ENGINE_REPO }}
+          ref: ${{ vars.ENGINE_REF || 'main' }}
+          path: engine-src
+
+      - name: Locate engine backend
+        if: ${{ vars.ENGINE_REPO != '' }}
+        run: |
+          # The engine lives under <repo>/backend (with the agent-orchestrator
+          # sentinel). Point PERFSCRIPT_ENGINE at it for engine.js.
+          if [ -f engine-src/backend/src/services/agent-orchestrator.js ]; then
+            echo "PERFSCRIPT_ENGINE=$GITHUB_WORKSPACE/engine-src/backend" >> "$GITHUB_ENV"
+          elif [ -f engine-src/src/services/agent-orchestrator.js ]; then
+            echo "PERFSCRIPT_ENGINE=$GITHUB_WORKSPACE/engine-src" >> "$GITHUB_ENV"
+          else
+            echo "::error::engine sentinel not found in ENGINE_REPO checkout"; exit 1
+          fi
+
+      - name: Guard — engine required
+        if: ${{ vars.ENGINE_REPO == '' }}
+        run: |
+          echo "::error::Set the ENGINE_REPO Actions variable to the PerfScript engine repo so tests can run."
+          exit 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run tests
+        run: node --test

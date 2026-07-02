@@ -120,10 +120,9 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     const jmeterBinPath = info && info.available ? info.path : null;
     if (!jmeterBinPath) return { ok: false, error: 'JMeter not found — set jmeterHome in perfscript.config.json or JMETER_HOME.' };
 
-    // 4. Target + credentials. NOTE: targetBaseUrl is the loop's connection
-    //    context; samplers still hit their recorded hosts (true cross-env host
-    //    rewrite is a later phase). Override is accepted for when the recorded
-    //    host == the test host but the base needs pinning.
+    // 4. Target + credentials. targetBaseUrl is the loop's connection context;
+    //    cross-env host rewrite (recorded host -> target) IS applied in generate
+    //    via rewriteHost when runCfg.hostRewrite is set (auto-derived above).
     const targetBaseUrl = (runCfg.targetBaseUrlOverride || '').trim() || deriveBaseUrl(gen.flat);
     if (!targetBaseUrl) return { ok: false, error: 'No target base URL could be determined (set run.targetBaseUrlOverride).' };
     const credentials = (runCfg.credentials && runCfg.credentials.username) ? runCfg.credentials : undefined;

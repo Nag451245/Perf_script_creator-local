@@ -133,15 +133,17 @@ async function processUnit(unit) {
 
     const genOpts = { dualHarHints: notes, secondaryEntries };
 
-    // Optional pre-flight: replay the recording against the target with our
-    // Node-only fast-replay engine. Catches the obvious "doesn't even respond"
-    // class of failures in <1s without booting JMeter. Honest pre-flight only;
-    // the full --run still owns "is this script good enough to ship."
-    if (FAST_LOOP) {
+    // Pre-flight: replay the recording against the target with our Node-only
+    // fast-replay engine BEFORE booting JMeter. Catches the obvious "doesn't even
+    // respond / wrong host" class in <1s. Runs automatically in --run mode (and
+    // via --fast-loop for generate-only), whenever a target is configured — this
+    // is the Phase-2 localization the architecture calls for. The full --run
+    // still owns "is this script good enough to ship."
+    if (FAST_LOOP || DO_RUN) {
         const runCfg = CONFIG.run || {};
         const targetBase = (runCfg.targetBaseUrlOverride || '').trim() || null;
         if (!targetBase) {
-            rec('--fast-loop skipped: run.targetBaseUrlOverride is required to pick a target.');
+            if (FAST_LOOP) rec('fast-replay pre-flight skipped: set run.targetBaseUrlOverride to enable it.');
         } else {
             rec(`fast-replay → ${targetBase} (Node, no JMeter)`);
             try {

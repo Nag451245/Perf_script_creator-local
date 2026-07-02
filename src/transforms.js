@@ -558,25 +558,29 @@ function applyLoadProfile(xml, profile = {}) {
     if (users == null && rampUpSec == null && holdSec == null && loops == null) {
         return { xml, applied: null };
     }
-    const m = xml.match(THREAD_GROUP_BLOCK_RE);
-    if (!m) return { xml, applied: null };
-
-    let block = m[0];
-    if (users     != null) block = setStringProp(block, 'ThreadGroup.num_threads', String(users));
-    if (rampUpSec != null) block = setStringProp(block, 'ThreadGroup.ramp_time',   String(rampUpSec));
-    if (holdSec != null && holdSec > 0) {
-        block = setBoolProp(block, 'ThreadGroup.scheduler', true);
-        block = setStringProp(block, 'ThreadGroup.duration', String(holdSec));
-        // Force infinite loops when a duration is set; finite loops + scheduler
-        // is a footgun (whichever finishes first wins, almost never what's
-        // intended for a load test).
-        block = setStringProp(block, 'LoopController.loops', '-1');
-        block = setBoolProp(block, 'LoopController.continue_forever', true);
-    } else if (loops != null) {
-        block = setStringProp(block, 'LoopController.loops', String(loops));
-        block = setBoolProp(block, 'ThreadGroup.scheduler', false);
-    }
-    const out = xml.slice(0, m.index) + block + xml.slice(m.index + m[0].length);
+    // Apply to EVERY ThreadGroup, not just the first — real plans can have
+    // multiple (or setUp) Thread Groups, and profiling only the first silently
+    // understates the intended load.
+    const editBlock = (block) => {
+        if (users     != null) block = setStringProp(block, 'ThreadGroup.num_threads', String(users));
+        if (rampUpSec != null) block = setStringProp(block, 'ThreadGroup.ramp_time',   String(rampUpSec));
+        if (holdSec != null && holdSec > 0) {
+            block = setBoolProp(block, 'ThreadGroup.scheduler', true);
+            block = setStringProp(block, 'ThreadGroup.duration', String(holdSec));
+            // Force infinite loops when a duration is set; finite loops + scheduler
+            // is a footgun (whichever finishes first wins, almost never what's
+            // intended for a load test).
+            block = setStringProp(block, 'LoopController.loops', '-1');
+            block = setBoolProp(block, 'LoopController.continue_forever', true);
+        } else if (loops != null) {
+            block = setStringProp(block, 'LoopController.loops', String(loops));
+            block = setBoolProp(block, 'ThreadGroup.scheduler', false);
+        }
+        return block;
+    };
+    let count = 0;
+    const out = xml.replace(new RegExp(THREAD_GROUP_BLOCK_RE.source, 'g'), (blk) => { count++; return editBlock(blk); });
+    if (!count) return { xml, applied: null };
     return {
         xml: out,
         applied: {
@@ -584,6 +588,7 @@ function applyLoadProfile(xml, profile = {}) {
             rampUpSec: rampUpSec ?? undefined,
             holdSec: (holdSec != null && holdSec > 0) ? holdSec : undefined,
             loops: (holdSec != null && holdSec > 0) ? undefined : (loops ?? undefined),
+            threadGroups: count,
         },
     };
 }

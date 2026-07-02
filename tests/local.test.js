@@ -366,6 +366,18 @@ test('load profile: holdSec enables scheduler + forces infinite loops', () => {
     assert.strictEqual(r.applied.loops, undefined, 'loops should be ignored when holdSec is set');
 });
 
+test('load profile: applies to ALL Thread Groups, not just the first', () => {
+    const tg = (n) => `
+        <ThreadGroup testclass="ThreadGroup" testname="TG${n}" enabled="true">
+          <stringProp name="ThreadGroup.num_threads">1</stringProp>
+          <stringProp name="ThreadGroup.ramp_time">1</stringProp>
+        </ThreadGroup>`;
+    const xml = tg(1) + tg(2);
+    const r = applyLoadProfile(xml, { users: 30, rampUpSec: 20 });
+    assert.strictEqual((r.xml.match(/num_threads">30</g) || []).length, 2, 'both Thread Groups profiled');
+    assert.strictEqual(r.applied.threadGroups, 2);
+});
+
 test('load profile: empty profile is a no-op (applied=null)', () => {
     const xml = `<ThreadGroup><stringProp name="ThreadGroup.num_threads">1</stringProp></ThreadGroup>`;
     const r = applyLoadProfile(xml, {});

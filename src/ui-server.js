@@ -1,14 +1,16 @@
 'use strict';
 /**
  * ui-server.js — a tiny, dependency-free local web UI over the same pipeline as
- * index.js. It does NOT reimplement any logic: it spawns `node index.js [--run]`
- * (the exact CLI) and streams its log, then links the generated report.html / .jmx
- * from output/. Start it with `node src/ui-server.js` (or perfscript-ui.cmd).
+ * index.js. It does NOT reimplement any logic: it spawns `node index.js`
+ * with the selected mode (`--run` / `--agent`) and streams its log, then links
+ * the generated report.html / .jmx from output/. Start it with
+ * `node src/ui-server.js` (or perfscript-ui.cmd).
  */
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { flagsForRunMode } = require('./ui-run-mode');
 
 const ROOT = path.join(__dirname, '..');
 const INPUT = path.join(ROOT, 'input');
@@ -129,7 +131,7 @@ function serveOutputFile(res, rel) {
 function startRun(mode) {
     if (activeChild) return { error: 'A run is already in progress.' };
     const id = ++runSeq;
-    const flags = mode === 'run' ? ['--run'] : [];
+    const flags = flagsForRunMode(mode);
     const rec = { id, mode, lines: [], done: false, code: null, startedAt: Date.now() };
     runs.set(id, rec);
     const child = spawn(process.execPath, [path.join(ROOT, 'index.js'), ...flags], { cwd: ROOT });
@@ -259,15 +261,16 @@ li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:
    <div class="row">
     <button id="gen" class="primary">Generate</button>
     <button id="run" class="ghost">Generate + Validate (JMeter)</button>
+    <button id="agent" class="ghost">Senior AI Agent</button>
     <button id="cancel" class="danger" style="display:none">Cancel</button>
    </div>
    <div id="bar" class="bar"><i></i></div>
    <div><span id="phase" class="phase"></span><span id="elapsed" class="elapsed"></span></div>
-   <p class="mut" style="font-size:13px">Generate = correlate &amp; build the .jmx. Validate = also execute it with local JMeter and report pass/fail. The final <code>.jmx</code> is always saved to <code>output\\&lt;name&gt;\\</code>.</p>
+   <p class="mut" style="font-size:13px">Generate = correlate &amp; build the .jmx. Validate = also execute it with local JMeter and report pass/fail. Senior AI Agent = Validate plus bounded OpenAI/Gemini diagnosis, safe JSON patching, and re-verification when deterministic repair leaves failures. The final <code>.jmx</code> is always saved to <code>output\\&lt;name&gt;\\</code>.</p>
    <div id="status" class="mut"></div>
   </div>
   <div class="card full">
-   <h2>Settings <span class="mut" style="text-transform:none;letter-spacing:0">— used by Generate + Validate</span></h2>
+   <h2>Settings <span class="mut" style="text-transform:none;letter-spacing:0">— used by Validate and Agent</span></h2>
    <div class="row">
     <label>Target URL<input id="cfg-target" placeholder="https://stage.example.com"></label>
     <label>Username<input id="cfg-user" placeholder="test user"></label>
@@ -315,7 +318,7 @@ async function refresh(){
    const acts=[o.jmx?\`<a class="dl" href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.jmx)}">⬇ Download .jmx</a>\`:'',o.report?\`<a class="open" href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.report)}" target="_blank">Open report</a>\`:''].filter(Boolean).join('');
    return \`<li style="flex-direction:column;align-items:stretch;gap:2px"><div class="row" style="justify-content:space-between"><b>\${esc(o.name)}</b> \${t}</div>\${summary}<div class="acts">\${acts}</div><div class="mut" style="font-size:12px">saved to output\\\\\${esc(o.name)}\\\\</div></li>\`;
  }).join(''):'<li class="mut">No results yet.</li>';
- $('#gen').disabled=$('#run').disabled=s.busy;
+ $('#gen').disabled=$('#run').disabled=$('#agent').disabled=s.busy;
  $('#cancel').style.display=s.busy?'':'none';
  return s;
 }
@@ -366,6 +369,7 @@ async function start(mode){
 }
 $('#gen').onclick=()=>start('generate');
 $('#run').onclick=()=>start('run');
+$('#agent').onclick=()=>start('agent');
 async function del(n){await fetch('/api/input?name='+encodeURIComponent(n),{method:'DELETE'});refresh()}
 async function upload(files){for(const f of files){await fetch('/api/upload?name='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()})}refresh()}
 const drop=$('#drop'),file=$('#file');

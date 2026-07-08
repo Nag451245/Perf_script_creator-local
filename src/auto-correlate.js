@@ -172,7 +172,7 @@ function verifyExtractor(der, value, entries) {
     const hdrs = (r.headers || []).map(h => `${h.name}: ${h.value}`).join('\n');
     try {
         if (der.kind === 'regex') {
-            const hay = der.useHeaders ? hdrs : (body + '\n' + hdrs);
+            const hay = der.useHeaders ? hdrs : body;
             const m = hay.match(new RegExp(der.expr));
             return !!(m && m[1] === value);
         }

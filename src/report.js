@@ -21,7 +21,12 @@ const ARTIFACTS = [
     ['_ghosts.json', 'Client-side (ghost) values'],
     ['_polling.json', 'Detected polling loops'],
     ['_llm_suggestions.json', 'LLM fix suggestions'],
+    ['_java_safe_generate.json', 'Generated JMX Java-safe compatibility report'],
+    ['_run_status.json', 'Validation attempt status'],
     ['_baseline_diff.json', 'Baseline vs test diff (status / length / shape)'],
+    ['_memory_matches.json', 'Verified learning memory matches'],
+    ['_memory_patches.json', 'Verified learning memory patches'],
+    ['_learned_lessons.json', 'Lessons saved after green verification'],
     ['_reasoning.md', 'Reasoning trace'],
     ['_reasoning.json', 'Reasoning trace (structured)'],
     ['_report.json', 'Raw report (JSON)'],
@@ -35,12 +40,12 @@ function statCard(label, value) {
 /**
  * @param outDir folder the run wrote into
  * @param name   base name
- * @param data   { mode, verdict, stats, samples, baselineDiff?, correlations?, dualHar?, loadProfile?, reasoning? }
+ * @param data   { mode, verdict, stats, samples, baselineDiff?, memoryMatches?, learnedLessons?, correlations?, dualHar?, loadProfile?, reasoning?, businessVerification? }
  */
 function writeHtmlReport(outDir, name, data = {}) {
     const {
         mode = 'generate', verdict = 'generated', stats = {}, samples = [],
-        baselineDiff = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [],
+        baselineDiff = null, memoryMatches = [], learnedLessons = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [], businessVerification = null,
     } = data;
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
@@ -68,7 +73,22 @@ function writeHtmlReport(outDir, name, data = {}) {
             <td>${esc(s.responseMessage || s.failureMessage || '')}</td>
         </tr>`).join('') : `<tr><td colspan="4" class="muted">No request results (generate-only, or run did not execute).</td></tr>`;
 
-    const artifactItems = ARTIFACTS
+    const businessSection = businessVerification ? `<h2>Business verification</h2>
+      <p><span class="badge ${businessVerification.ok ? 'ok' : 'bad'}">${businessVerification.ok ? 'PASSED' : 'NOT VERIFIED'}</span></p>
+      <p>${esc(businessVerification.reason || '')}</p>
+      ${businessVerification.protectedSamplers && businessVerification.protectedSamplers.length
+        ? `<ul>${businessVerification.protectedSamplers.slice(0, 20).map(s => `<li>${esc(s.name)} <span class="muted">(${esc(s.reason || 'protected')})</span></li>`).join('')}</ul>`
+        : ''}
+      ${businessVerification.blockedDisables && businessVerification.blockedDisables.length
+        ? `<p class="muted">Blocked disable attempts: ${esc(businessVerification.blockedDisables.map(s => s.sampler).slice(0, 8).join(', '))}</p>`
+        : ''}` : '';
+
+    const pointerItems = fs.readdirSync(outDir)
+        .filter(file => file === '00_OPEN_THIS_FIRST.txt' || /^00_USE_THIS_.*\.jmx$/i.test(file))
+        .sort()
+        .map(file => `<li><a href="${esc(file)}">${esc(file)}</a> — ${file.endsWith('.jmx') ? 'Final JMX to open in JMeter' : 'Read this first'}</li>`)
+        .join('');
+    const artifactItems = pointerItems + ARTIFACTS
         .map(([suffix, desc]) => {
             const file = suffix === 'log.txt' ? 'log.txt' : `${name}${suffix}`;
             const full = path.join(outDir, file);
@@ -163,6 +183,20 @@ function writeHtmlReport(outDir, name, data = {}) {
         }
     }
 
+    let learningSection = '';
+    const matchRows = Array.isArray(memoryMatches) && memoryMatches.length
+        ? memoryMatches.slice(0, 25).map(m => `<tr><td>${esc(m.lessonId)}</td><td>${esc(m.confidence)}</td><td>${esc(m.contextPattern && m.contextPattern.samplerPattern)}</td><td><code>${esc(m.fix && m.fix.kind)}</code></td></tr>`).join('')
+        : '';
+    const learned = learnedLessons && Array.isArray(learnedLessons.learned) ? learnedLessons.learned : [];
+    if (matchRows || learned.length) {
+        const learnedRows = learned.slice(0, 25).map(l => `<tr><td>${esc(l.id)}</td><td>${esc(l.confidence)}</td><td>${esc(l.contextPattern && l.contextPattern.samplerPattern)}</td><td><code>${esc(l.fix && l.fix.kind)}</code></td></tr>`).join('');
+        learningSection = `<h2>Verified learning store</h2>
+            ${matchRows ? `<p class="muted">Previously verified, redacted lessons considered before AI escalation.</p>
+            <table><thead><tr><th>Lesson</th><th>Confidence</th><th>Pattern</th><th>Fix</th></tr></thead><tbody>${matchRows}</tbody></table>` : ''}
+            ${learnedRows ? `<p class="muted">New lessons saved only after this run verified green.</p>
+            <table><thead><tr><th>Lesson</th><th>Confidence</th><th>Pattern</th><th>Fix</th></tr></thead><tbody>${learnedRows}</tbody></table>` : ''}`;
+    }
+
     const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>perfscript-local — ${esc(name)}</title>
@@ -198,6 +232,8 @@ function writeHtmlReport(outDir, name, data = {}) {
 
   ${dashLink}
 
+  ${businessSection}
+
   <h2>Request results</h2>
   <table><thead><tr><th></th><th>Sampler</th><th>Code</th><th>Message</th></tr></thead>
   <tbody>${reqRows}</tbody></table>
@@ -211,6 +247,8 @@ function writeHtmlReport(outDir, name, data = {}) {
   ${reasoningSection}
 
   ${driftSection}
+
+  ${learningSection}
 
   <h2>Artifacts</h2>
   <ul>${artifactItems || '<li class="muted">none</li>'}</ul>

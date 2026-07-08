@@ -80,6 +80,17 @@ function extractByBoundary(text, b) {
     return m ? m[1] : null;
 }
 
+function shouldOverrideRedirectHost(location, previousUrl) {
+    const loc = String(location || '');
+    const isAbsolute = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(loc) || loc.startsWith('//');
+    if (!isAbsolute) return true;
+    try {
+        return new URL(loc, previousUrl).origin === new URL(previousUrl).origin;
+    } catch {
+        return false;
+    }
+}
+
 /**
  * STATIC PRE-PASS: build producer→consumer links from the recording.
  * @returns {{ links: Array, orphans: Array }}
@@ -205,8 +216,11 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
             liveResponses.push(liveTextOf(r));
             let curUrl = reqEntry.request.url; let hops = 0;
             while (r && r.status >= 300 && r.status < 400 && r.headers && r.headers.location && hops < 12) {
-                curUrl = new URL(r.headers.location, curUrl).toString();
-                r = await replayOne({ entry: { request: { method: 'GET', url: curUrl, headers: [] } }, vars, cookieJar, targetBaseUrl, insecure, timeoutMs });
+                const location = r.headers.location;
+                const nextUrl = new URL(location, curUrl).toString();
+                const redirectTargetBaseUrl = shouldOverrideRedirectHost(location, curUrl) ? targetBaseUrl : null;
+                curUrl = nextUrl;
+                r = await replayOne({ entry: { request: { method: 'GET', url: curUrl, headers: [] } }, vars, cookieJar, targetBaseUrl: redirectTargetBaseUrl, insecure, timeoutMs });
                 liveResponses.push(liveTextOf(r));   // the auth code lands in a followed hop
                 hops++;
             }
@@ -234,4 +248,4 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
     };
 }
 
-module.exports = { correlateAndReplay, buildLinks, _internal: { isDynamic, requestValues, boundaryOf, extractByBoundary } };
+module.exports = { correlateAndReplay, buildLinks, _internal: { isDynamic, requestValues, boundaryOf, extractByBoundary, shouldOverrideRedirectHost } };

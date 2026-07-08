@@ -285,6 +285,12 @@ function injectAssertionsFromMined(xml, flatEntries, correlationValues = []) {
         if (status >= 400 || status === 0) continue;
         const body = (e.response.content && e.response.content.text) || '';
         if (!body || body.length < 8) continue;
+        // Auto-submit bridge pages (SSO interceptor, /redirect/ style: a POST
+        // form of hidden inputs that JS submits immediately) are transient
+        // plumbing — with follow_redirects the replay lands PAST them, so any
+        // text mined from the recorded bridge body fails on a correct run.
+        // The manually-fixed Tasking script asserts nothing on these.
+        if (isAutoSubmitBridgePage(body)) continue;
         const ct = (e.response.content && e.response.content.mimeType) || '';
         const cands = extractStableTextCandidates(body, ct, {
             correlationValues, maxCandidates: 2,
@@ -313,6 +319,118 @@ function injectAssertionsFromMined(xml, flatEntries, correlationValues = []) {
         injected++;
     }
     return { xml: result, injected };
+}
+
+/* ─────────────────────────────────────────────────────────────────
+ * Dead-extractor repair
+ * ───────────────────────────────────────────────────────────────── */
+
+/**
+ * An extractor attached to a DISABLED sampler never runs, so every `${var}`
+ * it was supposed to feed goes to JMeter as a literal `${var}` — which in a
+ * URL throws URISyntaxException and kills the request outright (seen live:
+ * the engine put "Extract code" under /authorize/resume, the default noise
+ * rules disable that sampler, and Step 17 /iam/callback then sends the
+ * unresolved `${code}`). The recorded literal is strictly better than a
+ * variable that can never resolve — the manually-fixed Tasking script ships
+ * the recorded code on /iam/callback and stays green.
+ *
+ * For each extractor under a disabled sampler, this restores the recorded
+ * literal at every `${var}` consumer in ENABLED samplers, using the consumer
+ * entry's recorded request as evidence (anchor text around the variable
+ * locates the original value).
+ *
+ * @returns {{ xml: string, restored: Array<{var:string, sampler:string, literal:string}>, dead: string[] }}
+ */
+function repairDeadExtractorConsumers(xml, flatEntries) {
+    const entries = flatEntries || [];
+    let samplers = indexSamplers(xml);
+    if (!samplers.length) return { xml, restored: [], dead: [] };
+
+    const deadVars = new Map(); // refname -> disabled sampler name
+    const liveVars = new Set();
+    const extractorRe = /<(RegexExtractor|JSONPostProcessor|HtmlExtractor|BoundaryExtractor)\b[\s\S]*?<\/\1>/g;
+    for (const s of samplers) {
+        const openEnd = xml.indexOf('>', s.position);
+        const disabled = /enabled="false"/.test(xml.substring(s.position, openEnd + 1));
+        const seg = xml.substring(s.position, s.endPosition);
+        extractorRe.lastIndex = 0;
+        let m;
+        while ((m = extractorRe.exec(seg)) !== null) {
+            const ref = (m[0].match(/name="[^"]*(?:refname|referenceNames)">([^<]+)</i) || [])[1];
+            if (!ref) continue;
+            if (disabled) { if (!deadVars.has(ref)) deadVars.set(ref, s.name); }
+            else liveVars.add(ref);
+        }
+    }
+    // A var also produced by an ENABLED extractor is alive — leave it.
+    for (const ref of liveVars) deadVars.delete(ref);
+    if (!deadVars.size) return { xml, restored: [], dead: [] };
+
+    const escXmlText = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    let out = xml;
+    const restored = [];
+    for (const [ref, deadSampler] of deadVars) {
+        const token = '${' + ref + '}';
+        samplers = indexSamplers(out);
+        for (let k = samplers.length - 1; k >= 0; k--) {
+            const s = samplers[k];
+            const openEnd = out.indexOf('>', s.position);
+            if (/enabled="false"/.test(out.substring(s.position, openEnd + 1))) continue;
+            const seg = out.substring(s.position, s.endPosition);
+            if (!seg.includes(token)) continue;
+            const entry = entries[k];
+            const candidatesRaw = [];
+            if (entry?.request) {
+                try {
+                    const u = new URL(entry.request.url);
+                    candidatesRaw.push(u.pathname + u.search);
+                } catch { /* skip */ }
+                if (entry.request.postData?.text) candidatesRaw.push(entry.request.postData.text);
+                for (const p of entry.request.postData?.params || []) candidatesRaw.push(String(p.value || ''));
+                for (const h of entry.request.headers || []) candidatesRaw.push(String(h.value || ''));
+            }
+            const candidates = candidatesRaw.filter(Boolean).map(escXmlText);
+            const repairedSeg = seg.replace(
+                /(<stringProp\b[^>]*>)([^<]*)(<\/stringProp>)/g,
+                (_m, open, content, close) => {
+                    let c = content;
+                    let idx;
+                    while ((idx = c.indexOf(token)) >= 0) {
+                        let prefix = c.slice(Math.max(0, idx - 24), idx);
+                        const brace = prefix.lastIndexOf('}');
+                        if (brace >= 0) prefix = prefix.slice(brace + 1);
+                        const suffix = c.slice(idx + token.length, idx + token.length + 24).split('${')[0];
+                        let literal = null;
+                        for (const rc of candidates) {
+                            const pAt = prefix ? rc.indexOf(prefix) : -1;
+                            if (prefix && pAt < 0) continue;
+                            const start = prefix ? pAt + prefix.length : 0;
+                            const end = suffix ? rc.indexOf(suffix, start) : rc.length;
+                            if (end <= start) continue;
+                            const cand = rc.slice(start, end);
+                            if (cand && cand.length <= 512 && !cand.includes('<') && !cand.includes('${')) { literal = cand; break; }
+                        }
+                        if (literal == null) break; // no evidence — leave as-is
+                        c = c.slice(0, idx) + literal + c.slice(idx + token.length);
+                        restored.push({ var: ref, sampler: s.name, literal: literal.slice(0, 60) });
+                    }
+                    return open + c + close;
+                }
+            );
+            if (repairedSeg !== seg) {
+                out = out.substring(0, s.position) + repairedSeg + out.substring(s.endPosition);
+            }
+        }
+    }
+    return { xml: out, restored, dead: [...deadVars.keys()] };
+}
+
+/** A POST form of hidden inputs that scripts submit on load — SSO/SAML bridge. */
+function isAutoSubmitBridgePage(body) {
+    if (!/<form\b[^>]*method\s*=\s*["']?post/i.test(body)) return false;
+    if (!/<input\b[^>]*type\s*=\s*["']?hidden/i.test(body)) return false;
+    return /\.submit\s*\(\s*\)/.test(body) || /onload\s*=/i.test(body) || /document\.forms\[/.test(body);
 }
 
 function buildResponseAssertion(texts) {
@@ -462,10 +580,9 @@ function setBoolProp(block, name, value) {
  * returns 401. Cascading: no auth code → no bearer → every later API
  * call returns 401.
  *
- * The fix is the opposite of extraction: mint a fresh value at the
- * start of each iteration via a JSR223 PreProcessor at ThreadGroup
- * scope, then let Auth0 echo it back (the round-trip works because
- * state/nonce are opaque to the server).
+ * The fix is the opposite of extraction: mint a fresh value directly
+ * in the /authorize URL using native JMeter functions, then let Auth0
+ * echo it back. Native functions keep the generated JMX Java-safe.
  *
  * Safety: only rewires a refname when ${refname} appears in at least
  * one URL containing `/authorize` (canonical OAuth marker), so we don't
@@ -476,9 +593,6 @@ function setBoolProp(block, name, value) {
 const OAUTH_REWIRE_SENTINEL = 'OAuth state/nonce synthesizer (perfscript-local)';
 
 function rewireClientMintedOauthVars(xml) {
-    // Idempotency: if our sentinel PreProcessor is already in the XML,
-    // this transform has already run — bail out so we don't double-inject.
-    if (xml.includes(OAUTH_REWIRE_SENTINEL)) return { xml, rewired: [] };
     // Only rewire the BARE OAuth2 client-side state/nonce. Suffixed
     // variants (state_2, state_3, …) are almost always Auth0/OIDC
     // universal-login session tokens that the IdP issues server-side
@@ -518,36 +632,36 @@ function rewireClientMintedOauthVars(xml) {
         return { xml, rewired: [] };
     }
 
-    // Build a single PreProcessor that mints fresh values for all OAuth
-    // vars at iteration start. 32-char lowercase hex matches the format
-    // browsers/SDKs typically emit (and Auth0 accepts anything opaque).
     const allVars = [...new Set([...varsUsedInAuthorize, ...rewired])];
-    const scriptLines = [
-        'def rand = new java.security.SecureRandom()',
-        'def hex32 = { -> String.format("%032x", new java.math.BigInteger(128, rand)) }',
-        ...allVars.map(v => `vars.put("${v}", hex32())`),
-    ];
-    const script = scriptLines.join('\n');
-
-    const preproc =
-        '\n      <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" ' +
-        `testname="${OAUTH_REWIRE_SENTINEL}" enabled="true">\n` +
-        '        <stringProp name="cacheKey">true</stringProp>\n' +
-        '        <stringProp name="filename"></stringProp>\n' +
-        '        <stringProp name="parameters"></stringProp>\n' +
-        '        <stringProp name="script">' + escXmlAttr(script) + '</stringProp>\n' +
-        '        <stringProp name="scriptLanguage">groovy</stringProp>\n' +
-        '      </JSR223PreProcessor>\n' +
-        '      <hashTree/>\n';
-
-    // Splice at the top of the first ThreadGroup's hashTree, so the
-    // PreProcessor runs once per iteration BEFORE any HTTP sampler.
-    const tgMatch = out.match(/<ThreadGroup\b[\s\S]*?<\/ThreadGroup>\s*<hashTree>/);
-    if (!tgMatch) return { xml: out, rewired }; // no ThreadGroup, nothing to splice
-    const insertAt = tgMatch.index + tgMatch[0].length;
-    out = out.slice(0, insertAt) + preproc + out.slice(insertAt);
+    for (const v of allVars) {
+        const native = '${__RandomString(32,abcdef0123456789,)}';
+        out = out.replace(new RegExp(`\\$\\{${v}\\}`, 'g'), native);
+    }
 
     return { xml: out, rewired: allVars };
+}
+
+function repairAuth0LoginStateExtractors(xml) {
+    let repaired = 0;
+    const rxBlock = (refname) => `
+            <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="Extract ${escXmlAttr(refname)} (Auth0 Location)" enabled="true">
+              <stringProp name="RegexExtractor.useHeaders">true</stringProp>
+              <stringProp name="RegexExtractor.refname">${escXmlAttr(refname)}</stringProp>
+              <stringProp name="RegexExtractor.regex">(?i)Location:\\s*[^\\r\\n]*[?&amp;]state=([^&amp;\\s&quot;&apos;#\\r\\n]+)</stringProp>
+              <stringProp name="RegexExtractor.template">$1$</stringProp>
+              <stringProp name="RegexExtractor.match_number">1</stringProp>
+              <stringProp name="RegexExtractor.default">NOT_FOUND_${escXmlAttr(refname)}</stringProp>
+              <stringProp name="Sample.scope">all</stringProp>
+            </RegexExtractor>`;
+
+    const out = xml.replace(
+        /<HtmlExtractor\b[^>]*>[\s\S]*?<stringProp name="HtmlExtractor\.refname">(state_\d+)<\/stringProp>[\s\S]*?<\/HtmlExtractor>/g,
+        (_block, refname) => {
+            repaired++;
+            return rxBlock(refname);
+        },
+    );
+    return { xml: out, repaired };
 }
 
 function applyLoadProfile(xml, profile = {}) {
@@ -631,6 +745,165 @@ function disableSamplersByPattern(xml, patterns) {
     return { xml: out, disabled, hits };
 }
 
+/* ─────────────────────────────────────────────────────────────────
+ * Form hidden-input correlation (login state, SSO auto-POST bridge)
+ * ───────────────────────────────────────────────────────────────── */
+
+/**
+ * Correlate values carried by HTML form hidden inputs. This is the class the
+ * manually-fixed Tasking script solved by hand and the engine misses:
+ *
+ *   - an IdP login page embeds <input type="hidden" name="state" value="…">
+ *     and every login step must post the FRESH value, not the recorded one;
+ *   - an SSO bridge page (/redirect/) embeds <input name="token" value="…">
+ *     that the next POST must carry.
+ *
+ * Evidence-driven and generic: a producer is any recorded entry whose HTML
+ * response contains a hidden input with a value (len >= 8) that a LATER
+ * entry provably consumes (URL query, post body, or request header). For
+ * each (name, value) pair we emit a CSS HtmlExtractor
+ * (`input[name="N"]`, attribute=value) after the producer sampler and
+ * substitute ${var} for the recorded literal in every LATER sampler segment
+ * (path / body args / header values live in stringProp text nodes). The
+ * producer's own fields are left recorded — the variable doesn't exist
+ * until its extractor has run.
+ *
+ * @param {string} xml       rendered JMX
+ * @param {Array}  flatEntries HAR-shape entries in sampler order
+ * @returns {{ xml: string, wired: Array<{var:string,input:string,producerSampler:string,substitutions:number}> }}
+ */
+function correlateFormHiddenInputs(xml, flatEntries) {
+    const entries = flatEntries || [];
+    if (!xml || entries.length === 0) return { xml, wired: [] };
+
+    // 1. Producers: hidden inputs with substantial values in HTML responses.
+    const candidates = [];
+    const seenPair = new Set(); // name value -> only earliest producer
+    for (let i = 0; i < entries.length; i++) {
+        const body = entries[i]?.response?.content?.text || '';
+        if (!body || !/<form\b/i.test(body)) continue;
+        for (const tag of body.match(/<input\b[^>]*>/gi) || []) {
+            if (!/type\s*=\s*["']?hidden/i.test(tag)) continue;
+            const name = (tag.match(/\bname\s*=\s*["']([^"']+)["']/i) || [])[1];
+            const value = (tag.match(/\bvalue\s*=\s*["']([^"']*)["']/i) || [])[1];
+            if (!name || !value || value.length < 8) continue;
+            if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name)) continue;
+            const key = `${name} ${value}`;
+            if (seenPair.has(key)) continue;
+            seenPair.add(key);
+            candidates.push({ entryIndex: i, input: name, value });
+        }
+    }
+    if (!candidates.length) return { xml, wired: [] };
+
+    // 2. Keep only values a LATER entry actually consumes.
+    const consumed = candidates.filter(c => {
+        for (let j = c.entryIndex + 1; j < entries.length; j++) {
+            const req = entries[j]?.request || {};
+            if ((req.url || '').includes(c.value)) return true;
+            if ((req.postData?.text || '').includes(c.value)) return true;
+            for (const p of req.postData?.params || []) {
+                if (String(p.value || '').includes(c.value)) return true;
+            }
+            for (const h of req.headers || []) {
+                if (String(h.value || '').includes(c.value)) return true;
+            }
+        }
+        return false;
+    });
+    if (!consumed.length) return { xml, wired: [] };
+
+    let out = xml;
+    const wired = [];
+    const usedVars = new Set();
+    for (const c of consumed) {
+        const samplers = indexSamplers(out);
+        const prodOrder = samplerOrderForEntry(samplers, entries, c.entryIndex);
+        if (prodOrder < 0) continue;
+        // The value must still be a literal somewhere AFTER the producer —
+        // if the engine already wired it (or a previous run of this pass),
+        // leave it alone.
+        const afterProducer = out.substring(samplers[prodOrder].endPosition);
+        if (!afterProducer.includes(c.value)) continue;
+
+        let varName = c.input.replace(/[^A-Za-z0-9_]/g, '_');
+        if (usedVars.has(varName) || variableAlreadyDefined(out, varName)) {
+            let n = 2;
+            while (usedVars.has(`${varName}_f${n}`) || variableAlreadyDefined(out, `${varName}_f${n}`)) n++;
+            varName = `${varName}_f${n}`;
+        }
+        usedVars.add(varName);
+
+        const block = `
+            <HtmlExtractor guiclass="HtmlExtractorGui" testclass="HtmlExtractor" testname="Extract ${escXmlAttr(varName)} (form hidden input)" enabled="true">
+              <stringProp name="HtmlExtractor.refname">${escXmlAttr(varName)}</stringProp>
+              <stringProp name="HtmlExtractor.expr">input[name=&quot;${escXmlAttr(c.input)}&quot;]</stringProp>
+              <stringProp name="HtmlExtractor.attribute">value</stringProp>
+              <stringProp name="HtmlExtractor.default">NOT_FOUND_${escXmlAttr(varName)}</stringProp>
+              <stringProp name="HtmlExtractor.match_number">1</stringProp>
+              <boolProp name="HtmlExtractor.default_empty_value">false</boolProp>
+            </HtmlExtractor>
+            <hashTree/>`;
+        const injected = require('./extractors').injectAfterSampler(out, prodOrder, block);
+        if (injected === out) continue;
+        out = injected;
+
+        // 3. Substitute the literal in every sampler segment AFTER the
+        //    producer (segments include the sampler's hashTree children:
+        //    HeaderManager Header.value, extractors, assertions).
+        const resamplers = indexSamplers(out);
+        let substitutions = 0;
+        for (let k = resamplers.length - 1; k > prodOrder; k--) {
+            const seg = out.substring(resamplers[k].position, resamplers[k].endPosition);
+            if (!seg.includes(c.value)) continue;
+            const replaced = seg.replace(
+                /(<stringProp\b[^>]*>)([^<]*)(<\/stringProp>)/g,
+                (_m, open, content, close) => {
+                    if (!content.includes(c.value)) return _m;
+                    substitutions++;
+                    return open + content.split(c.value).join('${' + varName + '}') + close;
+                }
+            );
+            if (replaced !== seg) {
+                out = out.substring(0, resamplers[k].position) + replaced + out.substring(resamplers[k].endPosition);
+            }
+        }
+        if (!substitutions) continue; // extractor without consumers is noise — but keep it; it is harmless and documents the source
+        wired.push({
+            var: varName,
+            input: c.input,
+            producerSampler: samplers[prodOrder].name,
+            substitutions,
+        });
+    }
+    return { xml: out, wired };
+}
+
+/** Map a flat-entry index onto its sampler order, tolerating filtered/renamed lists. */
+function samplerOrderForEntry(samplers, entries, entryIndex) {
+    const e = entries[entryIndex] || {};
+    let pathname = '';
+    try { pathname = new URL(e.request.url).pathname; } catch { /* keep empty */ }
+    const suffix = `- ${String(e.request?.method || 'GET').toUpperCase()} ${pathname}`;
+    if (samplers[entryIndex] && samplers[entryIndex].name.endsWith(suffix)) return entryIndex;
+    // Fall back to the sampler with the matching suffix nearest to entryIndex
+    // (the same path can appear several times, e.g. three GET /redirect/).
+    let best = -1;
+    let bestDist = Infinity;
+    for (const s of samplers) {
+        if (!s.name.endsWith(suffix)) continue;
+        const d = Math.abs(s.order - entryIndex);
+        if (d < bestDist) { best = s.order; bestDist = d; }
+    }
+    return best;
+}
+
+function variableAlreadyDefined(xml, varName) {
+    return xml.includes('${' + varName + '}') ||
+        new RegExp(`<stringProp name="[^"]*refname[^"]*">${varName}</stringProp>`, 'i').test(xml) ||
+        new RegExp(`\\bvars\\.put\\(['"]${varName}['"]`).test(xml);
+}
+
 function stripGuiListenersForRun(xml, jtlPath) {
     let disabled = 0;
     const out = xml.replace(/<ResultCollector\b([^>]*?)enabled="true"([^>]*)>/g, (_m, a, b) => {
@@ -674,5 +947,8 @@ module.exports = {
     injectGaussianTimers,
     applyLoadProfile,
     stripGuiListenersForRun,
-    _internal: { indexSamplers, findHashTreeEnd, escXmlAttr, computePageTimings, generatorForKind, setStringProp, setBoolProp },
+    repairAuth0LoginStateExtractors,
+    correlateFormHiddenInputs,
+    repairDeadExtractorConsumers,
+    _internal: { indexSamplers, findHashTreeEnd, escXmlAttr, computePageTimings, generatorForKind, setStringProp, setBoolProp, samplerOrderForEntry, isAutoSubmitBridgePage },
 };

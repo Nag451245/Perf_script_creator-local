@@ -2,13 +2,15 @@
   "name": "perfscript-local",
   "version": "0.1.0",
   "private": true,
-  "description": "Local-only, folder-driven autonomous JMeter scripting agent. Drop HARs in input/, get validated scripts in output/. Reuses the PerfScript engine; runs local JMeter + (optional) Gemini.",
+  "description": "Local-only, folder-driven autonomous JMeter scripting agent. Drop HARs in input/, get validated scripts in output/. Reuses the PerfScript engine; runs local JMeter + optional OpenAI/Gemini escalation.",
   "bin": { "perfscript-local": "index.js" },
   "scripts": {
     "start": "node index.js",
     "ui": "node src/ui-server.js",
     "watch": "node index.js --watch",
     "run-and-validate": "node index.js --run",
+    "agent": "node index.js --agent",
+    "agent:watch": "node index.js --agent --watch",
     "test": "node --test",
     "prepare": "git config core.hooksPath githooks 2>/dev/null || true"
   },

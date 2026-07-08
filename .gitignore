@@ -8,3 +8,5 @@ input/*
 perfscript.config.json
 **/*_secrets.json
 **/_baseline_diff.json
+memory/verified-lessons.json
+.perfscript-state/

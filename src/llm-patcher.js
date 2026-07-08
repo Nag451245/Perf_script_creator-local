@@ -40,6 +40,86 @@
  */
 const { injectAfterSampler, _internal: { escXmlAttr, indexSamplers } } = require('./extractors');
 
+const PATCH_SCHEMAS = {
+    addExtractor: {
+        keys: new Set(['kind', 'sampler', 'variable', 'type', 'path', 'regex', 'template', 'useHeaders']),
+        required: ['kind', 'sampler', 'variable', 'type'],
+    },
+    replaceValueWithVar: {
+        keys: new Set(['kind', 'sampler', 'value', 'variable']),
+        required: ['kind', 'value', 'variable'],
+    },
+    setSamplerEnabled: {
+        keys: new Set(['kind', 'sampler', 'enabled']),
+        required: ['kind', 'sampler', 'enabled'],
+    },
+};
+
+function validateLlmPatches(fixes) {
+    const accepted = [];
+    const rejected = [];
+    if (!Array.isArray(fixes)) return { accepted, rejected: [{ reason: 'not_array', raw: fixes }] };
+
+    for (const raw of fixes) {
+        const result = validateOne(raw);
+        if (result.ok) accepted.push(result.fix);
+        else rejected.push(result.rejected);
+    }
+    return { accepted, rejected };
+}
+
+function validateOne(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return { ok: false, rejected: { reason: 'not_object', raw } };
+    }
+    if (!Object.prototype.hasOwnProperty.call(raw, 'kind')) {
+        const field = Object.keys(raw)[0] || 'kind';
+        return { ok: false, rejected: { reason: 'unknown_field', kind: null, field, raw } };
+    }
+
+    const kind = raw.kind;
+    const schema = PATCH_SCHEMAS[kind];
+    if (!schema) return { ok: false, rejected: { reason: 'unsupported_kind', kind: kind || null, raw } };
+
+    for (const key of Object.keys(raw)) {
+        if (!schema.keys.has(key)) {
+            return { ok: false, rejected: { reason: 'unknown_field', kind, field: key, raw } };
+        }
+    }
+
+    for (const key of schema.required) {
+        if (!(key in raw) || raw[key] == null || raw[key] === '') {
+            return { ok: false, rejected: { reason: 'missing_field', kind, field: key, raw } };
+        }
+    }
+    if (raw.variable && !isSafeVariableName(raw.variable)) {
+        return { ok: false, rejected: { reason: 'invalid_variable', kind, variable: raw.variable, raw } };
+    }
+
+    if (kind === 'addExtractor') {
+        if (!['json', 'regex'].includes(raw.type)) {
+            return { ok: false, rejected: { reason: 'invalid_extractor_type', kind, type: raw.type, raw } };
+        }
+        if (raw.type === 'json' && !raw.path) {
+            return { ok: false, rejected: { reason: 'missing_field', kind, field: 'path', raw } };
+        }
+        if (raw.type === 'regex' && !raw.regex) {
+            return { ok: false, rejected: { reason: 'missing_field', kind, field: 'regex', raw } };
+        }
+    }
+
+    if (kind === 'setSamplerEnabled' && typeof raw.enabled !== 'boolean') {
+        return { ok: false, rejected: { reason: 'invalid_field', kind, field: 'enabled', raw } };
+    }
+
+    return { ok: true, fix: { ...raw } };
+}
+
+function isSafeVariableName(name) {
+    const s = String(name || '');
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(s) && !s.startsWith('__');
+}
+
 /**
  * @param {string} xml          rendered JMX
  * @param {Array}  fixes        LLM/user-supplied patch list
@@ -196,4 +276,4 @@ function applySetSamplerEnabled(xml, fix) {
     return { xml: next, applied: { kind: 'setSamplerEnabled', sampler: fix.sampler, enabled: !!fix.enabled, touched } };
 }
 
-module.exports = { applyLlmPatches, _internal: { normalize, applyAddExtractor, applyReplaceValueWithVar, applySetSamplerEnabled } };
+module.exports = { applyLlmPatches, validateLlmPatches, _internal: { normalize, applyAddExtractor, applyReplaceValueWithVar, applySetSamplerEnabled, validateOne, isSafeVariableName } };

@@ -5,9 +5,45 @@
   "jmeterHome": "D:/apache-jmeter-5.6.3",
   "maxIterations": 3,
 
+  "openai": {
+    "_comment": "Preferred AI provider for --agent. Acts as a constrained senior performance engineer and returns safe JSON patches only. Leave apiKey blank to use OPENAI_API_KEY or fall back to Gemini.",
+    "apiKey": "",
+    "model": "gpt-5.5"
+  },
+
   "gemini": {
-    "_comment": "Used in Phase 4 (ghost-source classification + JSR223 synthesis). Leave blank to disable AI escalation.",
-    "apiKey": ""
+    "_comment": "Optional fallback provider. Used only when OpenAI is not configured. Default model is Gemini 3.5 Flash; use --gemini-pro for Gemini 3.1 Pro Preview.",
+    "apiKey": "",
+    "model": "gemini-3.5-flash",
+    "proModel": "gemini-3.1-pro-preview"
+  },
+
+  "agent": {
+    "_comment": "Safe bounded agent mode. AI returns JSON suggestions only; the app applies approved patch types and re-runs JMeter.",
+    "enabled": false,
+    "maxLlmRounds": 1,
+    "javaSafeMode": true
+  },
+
+  "learning": {
+    "_comment": "Verified Learning Store. Saves only redacted lessons after green JMeter verification; imports/exports sanitized team bundles.",
+    "enabled": true,
+    "autoApplyMinConfidence": 0.85,
+    "storePath": "memory/verified-lessons.json",
+    "exportFile": "memory/team-lessons.json"
+  },
+
+  "inputState": {
+    "_comment": "Tracks processed input files by path/size/modified time so unchanged JMX/HAR/XML files are skipped across agent restarts.",
+    "enabled": true,
+    "storePath": ".perfscript-state/processed-inputs.json"
+  },
+
+  "successArchive": {
+    "_comment": "When Validate/Agent finishes GREEN, write a ZIP copy to output/successful while keeping normal output files readable.",
+    "enabled": true,
+    "folder": "output/successful",
+    "keepOriginals": true
   },
 
   "run": {
@@ -15,6 +51,15 @@
     "targetBaseUrlOverride": "",
     "credentials": { "username": "", "password": "" },
     "dataFiles": [],
+
+    "_disableCalls_comment": "App/flow-specific samplers to disable, matched by testname/path substring. Generic browser telemetry and standard OIDC plumbing (/authorize/resume, /oauth/token, /logout) are disabled by default in code; put YOUR app's vendor callback paths or step-numbered noise here.",
+    "disableCalls": [],
+
+    "_oauth_comment": "dropBareStateNonce: opt-in per flow. When true, bare state/nonce correlations are removed and the recorded literals stay in /authorize. Leave false for standard OAuth flows that need fresh state threaded.",
+    "oauth": { "dropBareStateNonce": false },
+
+    "_llmFlowNotes_comment": "Flow-specific guidance appended to the AI escalation prompt (which endpoints are plumbing for THIS app, etc). Keep app names/paths here, not in code.",
+    "llmFlowNotes": [],
 
     "_loadProfile_comment": "Optional load shape. Honored at both generate-only and --run. holdSec forces infinite loops + scheduler (whichever finishes first wins — don't combine finite loops with a duration). Omit any field to keep the engine default.",
     "loadProfile": {

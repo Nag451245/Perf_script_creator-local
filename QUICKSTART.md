@@ -9,27 +9,86 @@ run it against your test environment to see pass/fail.
 
 1. **Node.js 18+** installed (the launchers auto-find it; nothing to configure).
 2. **Apache JMeter** (for the *Validate* step only) — e.g. `D:\apache-jmeter-5.6.3`.
-3. **Java 8–21** (JMeter 5.6.3 breaks on Java 22+). A JDK 21 is already set up here.
+3. **Java 21 recommended** for JMeter 5.6.3. Agent Java-safe mode can strip
+   JSR223/Groovy blocks before validation so newer Java versions do not hit the
+   Groovy `Unsupported class file major version` failure.
 4. Tell the app where those live — copy `perfscript.config.example.json` to
    `perfscript.config.json` and set:
    ```json
    {
      "jmeterHome": "D:/apache-jmeter-5.6.3",
-     "javaHome": "D:/Users/nagendra.bpuchala/jdk21/jdk-21.0.11+10"
+     "javaHome": "D:/Users/nagendra.bpuchala/jdk21/jdk-21.0.11+10",
+     "agent": {
+       "enabled": false,
+       "maxLlmRounds": 1,
+       "javaSafeMode": true
+     },
+     "learning": {
+       "enabled": true,
+       "autoApplyMinConfidence": 0.85,
+       "storePath": "memory/verified-lessons.json",
+       "exportFile": "memory/team-lessons.json"
+     },
+     "inputState": {
+       "enabled": true,
+       "storePath": ".perfscript-state/processed-inputs.json"
+     },
+     "successArchive": {
+       "enabled": true,
+       "folder": "output/successful",
+       "keepOriginals": true
+     },
+    "openai": {
+      "apiKey": "",
+      "model": "gpt-5.5"
+    },
+    "gemini": {
+       "apiKey": "",
+       "model": "gemini-3.5-flash",
+       "proModel": "gemini-3.1-pro-preview"
+     }
    }
    ```
    (Generating a script needs neither JMeter nor Java — only *Validate* does.)
+   Add the OpenAI key later by filling `openai.apiKey` or setting
+   `OPENAI_API_KEY`; leave it blank to run deterministic-only. Gemini remains
+   available as a fallback via `gemini.apiKey` / `GOOGLE_API_KEY`.
 
 ---
 
-## A. Using the UI (easiest)
+## A. Start The Agent From The Folder
+
+Use this when you want it to behave like an agent, not a one-time command.
+
+1. Double-click **`START_AGENT.cmd`**.
+2. Keep the console window open.
+3. Drop one of these into `input\`:
+   - `flow__run1.har` + `flow__run2.har`
+   - `flow__run1.jmx` + `flow__run1.recording.xml`
+   - `flow__run2.jmx` + `flow__run2.recording.xml`
+4. The agent automatically groups fresh files, generates the JMX, validates it,
+   monitors failures, asks OpenAI/Gemini only when deterministic repair is stuck, applies
+   safe JSON patches, and re-runs JMeter.
+5. Open `output\<flow>\<flow>_report.html` first, then download/open the final
+   `.jmx`.
+
+Existing files in `input\` are processed once, then tracked in
+`.perfscript-state\processed-inputs.json`. If the same JMX/HAR/XML files are
+unchanged when the agent restarts, they are skipped. If you replace or edit a
+file, its size/modified time changes and the agent processes it again.
+
+Close the console window to stop watching.
+
+---
+
+## B. Using the UI
 
 1. **Launch:** double-click **`perfscript-ui.cmd`** (or the **PerfScript UI**
    desktop shortcut). A console window opens and your browser goes to
    **http://localhost:7070**. *Keep the console open; close it to stop the UI.*
 
 2. **Add recordings** — drag your files onto the drop zone (or click to browse).
-   See **§C** for what files to record and how to name them.
+   See **§D** for what files to record and how to name them.
 
 3. *(Only if you'll Validate)* **Settings** — fill in:
    - **Target URL** — the environment to test, e.g. `https://stage.example.com`
@@ -41,6 +100,8 @@ run it against your test environment to see pass/fail.
 4. **Run:**
    - **Generate** — correlate and build the `.jmx` (no execution).
    - **Generate + Validate (JMeter)** — also runs it and reports pass/fail.
+   - **Senior AI Agent** — runs validation, uses OpenAI/Gemini only for unresolved
+     failures, applies safe JSON patches, and re-runs JMeter.
 
    Watch the **live log**. Use **Cancel** to stop a run.
 
@@ -49,7 +110,7 @@ run it against your test environment to see pass/fail.
 
 ---
 
-## B. Using the CLI / one-click launchers (otherwise)
+## C. Using the CLI / one-click launchers (otherwise)
 
 Double-click a launcher, or run from a terminal in the project folder:
 
@@ -57,17 +118,25 @@ Double-click a launcher, or run from a terminal in the project folder:
 |---|---|---|
 | Generate only | `perfscript.cmd` | `node index.js` |
 | Generate **+ Validate** | `perfscript-run.cmd` | `node index.js --run` |
-| Watch input\ and process on drop | — | `node index.js --watch` |
+| One-shot Senior AI agent | `perfscript-agent.cmd` | `node index.js --agent` or `npm run agent` |
+| Always-on Senior AI agent | `START_AGENT.cmd` | `node index.js --agent --watch` or `npm run agent:watch` |
+| Watch input\ and generate only | — | `node index.js --watch` |
 | Start the web UI | `perfscript-ui.cmd` | `npm run ui` |
+| Export verified lessons | — | `node index.js --memory-export memory/team-lessons.json` |
+| Import teammate lessons | — | `node index.js --memory-import memory/team-lessons.json` |
 
-Useful flags: `--iterations N` (auto-fix loop budget, default 3), `--fast-loop`
-(quick Node pre-flight without JMeter).
+Useful flags: `--iterations N` (auto-fix loop budget, default 3), `--agent`
+(bounded AI diagnose/patch/re-verify when a key is configured), `--fast-loop`
+(quick Node pre-flight without JMeter), `--gemini-pro` (use Gemini 3.1 Pro
+Preview instead of default Gemini 3.5 Flash), `--force` (reprocess unchanged
+input files after code/prompt changes), `--memory-export FILE`, and
+`--memory-import FILE`.
 
 Everything the UI does, the CLI does — the UI just calls `index.js` under the hood.
 
 ---
 
-## C. What to put in `input\` (and naming)
+## D. What to put in `input\` (and naming)
 
 The **best** results come from **two recordings of the same flow** (different
 user/data) — the app diffs them to tell dynamic values from static config.
@@ -85,19 +154,36 @@ right-click the request list → **Save all as HAR with content**. Record it twi
 
 ---
 
-## D. Reading the output (`output\<name>\`)
+## E. Reading the output (`output\<name>\`)
 
+- **`00_OPEN_THIS_FIRST.txt`** — quick instructions for the folder.
+- **`00_USE_THIS_FINAL_VALIDATED_<name>.jmx`** — open this JMX first after a GREEN
+  Validate/Agent run. If JMeter validation did not run, the file says
+  `FINAL_GENERATED_NOT_VALIDATED` instead.
 - **`<name>_report.html`** — open this first: verdict, correlations, failures,
   links to every artifact.
-- **`<name>.jmx`** — the generated/validated script (open in JMeter GUI to edit).
+- `<name>.jmx`, `final_validated.jmx`, and patched JMX files are kept for history
+  and debugging.
 - `<name>_data.csv` — synthesized unique test data (if the flow had user inputs).
 - `final.jtl` / dashboard — raw run results (Validate mode).
+- `_llm_suggestions.json`, `_llm_validation_round*.json`, `_llm_patches_round*.json`
+  — only when OpenAI/Gemini is configured and unresolved failures remain.
+- `_memory_matches.json`, `_memory_patches.json`, `_learned_lessons.json` —
+  verified learning store evidence: matched lessons, applied memory patches, and
+  newly saved redacted lessons after green verification.
+- `_java_safe_*.json` — JSR223/Groovy blocks removed before JMeter validation.
 - `log.txt`, `<name>_reasoning.md` — what the tool did and why.
+- GREEN Validate/Agent runs also get a ZIP copy in `output\successful\`. The
+  normal output folder stays readable because `successArchive.keepOriginals` is
+  true by default.
 
 ---
 
-## E. When Validate shows failures
+## F. When Validate shows failures
 
+- In Agent mode, the tool first checks the local verified learning store. Matching
+  lessons are redacted, schema-gated, applied as candidate patches, and proven by
+  another JMeter run before being accepted.
 - **The report/log names the first failing step** — start there.
 - **Login/OAuth (auth0/Okta) 401/403** is often **not** a correlation bug: modern
   interactive logins (PKCE) can't be replayed. Options: use a service/ROPC token,
@@ -105,13 +191,34 @@ right-click the request list → **Save all as HAR with content**. Record it twi
 - **Third-party 4xx** (analytics/beacons like Dynatrace, gravatar) are noise —
   ignore them; they aren't your app.
 
+To share knowledge with teammates, export a sanitized bundle:
+
+```powershell
+node index.js --memory-export memory/team-lessons.json
+```
+
+They can import it on their machine:
+
+```powershell
+node index.js --memory-import memory/team-lessons.json
+```
+
 ---
 
-## F. Troubleshooting
+## G. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | UI won't open / port busy | It auto-tries 7071+; check the console for the actual URL, or set `PERFSCRIPT_UI_PORT`. |
 | "JMeter not found" | Set `jmeterHome` in `perfscript.config.json` (or `JMETER_HOME`). |
-| Validate runs but 0 samples | Java too new — point `javaHome` at a JDK 8–21. |
+| Validate runs but 0 samples | Use agent Java-safe mode or point `javaHome` at JDK 21. |
 | "engine not found" | Set `PERFSCRIPT_ENGINE` to the engine's `backend` folder. |
+
+---
+
+## H. Copying To Another Machine
+
+Use `SETUP_FOR_TEAMMATES.md`. In short: copy this folder plus the reused engine
+checkout, install Node 18+, install JMeter + Java 21, set `PERFSCRIPT_ENGINE` if
+the engine is not beside this folder, create a local `perfscript.config.json`,
+and add the OpenAI/Gemini key only on that machine if Agent mode should use AI.

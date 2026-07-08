@@ -10,24 +10,41 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 
 const { HarParser } = require('../src/engine');
-const { generate } = require('../src/generate');
+const { generate, _internal: generateInternal } = require('../src/generate');
 const { writeHtmlReport } = require('../src/report');
-const { escalateToLlm } = require('../src/runner');
+const { resolveAgentOptions, labelForAgentOptions } = require('../src/agent-config');
+const { sanitizeJavaUnsafeJmx } = require('../src/java-safe');
+const { flagsForRunMode } = require('../src/ui-run-mode');
+const { resolveGeminiModel } = require('../src/gemini-model');
+const inputState = require('../src/input-state');
+const { archiveSuccessfulRun } = require('../src/success-archive');
+const { writeFinalJmxPointer } = require('../src/final-artifact');
+const businessGuard = require('../src/business-guard');
+const { escalateToLlm, _internal: runnerInternal } = require('../src/runner');
+const learningStore = require('../src/learning-store');
 const { groupInputs } = require('../src/ingest');
 const { knownDefinedVars, planExtractor, _internal: extractorsInternal } = require('../src/extractors');
-const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun, rewireClientMintedOauthVars } = require('../src/transforms');
+const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun, rewireClientMintedOauthVars, repairAuth0LoginStateExtractors, correlateFormHiddenInputs } = require('../src/transforms');
 const { scrubRecordingXml } = require('../src/scrubber');
 const { rewriteHost } = require('../src/host-rewrite');
-const { diffRunAgainstRecording, _internal: verifierInternal } = require('../src/verifier');
+const { diffRunAgainstRecording, summarizeJtlFast, _internal: verifierInternal } = require('../src/verifier');
 const { replayAll, _internal: replayInternal } = require('../src/fast-replay');
-const { applyLlmPatches } = require('../src/llm-patcher');
+const { correlateAndReplay } = require('../src/replay-correlate');
+const { applyLlmPatches, validateLlmPatches } = require('../src/llm-patcher');
 const { writeHtmlReport: writeHtmlReportFn } = require('../src/report');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
+function listenLocal(server) {
+    return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
+}
+function closeServer(server) {
+    return new Promise(resolve => server.close(resolve));
+}
 function parse(har) {
     const o = new HarParser().parseFromBuffer(Buffer.from(JSON.stringify(har)));
     return { entries: (o.log && o.log.entries) || [], pages: (o.log && o.log.pages) || [] };
@@ -109,6 +126,38 @@ test('HTML report: standalone file with verdict badge + artifact links', () => {
     assert.match(html, /login_data\.csv/, 'report should link the data CSV artifact');
 });
 
+test('HTML report: renders verified learning matches and learned lessons', () => {
+    const out = tmp();
+    fs.writeFileSync(path.join(out, 'learn_memory_matches.json'), '[]');
+    fs.writeFileSync(path.join(out, 'learn_learned_lessons.json'), '[]');
+    const reportPath = writeHtmlReport(out, 'learn', {
+        mode: 'agent',
+        verdict: 'GREEN',
+        stats: {},
+        samples: [{ label: 'GET /avatar/123', success: true, isTransaction: false }],
+        memoryMatches: [{
+            lessonId: 'vls_abc',
+            confidence: 0.9,
+            contextPattern: { samplerPattern: '/avatar/:num' },
+            fix: { kind: 'setSamplerEnabled' },
+        }],
+        learnedLessons: {
+            learned: [{
+                id: 'vls_def',
+                confidence: 0.9,
+                contextPattern: { samplerPattern: '/orders/:num' },
+                fix: { kind: 'addExtractor' },
+            }],
+        },
+    });
+    const html = fs.readFileSync(reportPath, 'utf8');
+    assert.match(html, /Verified learning store/);
+    assert.match(html, /vls_abc/);
+    assert.match(html, /vls_def/);
+    assert.match(html, /learn_memory_matches\.json/);
+    assert.match(html, /learn_learned_lessons\.json/);
+});
+
 test('LLM escalation: clean no-op without a Gemini key', async () => {
     const out = tmp();
     const logs = [];
@@ -116,8 +165,713 @@ test('LLM escalation: clean no-op without a Gemini key', async () => {
         result: { samples: [{ label: 'GET /x', success: false, responseCode: '500', responseMessage: 'err', isTransaction: false }] },
         jmxPath: path.join(out, 'missing.jmx'), correlations: [], outDir: out, name: 't', onLog: (m) => logs.push(m),
     });
-    assert.ok(logs.some(l => /skipped — no Gemini key/.test(l)), 'should log a skip without a key');
+    assert.ok(logs.some(l => /skipped — no OpenAI\/Gemini key/.test(l)), 'should log a skip without a key');
     assert.ok(!fs.existsSync(path.join(out, 't_llm_suggestions.json')), 'no suggestions file without a key');
+});
+
+test('LLM escalation: unresolved protected failures are included even without failed samples', () => {
+    const failures = runnerInternal.collectLlmFailures({
+        samples: [],
+        unresolvedFailures: [
+            {
+                samplerLabel: 'Step 05 - GET /u/login/identifier',
+                issue: 'server_error_Non HTTP response code: java.net.URISyntaxException',
+                responseCode: 'Non HTTP response code: java.net.URISyntaxException',
+                manualFixHint: 'Compare the request body/params against the recording.',
+            },
+        ],
+    });
+    assert.strictEqual(failures.length, 1);
+    assert.strictEqual(failures[0].samplerName, 'Step 05 - GET /u/login/identifier');
+    assert.match(failures[0].failureMessage, /Compare the request body/);
+});
+
+test('AI fix prompt: senior performance engineer rules and safe patch schema only', () => {
+    const built = runnerInternal.buildGeminiFixPrompt({
+        failures: [{ samplerName: 'Step 01 - GET /me', responseCode: '401', failureMessage: 'Unauthorized' }],
+        jmxContent: '<HTTPSamplerProxy testname="Step 01 - GET /me" enabled="true"></HTTPSamplerProxy><hashTree/>',
+        correlations: [{ variableName: 'csrf', type: 'regex' }],
+    });
+
+    assert.match(built.systemInstruction, /senior performance/i);
+    assert.match(built.systemInstruction, /Do not guess/i);
+    assert.match(built.systemInstruction, /fold recorded redirect\/OIDC plumbing/i);
+    assert.match(built.systemInstruction, /\/oauth\/token/i);
+    assert.match(built.systemInstruction, /business action/i);
+    assert.match(built.systemInstruction, /protected login\/auth\/business samplers did not execute/i);
+    assert.match(built.systemInstruction, /ambiguous first-party sampler/i);
+    assert.match(built.userPrompt, /addExtractor/);
+    assert.match(built.userPrompt, /replaceValueWithVar/);
+    assert.match(built.userPrompt, /setSamplerEnabled/);
+    assert.match(built.userPrompt, /JSON object with exactly one top-level key: "fixes"/);
+    assert.match(built.userPrompt, /Do not include .*currentValue.*proposedValue/);
+    assert.doesNotMatch(built.userPrompt, /"currentValue"\s*:/);
+    assert.doesNotMatch(built.userPrompt, /"proposedValue"\s*:/);
+});
+
+test('AI fix prompt: suppresses cascade failures and keeps root/business triage visible', () => {
+    const failures = [
+        { samplerName: 'Step 14 - POST /', responseCode: '422', category: 'http_error_422', failureMessage: 'Returned 422' },
+        { samplerName: 'Step 19 - POST /authorization/', responseCode: '200', category: 'cascade_from_Step 14 - POST /', failureMessage: 'Downstream casualty' },
+        { samplerName: 'Step 26 - POST /user/iam/save', responseCode: '200', category: 'cascade_from_Step 14 - POST /', failureMessage: 'Downstream casualty' },
+        { category: 'business_verification_failed', failureMessage: 'protected business sampler(s) did not execute: Step 05 - GET /u/login/identifier' },
+    ];
+    const built = runnerInternal.buildGeminiFixPrompt({
+        failures,
+        jmxContent: '<HTTPSamplerProxy testname="Step 14 - POST /" enabled="true"></HTTPSamplerProxy><hashTree/>',
+        correlations: [],
+    });
+
+    assert.match(built.userPrompt, /cascadeFailuresSuppressed": 2/);
+    assert.match(built.userPrompt, /Step 14 - POST \//);
+    assert.match(built.userPrompt, /business_verification_failed/);
+    assert.doesNotMatch(built.userPrompt, /Step 26 - POST \/user\/iam\/save/);
+});
+
+test('AI fix prompt: flow-specific notes come from config, not hardcoded app names', () => {
+    const base = {
+        failures: [{ samplerName: 'Step 01 - GET /me', responseCode: '401', failureMessage: 'Unauthorized' }],
+        jmxContent: '<HTTPSamplerProxy testname="Step 01 - GET /me" enabled="true"></HTTPSamplerProxy><hashTree/>',
+        correlations: [],
+    };
+    const without = runnerInternal.buildGeminiFixPrompt(base);
+    assert.doesNotMatch(without.systemInstruction, /WebPT/i, 'no customer name may be baked into the generic prompt');
+    assert.doesNotMatch(without.systemInstruction, /llmFlowNotes/);
+    const withNotes = runnerInternal.buildGeminiFixPrompt({
+        ...base,
+        flowNotes: ['For this flow, /oauth/token is not the genuine request path.'],
+    });
+    assert.match(withNotes.systemInstruction, /run\.llmFlowNotes/);
+    assert.match(withNotes.systemInstruction, /\/oauth\/token is not the genuine request path/);
+});
+
+test('runner: empty engine samples are recovered from the JTL before business verification', () => {
+    const out = tmp();
+    const jtl = path.join(out, 'final.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults version="1.2">
+<httpSample t="10" lb="Step 05 - GET /u/login/identifier" rc="200" s="true"/>
+<httpSample t="10" lb="Step 05 - GET /u/login/identifier-0" rc="302" s="true"/>
+<httpSample t="12" lb="Step 08 - POST /u/login/identifier" rc="200" s="true"/>
+</testResults>`);
+    const empty = { success: false, samples: [] };
+    runnerInternal.recoverSamplesFromJtl(empty, jtl, out, () => {});
+    assert.strictEqual(empty.samples.length, 2, 'redirect sub-sample folds into its parent');
+    assert.deepStrictEqual(empty.samples.map(s => s.label), [
+        'Step 05 - GET /u/login/identifier',
+        'Step 08 - POST /u/login/identifier',
+    ]);
+    assert.strictEqual(empty.samplesRecoveredFromJtl, 'final.jtl');
+    // A PARTIAL engine list gets the missing executed labels merged in (the
+    // JTL is ground truth); labels the engine already has are not duplicated.
+    const partial = { success: true, samples: [{ label: 'Step 05 - GET /u/login/identifier', success: true }] };
+    runnerInternal.recoverSamplesFromJtl(partial, jtl, out, () => {});
+    assert.strictEqual(partial.samples.length, 2);
+    assert.deepStrictEqual(partial.samples.map(s => s.label).sort(), [
+        'Step 05 - GET /u/login/identifier',
+        'Step 08 - POST /u/login/identifier',
+    ]);
+    assert.strictEqual(partial.samplesRecoveredFromJtl, 'final.jtl');
+    // The engine's label-shape heuristic mislabels GraphQL samplers as
+    // transactions; the JTL <httpSample> tag corrects the flag.
+    const jtl2 = path.join(out, 'gql.jtl');
+    fs.writeFileSync(jtl2, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults version="1.2">
+<httpSample t="10" lb="Step 34 - GraphQL mutation SSOEmrAuthenticate" rc="200" s="true"/>
+<sample t="10" lb="login" rc="200" s="true"/>
+</testResults>`);
+    const misflagged = { success: true, samples: [
+        { label: 'Step 34 - GraphQL mutation SSOEmrAuthenticate', success: true, isTransaction: true },
+        { label: 'login', success: true, isTransaction: true },
+    ] };
+    runnerInternal.recoverSamplesFromJtl(misflagged, jtl2, out, () => {});
+    assert.strictEqual(misflagged.samples[0].isTransaction, false, 'GraphQL sampler is a request');
+    assert.strictEqual(misflagged.samples[1].isTransaction, true, 'transaction controller row stays a transaction');
+});
+
+test('form hidden-input correlation: CSS extractor after producer + ${var} at later consumers only', () => {
+    const freshState = 'hKFoFRESHSTATEVALUE123456';
+    const bridgeToken = 'aabbccddeeff00112233445566778899';
+    const entries = [
+        { request: { method: 'GET', url: 'https://idp.test/u/login/identifier?state=' + freshState, headers: [] },
+          response: { status: 200, content: { text: `<html><form method="POST" action="/u/login/identifier?state=${freshState}"><input type="hidden" name="state" value="${freshState}"/></form></html>` } } },
+        { request: { method: 'POST', url: 'https://idp.test/u/login/identifier?state=' + freshState, headers: [{ name: 'Referer', value: 'https://idp.test/u/login/identifier?state=' + freshState }], postData: { text: 'state=' + freshState + '&username=u' } },
+          response: { status: 302, content: { text: '' } } },
+        { request: { method: 'GET', url: 'https://app.test/redirect/', headers: [] },
+          response: { status: 200, content: { text: `<html><form method="POST" action="https://sso.test/authorization/"><input type="hidden" name="token" value="${bridgeToken}"></form></html>` } } },
+        { request: { method: 'POST', url: 'https://sso.test/authorization/', headers: [], postData: { text: 'token=' + bridgeToken } },
+          response: { status: 302, content: { text: '' } } },
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /u/login/identifier" enabled="true">
+    <stringProp name="HTTPSampler.path">/u/login/identifier?state=${freshState}</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - POST /u/login/identifier" enabled="true">
+    <stringProp name="HTTPSampler.path">/u/login/identifier?state=${freshState}</stringProp>
+    <stringProp name="Argument.value">${freshState}</stringProp>
+  </HTTPSamplerProxy><hashTree>
+    <HeaderManager testname="Headers" enabled="true">
+      <stringProp name="Header.value">https://idp.test/u/login/identifier?state=${freshState}</stringProp>
+    </HeaderManager><hashTree/>
+  </hashTree>
+  <HTTPSamplerProxy testname="Step 03 - GET /redirect/" enabled="true">
+    <stringProp name="HTTPSampler.path">/redirect/</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 04 - POST /authorization/" enabled="true">
+    <stringProp name="HTTPSampler.path">/authorization/</stringProp>
+    <stringProp name="Argument.value">${bridgeToken}</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+
+    const out = correlateFormHiddenInputs(xml, entries);
+    assert.strictEqual(out.wired.length, 2, 'state + token both wired');
+    const stateWire = out.wired.find(w => w.input === 'state');
+    const tokenWire = out.wired.find(w => w.input === 'token');
+    assert.ok(stateWire && tokenWire);
+    assert.strictEqual(stateWire.producerSampler, 'Step 01 - GET /u/login/identifier');
+    assert.strictEqual(tokenWire.producerSampler, 'Step 03 - GET /redirect/');
+    // Extractors exist with CSS selector on the hidden input.
+    assert.match(out.xml, /HtmlExtractor[^>]*testname="Extract state \(form hidden input\)"/);
+    assert.match(out.xml, /input\[name=&quot;token&quot;\]/);
+    // Consumers AFTER the producer use ${state}; the producer's own path keeps the recorded literal.
+    assert.match(out.xml, /Step 02[^]*?\/u\/login\/identifier\?state=\$\{state\}/);
+    assert.match(out.xml, /Header\.value">https:\/\/idp\.test\/u\/login\/identifier\?state=\$\{state\}/);
+    assert.match(out.xml, /Step 01[^]*?\/u\/login\/identifier\?state=hKFoFRESHSTATEVALUE123456/);
+    assert.match(out.xml, /Argument\.value">\$\{token\}/);
+    // Idempotent: running again wires nothing new (literals are gone).
+    const again = correlateFormHiddenInputs(out.xml, entries);
+    assert.strictEqual(again.wired.length, 0);
+});
+
+test('dead-extractor repair: consumers of an extractor under a disabled sampler get the recorded literal back', () => {
+    const { repairDeadExtractorConsumers } = require('../src/transforms');
+    const entries = [
+        { request: { method: 'GET', url: 'https://idp.test/authorize/resume?state=rs1', headers: [] }, response: { status: 302, content: { text: '' } } },
+        { request: { method: 'GET', url: 'https://auth.test/iam/callback?attempt=1&code=RECORDEDCODE123&state=rs1', headers: [] }, response: { status: 302, content: { text: '' } } },
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /authorize/resume" enabled="false">
+    <stringProp name="HTTPSampler.path">/authorize/resume?state=rs1</stringProp>
+  </HTTPSamplerProxy><hashTree>
+    <RegexExtractor testname="Extract code" enabled="true">
+      <stringProp name="RegexExtractor.refname">code</stringProp>
+      <stringProp name="RegexExtractor.regex">code=([^&amp;]+)</stringProp>
+    </RegexExtractor><hashTree/>
+  </hashTree>
+  <HTTPSamplerProxy testname="Step 02 - GET /iam/callback" enabled="true">
+    <stringProp name="HTTPSampler.path">/iam/callback?attempt=1&amp;code=\${code}&amp;state=rs1</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const out = repairDeadExtractorConsumers(xml, entries);
+    assert.deepStrictEqual(out.dead, ['code']);
+    assert.strictEqual(out.restored.length, 1);
+    assert.match(out.xml, /code=RECORDEDCODE123&amp;state=rs1/);
+    assert.doesNotMatch(out.xml, /\$\{code\}/);
+    // A var also produced by an ENABLED extractor is left alone.
+    const xmlLive = xml.replace('testname="Step 01 - GET /authorize/resume" enabled="false"', 'testname="Step 01 - GET /authorize/resume" enabled="true"');
+    const out2 = repairDeadExtractorConsumers(xmlLive, entries);
+    assert.strictEqual(out2.dead.length, 0);
+    assert.match(out2.xml, /\$\{code\}/);
+});
+
+test('assertion miner: auto-submit bridge pages get no mined assertions', () => {
+    const { _internal } = require('../src/transforms');
+    const bridge = '<html><body onload="document.forms[0].submit()"><form method="POST" action="https://sso.test/authorization/"><input type="hidden" name="token" value="abc123def456"/></form></body></html>';
+    assert.strictEqual(_internal.isAutoSubmitBridgePage(bridge), true);
+    assert.strictEqual(_internal.isAutoSubmitBridgePage('<html><h1>Dashboard</h1><form method="POST"><input type="text" name="q"/></form></html>'), false);
+});
+
+test('AI provider label prefers OpenAI over Gemini when both are configured', () => {
+    assert.strictEqual(runnerInternal.llmProviderLabel({ OPENAI_API_KEY: 'openai-key', GOOGLE_API_KEY: 'google-key' }), 'OpenAI');
+    assert.strictEqual(runnerInternal.llmProviderLabel({ GOOGLE_API_KEY: 'google-key' }), 'Gemini');
+    assert.strictEqual(runnerInternal.llmProviderLabel({}), 'none');
+});
+
+test('OpenAI escalation request: uses gpt-5.5 with max_completion_tokens', () => {
+    const prev = process.env.OPENAI_MODEL;
+    delete process.env.OPENAI_MODEL;
+    const req = runnerInternal.buildOpenAiChatRequest({
+        systemInstruction: 'sys',
+        userPrompt: 'user',
+    });
+    assert.strictEqual(req.model, 'gpt-5.5');
+    assert.strictEqual(req.max_completion_tokens, 2048);
+    assert.ok(!Object.prototype.hasOwnProperty.call(req, 'max_tokens'));
+    if (prev == null) delete process.env.OPENAI_MODEL;
+    else process.env.OPENAI_MODEL = prev;
+});
+
+test('Gemini fix normalizer only returns an array of fixes', () => {
+    assert.deepStrictEqual(runnerInternal.normalizeGeminiFixes([{ kind: 'setSamplerEnabled' }]), [{ kind: 'setSamplerEnabled' }]);
+    assert.deepStrictEqual(runnerInternal.normalizeGeminiFixes({ fixes: [{ kind: 'addExtractor' }] }), [{ kind: 'addExtractor' }]);
+    assert.deepStrictEqual(runnerInternal.normalizeGeminiFixes({ diagnostics: [] }), []);
+});
+
+test('learning store: redacts secrets and normalizes volatile values', () => {
+    const raw = 'https://app.test/patient/12345?token=abc123def456&email=alice@example.com';
+    const redacted = learningStore.redactSensitive(raw);
+    assert.doesNotMatch(redacted, /abc123def456/);
+    assert.doesNotMatch(redacted, /alice@example.com/);
+
+    const normalized = learningStore.normalizePattern(raw);
+    assert.match(normalized, /\/patient\/:num/);
+    assert.doesNotMatch(normalized, /token=/);
+});
+
+test('learning store: saves only verified safe lessons and finds matching failures', () => {
+    const dir = tmp();
+    const storePath = path.join(dir, 'verified-lessons.json');
+    const failed = learningStore.learnFromRun({
+        storePath,
+        flowName: 'demo',
+        sourceRun: 'failed-run',
+        result: { success: false, samples: [] },
+        fixes: [{ kind: 'setSamplerEnabled', sampler: 'Step 01 - GET /avatar/a3bd', enabled: false }],
+    });
+    assert.strictEqual(failed.learned.length, 0);
+    assert.ok(!fs.existsSync(storePath), 'failed runs must not create lessons');
+
+    const learned = learningStore.learnFromRun({
+        storePath,
+        flowName: 'demo',
+        sourceRun: 'green-run',
+        result: { success: true, samples: [{ isTransaction: false, success: true }] },
+        fixes: [{ kind: 'setSamplerEnabled', sampler: 'Step 01 - GET /avatar/a3bd', enabled: false }],
+    });
+    assert.strictEqual(learned.learned.length, 1);
+    const disk = fs.readFileSync(storePath, 'utf8');
+    assert.doesNotMatch(disk, /abc123def456|Bearer|Cookie/i);
+
+    const matches = learningStore.findMatchingLessons({
+        storePath,
+        failures: [{ samplerName: 'Step 99 - GET /avatar/other', responseCode: '404' }],
+    });
+    assert.strictEqual(matches.length, 1);
+    assert.deepStrictEqual(matches[0].fix, { kind: 'setSamplerEnabled', sampler: 'Step 99 - GET /avatar/other', enabled: false });
+});
+
+test('learning store: exports and imports sanitized team bundles', () => {
+    const dir = tmp();
+    const storePath = path.join(dir, 'verified-lessons.json');
+    const exportPath = path.join(dir, 'team-lessons.json');
+    const importedPath = path.join(dir, 'imported-lessons.json');
+
+    learningStore.learnFromRun({
+        storePath,
+        flowName: 'demo',
+        sourceRun: 'green-run',
+        result: { success: true, samples: [{ isTransaction: false, success: true }] },
+        fixes: [{ kind: 'replaceValueWithVar', sampler: 'Step 02 - GET /me', value: 'abc123def456', variable: 'session_id' }],
+    });
+
+    const exported = learningStore.exportLessons({ storePath, exportPath });
+    assert.strictEqual(exported.count, 1);
+    const text = fs.readFileSync(exportPath, 'utf8');
+    assert.doesNotMatch(text, /abc123def456/);
+
+    const imported = learningStore.importLessons({ storePath: importedPath, importPath: exportPath });
+    assert.strictEqual(imported.imported, 1);
+    assert.strictEqual(learningStore.loadLessons(importedPath).length, 1);
+});
+
+test('runner learning config: defaults to local verified memory with confidence gate', () => {
+    const cfg = runnerInternal.normalizeLearningCfg({});
+    assert.strictEqual(cfg.enabled, true);
+    assert.strictEqual(cfg.autoApplyMinConfidence, 0.85);
+    assert.match(cfg.storePath.replace(/\\/g, '/'), /memory\/verified-lessons\.json$/);
+
+    const disabled = runnerInternal.normalizeLearningCfg({
+        enabled: false,
+        autoApplyMinConfidence: 2,
+        storePath: 'custom.json',
+    });
+    assert.strictEqual(disabled.enabled, false);
+    assert.strictEqual(disabled.autoApplyMinConfidence, 0.99);
+    assert.strictEqual(disabled.storePath, 'custom.json');
+});
+
+test('Gemini model resolver: defaults to 3.5 Flash and supports 3.1 Pro switch', () => {
+    assert.strictEqual(resolveGeminiModel([], {}, {}), 'gemini-3.5-flash');
+    assert.strictEqual(resolveGeminiModel(['--gemini-pro'], {}, {}), 'gemini-3.1-pro-preview');
+    assert.strictEqual(resolveGeminiModel([], { gemini: { model: 'custom-flash' } }, {}), 'custom-flash');
+    assert.strictEqual(resolveGeminiModel(['--gemini-pro'], { gemini: { proModel: 'custom-pro' } }, {}), 'custom-pro');
+    assert.strictEqual(resolveGeminiModel(['--gemini-pro'], {}, { GOOGLE_MODEL: 'env-model' }), 'env-model');
+});
+
+test('input state: unchanged files are skipped after being processed once', () => {
+    const dir = tmp();
+    const statePath = path.join(dir, 'processed-inputs.json');
+    const input = path.join(dir, 'login.jmx');
+    fs.writeFileSync(input, 'first-version');
+
+    const unit = { kind: 'single', primary: input };
+    let state = inputState.loadProcessedState(statePath);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, state), true);
+
+    inputState.markUnitProcessed(unit, state, statePath);
+    state = inputState.loadProcessedState(statePath);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, state), false);
+
+    fs.writeFileSync(input, 'second-version-with-different-size');
+    state = inputState.loadProcessedState(statePath);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, state), true);
+});
+
+test('success archive: GREEN output folder is zipped while loose files stay readable', () => {
+    const outputRoot = tmp();
+    const outDir = path.join(outputRoot, 'flow');
+    fs.mkdirSync(path.join(outDir, 'nested'), { recursive: true });
+    fs.writeFileSync(path.join(outDir, 'flow_report.html'), '<html>GREEN</html>');
+    fs.writeFileSync(path.join(outDir, 'nested', 'data.txt'), 'payload');
+
+    const archived = archiveSuccessfulRun({ outputRoot, outDir, name: 'flow', keepOriginals: true });
+    assert.ok(archived.ok, archived.error || 'archive should succeed');
+    assert.ok(fs.existsSync(archived.zipPath), 'zip should be written');
+    assert.ok(fs.existsSync(path.join(outDir, 'flow_report.html')), 'loose report remains readable');
+
+    const zip = fs.readFileSync(archived.zipPath);
+    assert.strictEqual(zip.subarray(0, 4).toString('binary'), 'PK\u0003\u0004');
+    assert.ok(zip.includes(Buffer.from('flow_report.html')));
+    assert.ok(zip.includes(Buffer.from('nested/data.txt')));
+});
+
+test('final artifact pointer: creates an obvious top-sorted JMX and instructions file', () => {
+    const outDir = tmp();
+    const finalJmx = path.join(outDir, 'final_validated.jmx');
+    fs.writeFileSync(finalJmx, '<jmeterTestPlan/>');
+
+    const result = writeFinalJmxPointer({
+        outDir,
+        name: 'createtask',
+        finalJmxPath: finalJmx,
+        verdict: 'GREEN',
+        validated: true,
+        businessVerified: false,
+    });
+
+    assert.ok(fs.existsSync(path.join(outDir, '00_USE_THIS_FINAL_VALIDATED_createtask.jmx')));
+    assert.ok(fs.existsSync(path.join(outDir, '00_OPEN_THIS_FIRST.txt')));
+    const guide = fs.readFileSync(result.guidePath, 'utf8');
+    assert.match(guide, /USE THIS JMX/);
+    assert.match(guide, /00_USE_THIS_FINAL_VALIDATED_createtask\.jmx/);
+    assert.match(guide, /does not prove the business record was created/);
+});
+
+test('business guard: protects first-party mutating business samplers from disabling', () => {
+    const xml = `<?xml version="1.0"?>
+<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - POST /tasks" enabled="true">
+    <stringProp name="HTTPSampler.domain">stage-gateway.webpt.com</stringProp>
+    <stringProp name="HTTPSampler.path">/tasks</stringProp>
+    <stringProp name="HTTPSampler.method">POST</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - POST /domainreliability/upload" enabled="true">
+    <stringProp name="HTTPSampler.domain">beacons.example.com</stringProp>
+    <stringProp name="HTTPSampler.path">/domainreliability/upload</stringProp>
+    <stringProp name="HTTPSampler.method">POST</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 03 - POST /s/interceptor/" enabled="false">
+    <stringProp name="HTTPSampler.domain"></stringProp>
+    <stringProp name="HTTPSampler.path">/s/interceptor/</stringProp>
+    <stringProp name="HTTPSampler.method">POST</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 04 - POST /oauth/token" enabled="false">
+    <stringProp name="HTTPSampler.domain">stglogin.webpt.com</stringProp>
+    <stringProp name="HTTPSampler.path">/oauth/token</stringProp>
+    <stringProp name="HTTPSampler.method">POST</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const guard = businessGuard.buildBusinessGuard({ xml, flowName: 'createtask' });
+    assert.ok(!guard.protectedNames.has('Step 03 - POST /s/interceptor/'), 'redirect/interceptor plumbing should not block GREEN');
+    assert.ok(!guard.protectedNames.has('Step 04 - POST /oauth/token'), 'SPA oauth/token plumbing should not block GREEN');
+    const report = {
+        samplersToDisable: [
+            { samplerLabel: 'Step 01 - POST /tasks', reason: 'unfixable_after_retry', responseCode: '401' },
+            { samplerLabel: 'Step 02 - POST /domainreliability/upload', reason: 'telemetry', responseCode: '404' },
+        ],
+    };
+    const filtered = businessGuard.filterProtectedDisables(report, guard);
+    assert.deepStrictEqual(filtered.report.samplersToDisable.map(s => s.samplerLabel), ['Step 02 - POST /domainreliability/upload']);
+    assert.deepStrictEqual(filtered.blocked.map(s => s.samplerLabel), ['Step 01 - POST /tasks']);
+});
+
+test('LLM schema gate: rejects disabling ambiguous first-party root samplers', () => {
+    const validation = {
+        accepted: [
+            { kind: 'setSamplerEnabled', sampler: 'Step 07 - POST /', enabled: false },
+            { kind: 'setSamplerEnabled', sampler: 'Step 09 - POST /domainreliability/upload', enabled: false },
+        ],
+        rejected: [],
+    };
+    const filtered = runnerInternal.filterProtectedPatchDisables(validation, {
+        enabled: true,
+        protectedNames: new Set(),
+    });
+
+    assert.deepStrictEqual(filtered.accepted, [
+        { kind: 'setSamplerEnabled', sampler: 'Step 09 - POST /domainreliability/upload', enabled: false },
+    ]);
+    assert.strictEqual(filtered.rejected[0].reason, 'ambiguous_root_sampler_disable');
+});
+
+test('business guard: fails GREEN when protected create-task sampler is disabled or missing', () => {
+    const xml = `<?xml version="1.0"?>
+<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - POST /tasks" enabled="false">
+    <stringProp name="HTTPSampler.domain">stage-gateway.webpt.com</stringProp>
+    <stringProp name="HTTPSampler.path">/tasks</stringProp>
+    <stringProp name="HTTPSampler.method">POST</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const guard = businessGuard.buildBusinessGuard({ xml, flowName: 'createtask' });
+    const result = { success: true, samples: [] };
+    const evaluation = businessGuard.evaluateBusinessResult({ result, xml, guard });
+    assert.strictEqual(evaluation.ok, false);
+    assert.match(evaluation.reason, /disabled/);
+});
+
+test('agent config: --agent implies validate mode with safe bounded defaults', () => {
+    const opts = resolveAgentOptions(['--agent'], {});
+    assert.strictEqual(opts.doAgent, true);
+    assert.strictEqual(opts.doRun, true);
+    assert.strictEqual(opts.agent.enabled, true);
+    assert.strictEqual(opts.agent.maxLlmRounds, 1);
+    assert.strictEqual(opts.agent.javaSafeMode, true);
+});
+
+test('agent config: --agent overrides config false, --run is deterministic by default', () => {
+    const forced = resolveAgentOptions(['--agent'], { agent: { enabled: false } });
+    assert.strictEqual(forced.doRun, true);
+    assert.strictEqual(forced.agent.enabled, true);
+
+    const enabled = resolveAgentOptions(['--run'], {});
+    assert.strictEqual(enabled.doRun, true);
+    assert.strictEqual(enabled.agent.enabled, false);
+
+    const configured = resolveAgentOptions(['--run'], { agent: { enabled: true } });
+    assert.strictEqual(configured.doRun, true);
+    assert.strictEqual(configured.agent.enabled, true);
+});
+
+test('agent config labels watch mode clearly', () => {
+    assert.strictEqual(labelForAgentOptions(resolveAgentOptions([], {}), false), 'generate only');
+    assert.strictEqual(labelForAgentOptions(resolveAgentOptions(['--run'], {}), true), 'generate + run/validate (watch)');
+    assert.strictEqual(labelForAgentOptions(resolveAgentOptions(['--agent'], {}), true), 'agent validate (watch)');
+});
+
+test('UI run modes map to the expected CLI flags', () => {
+    assert.deepStrictEqual(flagsForRunMode('generate'), []);
+    assert.deepStrictEqual(flagsForRunMode('run'), ['--run']);
+    assert.deepStrictEqual(flagsForRunMode('agent'), ['--agent']);
+    assert.deepStrictEqual(flagsForRunMode('unexpected'), []);
+});
+
+test('java-safe JMX sanitizer strips JSR223 pre/post processors and reports them', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+      <ThreadGroup testname="tg"></ThreadGroup><hashTree>
+        <JSR223PreProcessor testname="bad pre" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223PreProcessor>
+        <hashTree/>
+        <HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree/>
+        <JSR223PostProcessor testname="bad post" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223PostProcessor>
+        <hashTree/>
+      </hashTree>
+    </hashTree></jmeterTestPlan>`;
+    const out = sanitizeJavaUnsafeJmx(xml);
+    assert.strictEqual(out.changed, true);
+    assert.strictEqual(out.removed.length, 2);
+    assert.ok(!out.xml.includes('JSR223PreProcessor'));
+    assert.ok(!out.xml.includes('JSR223PostProcessor'));
+    assert.match(out.xml, /HTTPSamplerProxy/);
+});
+
+test('java-safe JMX sanitizer also strips JSR223 blocks with explicit empty hashTree', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+        <JSR223PreProcessor testname="bad pre" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+        </JSR223PreProcessor>
+        <hashTree>
+        </hashTree>
+      </hashTree></jmeterTestPlan>`;
+    const out = sanitizeJavaUnsafeJmx(xml);
+    assert.strictEqual(out.changed, true);
+    assert.strictEqual(out.removed.length, 1);
+    assert.ok(!out.xml.includes('JSR223PreProcessor'));
+});
+
+test('generate: shipped JMX is Java-safe for manual JMeter runs', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/api/items', {
+            reqHeaders: [{ name: 'x-request-id', value: '3f2504e0-4f89-41d3-9a0c-0305e82c3301' }],
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'manualsafe');
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+    assert.strictEqual((xml.match(/<JSR223(?:PreProcessor|PostProcessor)\b/g) || []).length, 0);
+    assert.ok(fs.existsSync(path.join(out, 'manualsafe_java_safe_generate.json')), 'should report stripped JSR223 blocks');
+});
+
+test('generate: GraphQL query text is not parameterized as test data', () => {
+    const gql = 'query GetCurrentUser { currentUser { id name } }';
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/graphql', {
+            reqHeaders: [{ name: 'Content-Type', value: 'application/json' }],
+            postData: { mimeType: 'application/json', text: JSON.stringify({ query: gql, variables: { username: 'alice' } }) },
+        }),
+    ]));
+    const out = tmp();
+    generate(entries, pages, out, 'gql');
+    const paramsPath = path.join(out, 'gql_parameters.json');
+    if (fs.existsSync(paramsPath)) {
+        const params = JSON.parse(fs.readFileSync(paramsPath, 'utf8'));
+        assert.ok(!params.some(p => p.name === 'query'), 'GraphQL query/mutation documents must not be CSV-parameterized');
+    }
+});
+
+test('OAuth constants: response_type code is not correlated into protocol syntax', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="authorize" enabled="true">
+        <stringProp name="HTTPSampler.path">/authorize?response_type=\${response_type}</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree>
+        <HeaderManager enabled="true">
+          <collectionProp name="HeaderManager.headers">
+            <elementProp name="" elementType="Header">
+              <stringProp name="Header.name">Content-Type</stringProp>
+              <stringProp name="Header.value">application/x-www-form-urlen\${response_type}d</stringProp>
+            </elementProp>
+          </collectionProp>
+        </HeaderManager>
+      </hashTree>
+      <HTTPSamplerProxy testname="callback" enabled="true">
+        <stringProp name="HTTPSampler.path">/iam/callback?\${response_type}=\${code}</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree/>
+      <HTTPSamplerProxy testname="token" enabled="true">
+        <stringProp name="Argument.value">authorization_\${response_type}</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree/>
+    </hashTree></jmeterTestPlan>`;
+    const r = generateInternal.repairStaticOauthConstants(xml);
+    assert.strictEqual(r.repaired, 1);
+    assert.doesNotMatch(r.xml, /\$\{response_type\}/);
+    assert.match(r.xml, /response_type=code/);
+    assert.match(r.xml, /application\/x-www-form-urlencoded/);
+    assert.match(r.xml, /\/iam\/callback\?code=\$\{code\}/);
+    assert.match(r.xml, /authorization_code/);
+});
+
+test('OAuth manual rule: bare state and nonce are left recorded, not correlated', () => {
+    const entries = [
+        entry('GET', 'https://login.example.com/authorize?response_type=code&client_id=abc&redirect_uri=https%3A%2F%2Fapp%2Fcb&state=recordedState123&nonce=recordedNonce456'),
+    ];
+    const corrs = [
+        { variableName: 'state', value: 'recordedState123' },
+        { variableName: 'nonce', value: 'recordedNonce456' },
+        { variableName: 'state', value: 'loginPageState789' },
+        { variableName: 'state_4', value: 'serverIssuedLoginState789' },
+    ];
+    const filtered = generateInternal.filterBareOauthStateNonceCorrelations(corrs, entries);
+    assert.deepStrictEqual(filtered.removed.map(c => c.variableName).sort(), ['nonce', 'state', 'state']);
+    assert.deepStrictEqual(filtered.kept.map(c => c.variableName), ['state_4']);
+});
+
+test('generate: generic browser/OIDC noise is disabled by default; app-specific paths only via run.disableCalls', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://www.gstatic.com/ohttp_gateway/hpke_public_keys/sbc_prod?key=AIzaSyFake'),
+        entry('POST', 'https://ohttp-relay-safebrowsing-chrome.google.fastly-edge.com/'),
+        entry('POST', 'https://beacons.example.com/domainreliability/upload'),
+        entry('POST', 'https://login.example.com/'),
+        entry('GET', 'https://auth-gateway.example.com/auth-gateway/rbac-public-key/prod'),
+        entry('GET', 'https://login.example.com/authorize/resume?state=abc'),
+        entry('GET', 'https://auth.example.com/iam/callback?code=abc&state=abc'),
+        entry('POST', 'https://login.example.com/oauth/token'),
+        entry('GET', 'https://app.test/tasks'),
+    ]));
+    // Default: only app-agnostic noise + standard OIDC plumbing is disabled.
+    const outDefault = tmp();
+    const genDefault = generate(entries, pages, outDefault, 'noise');
+    const xmlDefault = fs.readFileSync(genDefault.jmxPath, 'utf8');
+    assert.strictEqual(samplerEnabledForPath(xmlDefault, 'ohttp_gateway'), false);
+    assert.strictEqual(samplerEnabledForDomain(xmlDefault, 'OHTTP_RELAY_SAFEBROWSING_CHROME_SERVER'), false);
+    assert.strictEqual(samplerEnabledForPath(xmlDefault, 'domainreliability/upload'), false);
+    assert.strictEqual(samplerEnabledForPath(xmlDefault, 'authorize/resume'), false);
+    assert.strictEqual(samplerEnabledForPath(xmlDefault, 'oauth/token'), false);
+    // App-specific paths are NOT disabled by default — they'd break other apps.
+    assert.strictEqual(samplerEnabledForPath(xmlDefault, 'auth-gateway/rbac-public-key'), true);
+    assert.strictEqual(samplerEnabledForPath(xmlDefault, 'iam/callback'), true);
+    // With run.disableCalls, the app-specific paths are disabled too.
+    const outCfg = tmp();
+    const genCfg = generate(entries, pages, outCfg, 'noise-cfg', {
+        runCfg: { disableCalls: ['/auth-gateway/rbac-public-key', '/iam/callback'] },
+    });
+    const xmlCfg = fs.readFileSync(genCfg.jmxPath, 'utf8');
+    assert.strictEqual(samplerEnabledForPath(xmlCfg, 'auth-gateway/rbac-public-key'), false);
+    assert.strictEqual(samplerEnabledForPath(xmlCfg, 'iam/callback'), false);
+});
+
+test('generate: step-named samplers are disabled via run.disableCalls, not by default', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/p1'),
+        entry('GET', 'https://app.test/p2'),
+        entry('GET', 'https://app.test/p3'),
+        entry('GET', 'https://app.test/p4'),
+        entry('GET', 'https://app.test/p5'),
+        entry('GET', 'https://app.test/p6'),
+        entry('POST', 'https://login.example.com/'),
+    ]));
+    const outDefault = tmp();
+    const genDefault = generate(entries, pages, outDefault, 'highlighted-noise');
+    const xmlDefault = fs.readFileSync(genDefault.jmxPath, 'utf8');
+    assert.strictEqual(samplerEnabledForName(xmlDefault, 'Step 07 - POST /'), true,
+        'a step-numbered pattern from one recording must not be a global default');
+    const outCfg = tmp();
+    const genCfg = generate(entries, pages, outCfg, 'highlighted-noise-cfg', {
+        runCfg: { disableCalls: ['Step 07 - POST /'] },
+    });
+    const xmlCfg = fs.readFileSync(genCfg.jmxPath, 'utf8');
+    assert.strictEqual(samplerEnabledForName(xmlCfg, 'Step 07 - POST /'), false);
+});
+
+function samplerEnabledForPath(xml, pathPart) {
+    for (const m of xml.matchAll(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g)) {
+        if (!m[2].includes(pathPart)) continue;
+        return /enabled="true"/.test(m[1]);
+    }
+    return null;
+}
+
+function samplerEnabledForDomain(xml, domainPart) {
+    for (const m of xml.matchAll(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g)) {
+        if (!m[2].includes(domainPart)) continue;
+        return /enabled="true"/.test(m[1]);
+    }
+    return null;
+}
+
+function samplerEnabledForName(xml, samplerName) {
+    for (const m of xml.matchAll(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g)) {
+        if (!m[1].includes(`testname="${samplerName}"`)) continue;
+        return /enabled="true"/.test(m[1]);
+    }
+    return null;
+}
+
+test('runner JMeter detection falls back to common local install homes', () => {
+    const dir = tmp();
+    const home = path.join(dir, 'apache-jmeter-5.6.3');
+    fs.mkdirSync(path.join(home, 'bin'), { recursive: true });
+    const bin = path.join(home, process.platform === 'win32' ? 'bin/jmeter.bat' : 'bin/jmeter');
+    fs.writeFileSync(bin, '');
+    const resolved = runnerInternal.resolveJMeterBinPath({
+        detector: { detect: () => ({ available: false }) },
+        homes: [home],
+    });
+    assert.strictEqual(path.resolve(resolved), path.resolve(bin));
 });
 
 /* ─────────── New tests (ingest, extractors, transforms, scrubber, verifier) ─────────── */
@@ -157,6 +911,32 @@ test('extractor planner: locates value in earlier JSON response, emits JSONPostP
     assert.strictEqual(plan.type, 'json', 'JSON body → JSONPostProcessor');
     assert.match(plan.block, /JSONPostProcessor/);
     assert.match(plan.block, /\$\.token/);
+});
+
+test('extractor planner: Set-Cookie regex is proven against the actual cookie name before use', () => {
+    const e1 = entry('POST', 'https://app.test/login');
+    e1.response.headers = [{ name: 'Set-Cookie', value: 'stgapp_sess=abc123def456ghi789; Path=/; HttpOnly' }];
+    const e2 = entry('POST', 'https://app.test/graphql', { body: '{"sessionId":"Token abc123def456ghi789"}' });
+
+    const plan = planExtractor('sessionId', [{ name: 'sessionId', value: 'abc123def456ghi789' }], [e1, e2], 1);
+    assert.ok(plan, 'a verified cookie regex should be planned');
+    assert.strictEqual(plan.type, 'regex');
+    assert.match(plan.block, /stgapp_sess=\(\[\^;\\r\\n\]\+\)/);
+    assert.strictEqual(plan.extractedValue, 'abc123def456ghi789');
+});
+
+test('extractor planner: rejects regex plans that do not fetch the recorded value', () => {
+    const badPlan = extractorsInternal.verifyRegexPlan({
+        varName: 'sessionId',
+        expr: '(?i)^Set-Cookie:\\s*sessionId=([^;\\r\\n]+)',
+        useHeaders: true,
+        body: '',
+        headers: [{ name: 'Set-Cookie', value: 'other_cookie=abc123def456ghi789; Path=/' }],
+        expectedValue: 'abc123def456ghi789',
+    });
+
+    assert.strictEqual(badPlan.ok, false);
+    assert.strictEqual(badPlan.reason, 'no_match');
 });
 
 test('knownDefinedVars detects CSVDataSet columns even with a wide block', () => {
@@ -294,6 +1074,21 @@ test('baseline diff: returns empty drift when no JTL is present', () => {
     const r = diffRunAgainstRecording({ outDir: out, flatEntries: [] });
     assert.strictEqual(r.jtlPath, null);
     assert.strictEqual(r.drift.length, 0);
+});
+
+test('verifier fast JTL summary treats httpSample as a request even with a plain label', () => {
+    const dir = tmp();
+    const jtl = path.join(dir, 'results.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <sample lb="Login" rc="200" s="true"/>
+  <httpSample lb="Submit Form" rc="500" s="false"/>
+</testResults>`);
+
+    const samples = summarizeJtlFast(jtl);
+
+    assert.strictEqual(samples.find(s => s.label === 'Login').isTransaction, true);
+    assert.strictEqual(samples.find(s => s.label === 'Submit Form').isTransaction, false);
 });
 
 /* ─────────── Fix-pass tests (dual-JMX, load profile, cookie domain, patcher) ─────────── */
@@ -465,6 +1260,30 @@ test('LLM patcher: lenient input — `action`/`samplerName`/`refname` aliases ar
     assert.match(r.xml, /sessionId/);
 });
 
+test('LLM patch validator: auto-apply accepts only exact safe patch schema', () => {
+    const out = validateLlmPatches([
+        { kind: 'addExtractor', sampler: 'Step 01', variable: 'token', type: 'json', path: '$.token' },
+        { action: 'addExtractor', samplerName: 'Step 02', refname: 'sid', type: 'json', jsonPath: '$.session.id' },
+        { kind: 'rewriteGroovyScript', script: 'vars.put("x", "y")' },
+        { kind: 'setSamplerEnabled', sampler: 'Noise Step', enabled: false, script: 'extra' },
+    ]);
+    assert.strictEqual(out.accepted.length, 1);
+    assert.strictEqual(out.accepted[0].kind, 'addExtractor');
+    assert.strictEqual(out.rejected.length, 3);
+    assert.deepStrictEqual(out.rejected.map(r => r.reason), ['unknown_field', 'unsupported_kind', 'unknown_field']);
+});
+
+test('LLM patch validator: rejects unsafe variable names before auto-apply', () => {
+    const out = validateLlmPatches([
+        { kind: 'replaceValueWithVar', value: 'abc123def', variable: '__groovy(vars.clear())' },
+        { kind: 'addExtractor', sampler: 'Step 01', variable: '${__UUID}', type: 'json', path: '$.id' },
+        { kind: 'addExtractor', sampler: 'Step 02', variable: 'safe_token_1', type: 'regex', regex: 'token=([^&]+)' },
+    ]);
+    assert.strictEqual(out.accepted.length, 1);
+    assert.strictEqual(out.accepted[0].variable, 'safe_token_1');
+    assert.deepStrictEqual(out.rejected.map(r => r.reason), ['invalid_variable', 'invalid_variable']);
+});
+
 test('HTML report: load profile + correlation table + dual-recording panel render when data is present', () => {
     const out = tmp();
     const reportPath = writeHtmlReportFn(out, 'demo', {
@@ -515,7 +1334,6 @@ test('polling while: when terminator is provided, it overrides the counter condi
 });
 
 test('fast-replay E2E: replays against an embedded HTTP server and substitutes ${vars}', async () => {
-    const http = require('http');
     let received = null;
     const server = http.createServer((req, res) => {
         const chunks = [];
@@ -545,6 +1363,41 @@ test('fast-replay E2E: replays against an embedded HTTP server and substitutes $
         assert.strictEqual(received.headers['x-run'], '7', 'var substitution applied to header');
     } finally {
         await new Promise(r => server.close(r));
+    }
+});
+
+test('replay-correlate: absolute live redirects are replayed against the redirected host', async () => {
+    let idpHits = 0;
+    let appIdpPathHits = 0;
+    const idp = http.createServer((req, res) => {
+        idpHits++;
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('idp-ok');
+    });
+    const idpPort = await listenLocal(idp);
+    const app = http.createServer((req, res) => {
+        if (req.url === '/start') {
+            res.writeHead(302, { Location: `http://127.0.0.1:${idpPort}/idp` });
+            res.end();
+            return;
+        }
+        if (req.url === '/idp') appIdpPathHits++;
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('wrong-host');
+    });
+    const appPort = await listenLocal(app);
+    try {
+        const result = await correlateAndReplay({
+            entries: [entry('GET', 'http://recorded.test/start', { body: 'idp-ok' })],
+            targetBaseUrl: `http://127.0.0.1:${appPort}`,
+        });
+
+        assert.strictEqual(result.reachedEnd, true, JSON.stringify(result.failures));
+        assert.strictEqual(idpHits, 1, 'absolute redirect should hit the IdP host once');
+        assert.strictEqual(appIdpPathHits, 0, 'absolute redirect path must not be rewritten to the app host');
+    } finally {
+        await closeServer(app);
+        await closeServer(idp);
     }
 });
 
@@ -598,18 +1451,16 @@ function makeOauthJmx(extractorRefname = 'state', urlHasAuthorize = true) {
 </jmeterTestPlan>`;
 }
 
-test('OAuth rewire: strips dud state extractor + injects per-iteration synthesizer', () => {
+test('OAuth rewire: strips dud state extractor + uses native Java-safe synthesizer', () => {
     const xml = makeOauthJmx('state', true);
     const r = rewireClientMintedOauthVars(xml);
     assert.ok(r.rewired.includes('state'), 'state should be rewired');
     assert.ok(r.rewired.includes('nonce'), 'nonce (used in URL) should also be synthesized');
     assert.doesNotMatch(r.xml, /<RegexExtractor[^>]*>[\s\S]*?refname">state</,
         'the dud state RegexExtractor must be gone');
-    assert.match(r.xml, /OAuth state\/nonce synthesizer/, 'PreProcessor inserted');
-    // script lives inside a <stringProp>, so " gets XML-encoded as &quot;
-    assert.match(r.xml, /vars\.put\(&quot;state&quot;,\s*hex32\(\)\)/);
-    assert.match(r.xml, /vars\.put\(&quot;nonce&quot;,\s*hex32\(\)\)/);
-    assert.match(r.xml, /state=\$\{state\}.*nonce=\$\{nonce\}/, 'URL var-refs are preserved');
+    assert.doesNotMatch(r.xml, /JSR223PreProcessor|scriptLanguage">groovy/);
+    assert.match(r.xml, /state=\$\{__RandomString\(32,abcdef0123456789,\)\}.*nonce=\$\{__RandomString\(32,abcdef0123456789,\)\}/,
+        'URL vars use native JMeter functions');
 });
 
 test('OAuth rewire: no-op when state extractor exists but no /authorize URL uses it', () => {
@@ -621,11 +1472,39 @@ test('OAuth rewire: no-op when state extractor exists but no /authorize URL uses
     assert.doesNotMatch(r.xml, /OAuth state\/nonce synthesizer/);
 });
 
+test('Auth0 login state repair: extracts suffixed state from Location header instead of hidden input', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 04 - GET /authorize" enabled="true">
+        <stringProp name="HTTPSampler.path">/authorize?response_type=code&amp;state=\${state}&amp;nonce=\${nonce}</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree>
+        <HtmlExtractor guiclass="HtmlExtractorGui" testclass="HtmlExtractor" testname="Extract state_4 (CSS)" enabled="true">
+          <stringProp name="HtmlExtractor.refname">state_4</stringProp>
+          <stringProp name="HtmlExtractor.expr">input[name=&quot;state&quot;]</stringProp>
+          <stringProp name="HtmlExtractor.attribute">value</stringProp>
+          <stringProp name="HtmlExtractor.default">STATE_4_NOT_FOUND</stringProp>
+          <stringProp name="HtmlExtractor.match_number">1</stringProp>
+        </HtmlExtractor>
+      </hashTree>
+      <HTTPSamplerProxy testname="Step 05 - GET /u/login/identifier" enabled="true">
+        <stringProp name="HTTPSampler.path">/u/login/identifier?state=\${state_4}</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree/>
+    </hashTree></jmeterTestPlan>`;
+    const r = repairAuth0LoginStateExtractors(xml);
+    assert.strictEqual(r.repaired, 1);
+    assert.doesNotMatch(r.xml, /HtmlExtractor/);
+    assert.match(r.xml, /RegexExtractor\.refname">state_4/);
+    assert.match(r.xml, /Location:\\s\*\[\^\\r\\n\]\*\[\?&amp;\]state=/);
+    assert.match(r.xml, /<stringProp name="Sample\.scope">all<\/stringProp>/);
+});
+
 test('OAuth rewire: idempotent (running twice does not double-inject)', () => {
     const once = rewireClientMintedOauthVars(makeOauthJmx('state', true)).xml;
     const twice = rewireClientMintedOauthVars(once).xml;
-    const occurrences = (twice.match(/OAuth state\/nonce synthesizer/g) || []).length;
-    assert.strictEqual(occurrences, 1, 'must not inject duplicate PreProcessor');
+    assert.doesNotMatch(twice, /JSR223PreProcessor|scriptLanguage">groovy/);
+    const nativeFns = (twice.match(/__RandomString\(32,abcdef0123456789,\)/g) || []).length;
+    assert.strictEqual(nativeFns, 2, 'state and nonce should each have one native generator');
 });
 
 test('OAuth rewire: suffixed names (state_2, nonce_2) are LEFT ALONE — those are IdP session tokens needing extraction', () => {
@@ -711,6 +1590,23 @@ test('auto-correlate: correlateBodyDynamics substitutes session-in-body + wires 
     assert.doesNotMatch(r.xml, /a1b2c3d4e5f6g7h8i9j0k/, 'the literal session value must be replaced');
     assert.match(r.xml, /\$\{[A-Za-z0-9_]+\}/, 'a ${var} must be substituted into the body');
     assert.match(r.xml, /RegexExtractor|JSONPostProcessor|HtmlExtractor/, 'a verified extractor is injected');
+});
+
+test('auto-correlate: body-only regex verification ignores response headers', () => {
+    const producer = recEntry('GET', 'https://app.test/start', {
+        respBody: '{"ok":true}',
+    });
+    producer.response.headers = [{ name: 'Location', value: '/next?token=abc123def456' }];
+    const der = {
+        producerUrl: 'https://app.test/start',
+        kind: 'regex',
+        useHeaders: false,
+        refName: 'token',
+        expr: 'token=([^&"\\s]+)',
+    };
+
+    assert.strictEqual(acInternal.verifyExtractor(der, 'abc123def456', [producer]), false);
+    assert.strictEqual(acInternal.verifyExtractor({ ...der, useHeaders: true }, 'abc123def456', [producer]), true);
 });
 
 test('auto-correlate: does NOT clobber a value the engine already turned into ${var}', () => {

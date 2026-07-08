@@ -115,7 +115,19 @@ function planExtractor(varName, candidateValues, entries, consumerOrder) {
             // 2) Body contains the value verbatim -> regex extractor.
             if (body && body.includes(value)) {
                 const rx = buildBodyRegex(varName, body, value);
-                if (rx) return makeRegexExtractor(varName, rx.expr, rx.template, rx.useHeaders, i, label, 'body');
+                if (rx) {
+                    const verified = verifyRegexPlan({
+                        varName,
+                        expr: rx.expr,
+                        useHeaders: rx.useHeaders,
+                        body,
+                        headers,
+                        expectedValue: value,
+                    });
+                    if (verified.ok) {
+                        return makeRegexExtractor(varName, rx.expr, rx.template, rx.useHeaders, i, label, 'body', verified.value);
+                    }
+                }
             }
             // 3) Response header / Set-Cookie source.
             for (const h of headers) {
@@ -127,11 +139,43 @@ function planExtractor(varName, candidateValues, entries, consumerOrder) {
                     // an extractor when the value ALSO needs to land in a
                     // non-Cookie sink (the engine's correlation pass already
                     // handles the cookie sink itself).
-                    return makeRegexExtractor(varName, `(?i)^Set-Cookie:\\s*${escRegex(varName)}=([^;\\r\\n]+)`, '$1$', true, i, label, 'set-cookie');
+                    const cookieName = cookieNameForValue(hv, value);
+                    if (!cookieName) continue;
+                    const expr = `(?i)^Set-Cookie:\\s*${escRegex(cookieName)}=([^;\\r\\n]+)`;
+                    const verified = verifyRegexPlan({
+                        varName,
+                        expr,
+                        useHeaders: true,
+                        body,
+                        headers,
+                        expectedValue: value,
+                    });
+                    if (!verified.ok) continue;
+                    return makeRegexExtractor(varName, expr, '$1$', true, i, label, 'set-cookie', verified.value);
                 }
-                return makeRegexExtractor(varName, `(?im)^${escRegex(h.name)}:\\s*([^\\r\\n]+)`, '$1$', true, i, label, 'header');
+                const expr = `(?im)^${escRegex(h.name)}:\\s*([^\\r\\n]+)`;
+                const verified = verifyRegexPlan({
+                    varName,
+                    expr,
+                    useHeaders: true,
+                    body,
+                    headers,
+                    expectedValue: value,
+                });
+                if (!verified.ok) continue;
+                return makeRegexExtractor(varName, expr, '$1$', true, i, label, 'header', verified.value);
             }
         }
+    }
+    return null;
+}
+
+function cookieNameForValue(headerValue, expectedValue) {
+    const value = String(expectedValue || '');
+    if (!value) return null;
+    for (const part of String(headerValue || '').split(/,(?=\s*[\w.-]+=)/)) {
+        const m = part.trim().match(/^([\w.-]+)=([^;]*)/);
+        if (m && m[2] === value) return m[1];
     }
     return null;
 }
@@ -223,7 +267,7 @@ function makeJsonExtractor(varName, jsonPath, sourceOrder, sourceLabel) {
     return { type: 'json', sourceOrder, sourceLabel, block };
 }
 
-function makeRegexExtractor(varName, expr, template, useHeaders, sourceOrder, sourceLabel, originLabel) {
+function makeRegexExtractor(varName, expr, template, useHeaders, sourceOrder, sourceLabel, originLabel, extractedValue = undefined) {
     const fieldToCheck = useHeaders ? 'true' : 'false';
     const block = `
             <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="Extract ${escXmlAttr(varName)} (${escXmlAttr(originLabel)})" enabled="true">
@@ -235,7 +279,40 @@ function makeRegexExtractor(varName, expr, template, useHeaders, sourceOrder, so
               <stringProp name="RegexExtractor.default">NOT_FOUND_${escXmlAttr(varName)}</stringProp>
             </RegexExtractor>
             <hashTree/>`;
-    return { type: 'regex', sourceOrder, sourceLabel, block };
+    return { type: 'regex', sourceOrder, sourceLabel, block, extractedValue };
+}
+
+function verifyRegexPlan({ expr, useHeaders, body, headers, expectedValue }) {
+    if (!expr || expectedValue == null) return { ok: false, reason: 'missing_input' };
+    let rx;
+    try {
+        rx = compileJMeterRegexForLocalProof(expr);
+    } catch (e) {
+        return { ok: false, reason: 'invalid_regex', error: e.message };
+    }
+    const haystack = useHeaders
+        ? (headers || []).map(h => `${h.name}: ${h.value}`).join('\n')
+        : String(body || '');
+    const match = haystack.match(rx);
+    if (!match) return { ok: false, reason: 'no_match' };
+    if (match.length < 2) return { ok: false, reason: 'no_capture' };
+    if (match[1] !== String(expectedValue)) {
+        return { ok: false, reason: 'wrong_value', value: match[1] };
+    }
+    return { ok: true, value: match[1] };
+}
+
+function compileJMeterRegexForLocalProof(expr) {
+    let pattern = String(expr || '');
+    let flags = '';
+    const flagMatch = pattern.match(/^\(\?([im]+)\)/i);
+    if (flagMatch) {
+        for (const flag of flagMatch[1].toLowerCase()) {
+            if (!flags.includes(flag)) flags += flag;
+        }
+        pattern = pattern.slice(flagMatch[0].length);
+    }
+    return new RegExp(pattern, flags);
 }
 
 /**
@@ -286,5 +363,5 @@ module.exports = {
     knownDefinedVars,
     planExtractor,
     injectAfterSampler,
-    _internal: { escXmlAttr, escRegex, indexSamplers, findJsonPath, buildBodyRegex },
+    _internal: { escXmlAttr, escRegex, indexSamplers, findJsonPath, buildBodyRegex, verifyRegexPlan, cookieNameForValue, compileJMeterRegexForLocalProof },
 };

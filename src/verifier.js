@@ -150,24 +150,25 @@ function generateHtmlDashboard({ jmeterBinPath, jtlPath, outDir, onLog = () => {
 function summarizeJtlFast(jtlPath) {
     if (!jtlPath || !fs.existsSync(jtlPath)) return [];
     const xml = fs.readFileSync(jtlPath, 'utf8');
-    const re = /<(?:httpSample|sample)\b([^>]*)>/g;
+    const re = /<(httpSample|sample)\b([^>]*)>/g;
     const raw = [];
     const labels = new Set();
     let m;
     while ((m = re.exec(xml)) !== null) {
-        const a = m[1];
+        const tag = m[1];
+        const a = m[2];
         const lb = (a.match(/\blb="([^"]*)"/) || [])[1] || '';
         if (!lb) continue;
         const rc = (a.match(/\brc="([^"]*)"/) || [])[1] || '';
         const s = /\bs="true"/.test(a);
-        raw.push({ lb, rc, s });
+        raw.push({ tag, lb, rc, s });
         labels.add(lb);
     }
     const out = [];
     for (const r of raw) {
         const sub = /^(.+)-\d+$/.exec(r.lb);
         if (sub && labels.has(sub[1])) continue; // fold redirect hops
-        out.push({ label: r.lb, code: r.rc, success: r.s, isTransaction: !r.lb.includes('/') });
+        out.push({ label: r.lb, code: r.rc, success: r.s, isTransaction: r.tag === 'sample' });
     }
     return out;
 }

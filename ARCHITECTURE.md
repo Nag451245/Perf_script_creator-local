@@ -2,7 +2,7 @@
 
 A **local-only, folder-driven autonomous** JMeter scripting agent. Drop
 recordings in `input/`, get validated scripts in `output/`. Runs entirely on
-your machine (local JMeter + optional Gemini key) so it can reach corporate
+your machine (local JMeter + optional OpenAI/Gemini key) so it can reach corporate
 staging and never sends PHI to the cloud. Reuses the proven PerfScript engine
 (see `src/engine.js`) — this folder is the autonomous wrapper + the hardened
 verification loop on top of it.
@@ -24,7 +24,7 @@ PHASE 2  Replay Baseline & Localize  hit live env unmodified; find the FIRST div
    ↓
 PHASE 3  Deterministic Repair Loop   fuzzy/transform matchers, verified vs recorded bytes
    ↓
-PHASE 4  LLM Escalation              ghost sources, crypto, complex transforms → JSR223
+PHASE 4  LLM Escalation              unresolved failures → safe structured patches
    ↓
 PHASE 5  JMX Emission & Headless Verify   jmeter -n, parse .jtl, confirm metrics mirror replay
 ```
@@ -51,10 +51,11 @@ raw recorded byte arrays before execution** (the engine already round-trip
 verifies). Source priority: **body → response-header → Set-Cookie** (a body
 value reproduces; a redirect header may not).
 
-### Phase 4 — LLM Escalation (Gemini)
-Triggered **only** when Phase 3 hits a ghost source or an unresolvable
-transform chain. Bounded, tool-using, and every suggestion is re-verified by
-the deterministic matchers before it ships. Never brute-force permutations.
+### Phase 4 — LLM Escalation (OpenAI Preferred, Gemini Fallback)
+Triggered **only** when Phase 3 leaves unresolved failures. AI returns
+structured suggestions; the local app auto-applies only a safe subset
+(`addExtractor`, `replaceValueWithVar`, `setSamplerEnabled`) and re-verifies
+with JMeter before anything ships. Never brute-force permutations.
 
 ### Phase 5 — Target JMX Emission & Headless Verification
 Emit the final `.jmx`, drive it via `jmeter -n`, parse the `.jtl`, and confirm
@@ -127,10 +128,39 @@ The goal is 80%-grunt-work → 20%-review, fully auditable — not zero-human.
     correlation covers cookies it can't carry). **Elastic polling** — detected
     + reported (`_polling.json`); auto-emitting a While Controller needs engine
     IR/renderer support (deferred to avoid disturbing the current app).
-- **Phases 4-5** — Gemini escalation + headless verify (`--run` already does a
-  bounded headless loop); LLM escalation for un-repaired failures is next.
+- **Phases 4-5** — safe bounded AI escalation + headless verify (`--run` and
+  `--agent` run a bounded headless loop; OpenAI/Gemini is optional and key-gated).
 
 ## Update log (built since the phase notes above)
+- **Form hidden-input correlation** (`correlateFormHiddenInputs` in
+  `src/transforms.js`) — the class the manually-fixed Tasking script solved by
+  hand: a page body carries `<input type="hidden" name=X value=V>` (IdP login
+  `state`, SSO auto-POST bridge `token`) and later requests must send the FRESH
+  value. Recording-evidence-driven: producer = entry whose HTML response holds
+  the hidden input, wired only when a later entry provably consumes the value;
+  emits a CSS HtmlExtractor after the producer and substitutes `${var}` in all
+  later sampler fields (path / body args / headers). Generic — no app names.
+- **Flow profiles moved to config** — app/flow-specific knowledge (disable
+  patterns, `oauth.dropBareStateNonce`, LLM flow notes) now lives in
+  `perfscript.config.json` (`run.disableCalls` / `run.oauth` /
+  `run.llmFlowNotes`), not in code. The business guard treats
+  `run.disableCalls` as an operator override: explicitly disabled samplers are
+  never "protected", so an intentional disable can't fail the verdict.
+- **Verdict recovery from JTL** — the engine loop's result parse can return an
+  empty or PARTIAL samples array after JMeter ran; per-sampler rows are
+  recovered/merged from `final.jtl` (`recoverSamplesFromJtl`), which is also
+  deleted at run start (SimpleDataWriter appends — stale rows from a previous
+  run must not pollute the verdict). Fixes "0/0 requests passed" and the
+  guard's false "protected sampler did not execute".
+- **Dead-extractor repair** (`repairDeadExtractorConsumers`) — an extractor
+  stranded under a disabled sampler can never populate its variable, so its
+  `${var}` consumers would send the literal brace string (URISyntaxException
+  in URLs). Restores the recorded literal at each consumer, evidenced from the
+  consumer's recorded request.
+- **Bridge-page assertion skip** — auto-submit SSO bridge pages (POST form of
+  hidden inputs + `.submit()`) get no mined assertions: with redirects
+  followed, the replay lands PAST the bridge, so recorded-bridge text always
+  fails on a correct run.
 - **Correlation convergence** — the variance/verify-gate/body-parsing correlator
   (`src/auto-correlate.js`) is now wired into the app: `generate.js` runs it as a
   final **body/session pass** when a 2nd recording is present, filling dynamics
@@ -147,8 +177,10 @@ The goal is 80%-grunt-work → 20%-review, fully auditable — not zero-human.
   localization before the JVM boots.
 - **Load profile** — applies to **every** Thread Group (setUp/multi-TG safe).
 - **Web UI** (`src/ui-server.js`, `perfscript-ui.cmd`) — drag-drop recordings,
-  Generate / Generate+Validate, a settings panel (target/credentials/load
-  profile), live log, cancel, and links to the report + `.jmx`.
+  Generate / Generate+Validate / Senior AI Agent, a settings panel
+  (target/credentials/load profile), live log, cancel, and links to the report
+  + `.jmx`.
 - **Test gate** — `githooks/pre-push` runs the suite before every push;
   `.github/workflows/test.yml` runs it in CI (set the `ENGINE_REPO` Actions
-  variable so CI can check out the engine). 52 tests, all green.
+  variable so CI can check out the engine). Run `npm test` locally before
+  sharing changes.

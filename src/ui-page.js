@@ -133,7 +133,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .results{border-top:1px solid var(--line);padding:14px 18px}
 .results-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px;gap:12px}
 .results-h h3{margin:0;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink2);display:flex;align-items:center}
-#outputs{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:12px}
+#outputs{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.hist-pager{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:11px}
+.hist-pager:empty{display:none}
+.hist-pager button{padding:6px 12px;font-size:12.5px}
+.hpage{font-size:12px;color:var(--mut)}
 .hrow{display:flex;align-items:center;gap:10px;padding:10px 13px;border-bottom:1px solid var(--line);cursor:pointer;transition:background .12s}
 .hrow:last-child{border-bottom:0}
 .hrow:hover{background:var(--surface2)}
@@ -287,6 +291,7 @@ The agent will print its understanding of the flow and domain before it begins.<
         <input id="hist-search" placeholder="Filter runs…" style="width:180px;background:var(--bg);border:1px solid var(--line2);border-radius:var(--radius-sm);padding:6px 10px;font-size:12.5px">
       </div>
       <div id="outputs"><div class="empty">No runs yet. Completed runs are listed here.</div></div>
+      <div id="hist-pager" class="hist-pager"></div>
     </div>
   </main>
 </div>
@@ -355,7 +360,7 @@ function renderIssues(issues){
  q('#input-issues').innerHTML=(issues||[]).filter(function(i){return i.severity==='error'||i.severity==='warning'}).slice(0,8)
   .map(function(i){return '<div class="warnrow">'+esc(i.severity.toUpperCase()+': '+i.message)+'</div>'}).join('');
 }
-var allOutputs=[];
+var allOutputs=[],histPage=0;var HIST_PER_PAGE=5;
 function renderOutputs(outputs){
  allOutputs=outputs||[];
  q('#hist-count').textContent=allOutputs.length;
@@ -364,8 +369,13 @@ function renderOutputs(outputs){
 function paintHistory(){
  var term=(q('#hist-search').value||'').toLowerCase();
  var list=allOutputs.filter(function(o){return !term||String(o.name||'').toLowerCase().indexOf(term)>=0});
- if(!list.length){q('#outputs').innerHTML='<div class="empty">'+(allOutputs.length?'No runs match the filter.':'No runs yet. Completed runs are listed here.')+'</div>';return}
- q('#outputs').innerHTML=list.map(function(o,i){
+ if(!list.length){q('#outputs').innerHTML='<div class="empty">'+(allOutputs.length?'No runs match the filter.':'No runs yet. Completed runs are listed here.')+'</div>';q('#hist-pager').innerHTML='';return}
+ var pages=Math.ceil(list.length/HIST_PER_PAGE);
+ if(histPage>=pages)histPage=pages-1; if(histPage<0)histPage=0;
+ var start=histPage*HIST_PER_PAGE;
+ var pageItems=list.slice(start,start+HIST_PER_PAGE);
+ q('#outputs').innerHTML=pageItems.map(function(o,pi){
+  var i=start+pi;
   var vc=o.verdict==='GREEN'?'ok':(o.verdict==='needs attention'?'warn':'gen');
   var vlabel=o.verdict==='GREEN'?'GREEN':(o.verdict==='needs attention'?'ATTENTION':'generated');
   var meta=o.kind==='validated'?((o.passed||0)+'/'+((o.passed||0)+(o.failed||0))+' passed'):((o.samplers||0)+' samplers');
@@ -376,13 +386,21 @@ function paintHistory(){
   if(o.report)act+='<a class="action primary" target="_blank" href="/out/'+encodeURIComponent(o.name)+'/'+encodeURIComponent(o.report)+'">Open report</a>';
   if(o.jmx)act+='<a class="action" href="/out/'+encodeURIComponent(o.name)+'/'+encodeURIComponent(o.jmx)+'">Download JMX</a>';
   act+='<button class="action" type="button" data-name="'+esc(o.name)+'" onclick="event.stopPropagation();rerunName(this.dataset.name)">Rerun</button>';
-  return '<div class="hrow" onclick="toggleHist('+i+')"><span class="hcaret">▶</span><span class="hdot '+vc+'"></span>'+
+  void i;
+  return '<div class="hrow" onclick="toggleHist('+pi+')"><span class="hcaret">▶</span><span class="hdot '+vc+'"></span>'+
     '<span class="hname" title="'+esc(o.name)+'">'+esc(o.name)+'</span>'+
     '<span class="hmeta">'+esc(meta)+'</span>'+
     '<span class="hverdict '+vc+'">'+vlabel+'</span></div>'+
-    '<div class="hbody" id="hbody-'+i+'"><div class="stats">'+stats+'</div><div class="actions">'+act+'</div></div>';
+    '<div class="hbody" id="hbody-'+pi+'"><div class="stats">'+stats+'</div><div class="actions">'+act+'</div></div>';
  }).join('');
+ var pages=Math.ceil(list.length/HIST_PER_PAGE);
+ q('#hist-pager').innerHTML = pages>1
+   ? '<button class="btn-ghost" type="button" onclick="histNav(-1)" '+(histPage<=0?'disabled':'')+'>‹ Prev</button>'+
+     '<span class="hpage">Page '+(histPage+1)+' of '+pages+' · '+list.length+' run'+(list.length===1?'':'s')+'</span>'+
+     '<button class="btn-ghost" type="button" onclick="histNav(1)" '+(histPage>=pages-1?'disabled':'')+'>Next ›</button>'
+   : '';
 }
+function histNav(d){histPage+=d;paintHistory()}
 function toggleHist(i){
  var row=qa('.hrow')[i],body=q('#hbody-'+i);
  if(!row||!body)return;
@@ -429,7 +447,7 @@ q('#rerun-last').onclick=function(){rerunLast().catch(function(e){alert(e.messag
 q('#stop').onclick=async function(){await fetch('/api/cancel',{method:'POST'});q('#phase').textContent='Stopping…'};
 q('#refresh').onclick=refresh;q('#cfg-save').onclick=function(){saveCfg(false)};
 q('#rec1').onchange=updateSelected;q('#rec2').onchange=updateSelected;
-q('#hist-search').oninput=paintHistory;
+q('#hist-search').oninput=function(){histPage=0;paintHistory()};
 q('#copy-log').onclick=function(){navigator.clipboard&&navigator.clipboard.writeText(logText)};
 q('#clear-log').onclick=function(){logText='';q('#log').textContent=''};
 q('#chat-send').onclick=function(){sendChat()};q('#chat-input').onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();sendChat()}};

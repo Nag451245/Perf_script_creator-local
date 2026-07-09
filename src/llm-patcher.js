@@ -42,7 +42,7 @@ const { injectAfterSampler, _internal: { escXmlAttr, indexSamplers } } = require
 
 const PATCH_SCHEMAS = {
     addExtractor: {
-        keys: new Set(['kind', 'sampler', 'variable', 'type', 'path', 'regex', 'template', 'useHeaders']),
+        keys: new Set(['kind', 'sampler', 'variable', 'type', 'path', 'regex', 'template', 'useHeaders', 'selector', 'attribute']),
         required: ['kind', 'sampler', 'variable', 'type'],
     },
     replaceValueWithVar: {
@@ -52,6 +52,10 @@ const PATCH_SCHEMAS = {
     setSamplerEnabled: {
         keys: new Set(['kind', 'sampler', 'enabled']),
         required: ['kind', 'sampler', 'enabled'],
+    },
+    removeAssertion: {
+        keys: new Set(['kind', 'sampler', 'assertion']),
+        required: ['kind', 'sampler', 'assertion'],
     },
 };
 
@@ -97,7 +101,7 @@ function validateOne(raw) {
     }
 
     if (kind === 'addExtractor') {
-        if (!['json', 'regex'].includes(raw.type)) {
+        if (!['json', 'regex', 'css'].includes(raw.type)) {
             return { ok: false, rejected: { reason: 'invalid_extractor_type', kind, type: raw.type, raw } };
         }
         if (raw.type === 'json' && !raw.path) {
@@ -105,6 +109,9 @@ function validateOne(raw) {
         }
         if (raw.type === 'regex' && !raw.regex) {
             return { ok: false, rejected: { reason: 'missing_field', kind, field: 'regex', raw } };
+        }
+        if (raw.type === 'css' && !raw.selector) {
+            return { ok: false, rejected: { reason: 'missing_field', kind, field: 'selector', raw } };
         }
     }
 
@@ -156,6 +163,12 @@ function applyLlmPatches(xml, fixes) {
                 else skipped.push(res.skipped);
                 continue;
             }
+            if (fix.kind === 'removeAssertion') {
+                const res = applyRemoveAssertion(out, fix);
+                if (res.applied) { out = res.xml; applied.push(res.applied); }
+                else skipped.push(res.skipped);
+                continue;
+            }
             skipped.push({ reason: 'unsupported_kind', kind: fix.kind, raw });
         } catch (e) {
             skipped.push({ reason: 'apply_error', kind: fix.kind, error: e.message, raw });
@@ -180,6 +193,9 @@ function normalize(raw) {
         type: raw.type || raw.extractorType || null,
         path: raw.path || raw.jsonPath || null,
         regex: raw.regex || raw.expression || null,
+        selector: raw.selector || raw.cssSelector || null,
+        attribute: raw.attribute || 'value',
+        assertion: raw.assertion || raw.assertionName || null,
         template: raw.template || '$1$',
         useHeaders: !!raw.useHeaders,
         value: raw.value != null ? String(raw.value) : null,
@@ -195,7 +211,7 @@ function applyAddExtractor(xml, fix) {
     if (idx < 0) return { skipped: { reason: 'sampler_not_found', sampler: fix.sampler } };
 
     let block;
-    if (fix.type === 'json' || (fix.path && !fix.regex)) {
+    if (fix.type === 'json' || (fix.path && !fix.regex && !fix.selector)) {
         if (!fix.path) return { skipped: { reason: 'missing_json_path', kind: fix.kind } };
         block = `
             <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="LLM-fix Extract ${escXmlAttr(fix.variable)} (JSON)" enabled="true">
@@ -204,6 +220,17 @@ function applyAddExtractor(xml, fix) {
               <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>
               <stringProp name="JSONPostProcessor.defaultValues">NOT_FOUND_${escXmlAttr(fix.variable)}</stringProp>
             </JSONPostProcessor>
+            <hashTree/>`;
+    } else if (fix.type === 'css' || fix.selector) {
+        if (!fix.selector) return { skipped: { reason: 'missing_css_selector', kind: fix.kind } };
+        block = `
+            <HtmlExtractor guiclass="HtmlExtractorGui" testclass="HtmlExtractor" testname="LLM-fix Extract ${escXmlAttr(fix.variable)} (CSS)" enabled="true">
+              <stringProp name="HtmlExtractor.refname">${escXmlAttr(fix.variable)}</stringProp>
+              <stringProp name="HtmlExtractor.expr">${escXmlAttr(fix.selector)}</stringProp>
+              <stringProp name="HtmlExtractor.attribute">${escXmlAttr(fix.attribute || 'value')}</stringProp>
+              <stringProp name="HtmlExtractor.default">NOT_FOUND_${escXmlAttr(fix.variable)}</stringProp>
+              <stringProp name="HtmlExtractor.match_number">1</stringProp>
+            </HtmlExtractor>
             <hashTree/>`;
     } else if (fix.type === 'regex' || fix.regex) {
         if (!fix.regex) return { skipped: { reason: 'missing_regex', kind: fix.kind } };
@@ -226,6 +253,23 @@ function applyAddExtractor(xml, fix) {
     return { xml: next, applied: { kind: 'addExtractor', sampler: fix.sampler, variable: fix.variable, type: fix.type || (fix.path ? 'json' : 'regex') } };
 }
 
+function applyRemoveAssertion(xml, fix) {
+    if (!fix.sampler) return { skipped: { reason: 'missing_sampler', kind: fix.kind } };
+    if (!fix.assertion) return { skipped: { reason: 'missing_assertion', kind: fix.kind } };
+    const samplerRe = new RegExp(`<HTTPSamplerProxy\\b[^>]*\\btestname="${escapeRegExp(fix.sampler)}"[^>]*>[\\s\\S]*?<\\/HTTPSamplerProxy>\\s*<hashTree>[\\s\\S]*?<\\/hashTree>`);
+    const match = String(xml || '').match(samplerRe);
+    if (!match) return { skipped: { reason: 'sampler_not_found', sampler: fix.sampler } };
+    const block = match[0];
+    const assertionRe = new RegExp(`\\s*<ResponseAssertion\\b[^>]*\\btestname="${escapeRegExp(fix.assertion)}"[^>]*>[\\s\\S]*?<\\/ResponseAssertion>\\s*<hashTree\\/>`, 'g');
+    let removed = 0;
+    const nextBlock = block.replace(assertionRe, () => { removed++; return ''; });
+    if (!removed) return { skipped: { reason: 'assertion_not_found', sampler: fix.sampler, assertion: fix.assertion } };
+    return {
+        xml: xml.replace(block, nextBlock),
+        applied: { kind: 'removeAssertion', sampler: fix.sampler, assertion: fix.assertion, removed },
+    };
+}
+
 function applyReplaceValueWithVar(xml, fix) {
     if (!fix.value) return { skipped: { reason: 'missing_value', kind: fix.kind } };
     if (!fix.variable) return { skipped: { reason: 'missing_variable', kind: fix.kind } };
@@ -243,9 +287,9 @@ function applyReplaceValueWithVar(xml, fix) {
     for (let i = samplers.length - 1; i >= 0; i--) {
         const s = samplers[i];
         if (fix.sampler && s.name !== fix.sampler) continue;
-        const closeIdx = result.indexOf('</HTTPSamplerProxy>', s.position);
-        if (closeIdx < 0) continue;
-        const samplerXml = result.substring(s.position, closeIdx);
+        const endIdx = s.endPosition || result.indexOf('</HTTPSamplerProxy>', s.position);
+        if (endIdx < 0) continue;
+        const samplerXml = result.substring(s.position, endIdx);
         if (!samplerXml.includes(fix.value)) continue;
         // Only replace inside stringProp/Header.value content nodes — never
         // inside attributes (testname="...") or tag names. The reliable way
@@ -255,7 +299,7 @@ function applyReplaceValueWithVar(xml, fix) {
             (_m, a, content, b) => `${a}${content.split(fix.value).join(replacement)}${b}`
         );
         if (scoped !== samplerXml) {
-            result = result.substring(0, s.position) + scoped + result.substring(closeIdx);
+            result = result.substring(0, s.position) + scoped + result.substring(endIdx);
             replacements++;
             if (fix.sampler) break;
         }
@@ -276,4 +320,8 @@ function applySetSamplerEnabled(xml, fix) {
     return { xml: next, applied: { kind: 'setSamplerEnabled', sampler: fix.sampler, enabled: !!fix.enabled, touched } };
 }
 
-module.exports = { applyLlmPatches, validateLlmPatches, _internal: { normalize, applyAddExtractor, applyReplaceValueWithVar, applySetSamplerEnabled, validateOne, isSafeVariableName } };
+function escapeRegExp(s) {
+    return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+module.exports = { applyLlmPatches, validateLlmPatches, _internal: { normalize, applyAddExtractor, applyReplaceValueWithVar, applySetSamplerEnabled, applyRemoveAssertion, validateOne, isSafeVariableName } };

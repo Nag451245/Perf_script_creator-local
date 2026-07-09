@@ -19,6 +19,15 @@ const { applyLlmPatches, validateLlmPatches } = require('./llm-patcher');
 const { sanitizeJavaUnsafeJmx } = require('./java-safe');
 const learningStore = require('./learning-store');
 const businessGuard = require('./business-guard');
+const blueprintContext = require('./blueprint-context');
+const blueprintAgent = require('./blueprint-agent');
+const { classifyFirstFailure } = require('./failure-classifier');
+const valueFlowDecisions = require('./value-flow-decisions');
+const responseEvidence = require('./response-evidence');
+const fastRepairLoop = require('./fast-repair-loop');
+const correlationHypotheses = require('./correlation-hypotheses');
+const statusAnalysis = require('./status-analysis');
+const finalGreenGate = require('./final-green-gate');
 const { runFeedbackLoop } = require(path.join(ENGINE_ROOT, 'src/execution/feedbackLoop'));
 const autoPatcher = require(path.join(ENGINE_ROOT, 'src/execution/autoPatcher'));
 const aiService = require(path.join(ENGINE_ROOT, 'src/services/ai-service'));
@@ -34,7 +43,7 @@ const aiService = require(path.join(ENGINE_ROOT, 'src/services/ai-service'));
 // (see `runValidate` below). Kept backwards-compatible: still writes the
 // suggestions file; callers that ignore the return value (tests, older code)
 // keep working.
-async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLog, flowNotes = [] }) {
+async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLog, flowNotes = [], blueprintEvidence = null }) {
     const failures = collectLlmFailures(result);
     if (!failures.length) return [];
     if (!process.env.OPENAI_API_KEY && !aiService.isEnabled()) {
@@ -43,7 +52,7 @@ async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLo
     }
     try {
         const jmxContent = fs.readFileSync(jmxPath, 'utf8');
-        const prompt = buildGeminiFixPrompt({ failures, jmxContent, correlations, flowNotes });
+        const prompt = buildGeminiFixPrompt({ failures, jmxContent, correlations, flowNotes, blueprintEvidence });
         const provider = llmProviderLabel(process.env);
         onLog(`AI escalation using ${provider} as senior performance engineer`);
         const out = process.env.OPENAI_API_KEY
@@ -115,6 +124,22 @@ function parseLlmJson(content) {
 function collectLlmFailures(result = {}) {
     const failures = [];
     const seen = new Set();
+    if (result.statusRootCause && result.statusRootCause.rootCause) {
+        const root = result.statusRootCause.rootCause;
+        const samplerName = root.sampler || '';
+        if (samplerName) {
+            seen.add(samplerName);
+            failures.push({
+                samplerName,
+                samplerIndex: result.statusRootCause.rootCauseIndex,
+                responseCode: String(root.observed || ''),
+                responseMessage: root.relevance || '',
+                failureMessage: result.statusRootCause.summary || root.repairHint || '',
+                category: root.category,
+                unresolvedVariables: [],
+            });
+        }
+    }
     for (const [i, s] of (result.samples || []).entries()) {
         if (s.isTransaction || s.success !== false) continue;
         const samplerName = s.label || s.name;
@@ -153,7 +178,7 @@ function normalizeGeminiFixes(out) {
     return [];
 }
 
-function buildGeminiFixPrompt({ failures, jmxContent, correlations = [], flowNotes = [] }) {
+function buildGeminiFixPrompt({ failures, jmxContent, correlations = [], flowNotes = [], blueprintEvidence = null }) {
     const prioritizedFailures = prioritizeLlmFailures(failures || []);
     const failureSummary = prioritizedFailures.failures.map((f, i) => ({
         sampler: f.samplerName,
@@ -181,6 +206,10 @@ Operate like the senior engineer who manually fixed the Tasking script:
 - Do not guess. If the exact producer, literal value, or sampler target is not visible, return no fix for that item.
 - Do not hallucinate endpoints, variables, extractors, scripts, credentials, tokens, or response bodies.
 - Prefer fresh server-issued correlation over hardcoded recorded values.
+- Interpret HTTP status codes recording-first: 200/202/3xx/4xx/5xx are only correct when they match the recorded sampler's expected status and response shape.
+- Follow the senior PE gates when evidence is present: objective -> flow intent -> role/necessity ledger -> native managers -> producer-localized repair -> validity/negative-space audit.
+- Do not parameterize values merely because they differ; tie parameterization to the test objective and role. Do not correlate values that Cookie/Cache/Auth/redirect managers own.
+- If a downstream sampler fails, inspect prior statusRootCause / baseline drift first; repair the earliest upstream divergence before patching the downstream symptom.
 - Treat 401/403 after login as an upstream auth/session symptom until the failing sampler proves otherwise.
 - Fold recorded redirect/OIDC plumbing instead of replaying stale redirect hops. Treat /authorize/resume and /oauth/token as non-business plumbing unless the evidence proves they are the business action.
 - Preserve true business action samplers: login form submissions, SSO bridge posts, session save/create-cookie calls, GraphQL mutations, and create-task API calls.
@@ -202,23 +231,33 @@ Allowed fix objects are ONLY these exact schemas:
 1. Add a native extractor after a producer sampler:
 {"kind":"addExtractor","sampler":"exact sampler testname","variable":"safe_variable_name","type":"json","path":"$.json.path"}
 {"kind":"addExtractor","sampler":"exact sampler testname","variable":"safe_variable_name","type":"regex","regex":"left([^\\\\s&\\\"]+)right","template":"$1$","useHeaders":true}
+{"kind":"addExtractor","sampler":"exact sampler testname","variable":"safe_variable_name","type":"css","selector":"input[name=\\"csrf\\"]","attribute":"value"}
 
 2. Replace a visible recorded literal with an existing/new safe JMeter variable:
 {"kind":"replaceValueWithVar","sampler":"exact sampler testname or omit for all samplers","value":"exact literal visible in JMX","variable":"safe_variable_name"}
 
-3. Disable a clearly useless/noisy sampler:
+3. Disable or re-enable an exact sampler when evidence proves it:
 {"kind":"setSamplerEnabled","sampler":"exact sampler testname","enabled":false}
+{"kind":"setSamplerEnabled","sampler":"exact sampler testname","enabled":true}
+
+4. Remove a bad generated assertion under an exact sampler:
+{"kind":"removeAssertion","sampler":"exact sampler testname","assertion":"exact assertion testname"}
 
 Hard rules:
-- The only allowed kind values are addExtractor, replaceValueWithVar, setSamplerEnabled.
+- The only allowed kind values are addExtractor, replaceValueWithVar, setSamplerEnabled, removeAssertion.
 - Variable names must match ^[A-Za-z_][A-Za-z0-9_]*$ and must not start with "__".
 - Do not include id, category, description, explanation, confidence, currentValue, proposedValue, xmlElement, notes, markdown, or any extra field.
 - Do not propose JSR223, Groovy, BeanShell, JavaScript execution, or any unsupported patch kind.
 - For regex extractors, use exactly one capture group and set useHeaders=true only for Location/Set-Cookie/header values.
 - For JSON extractors, use JSON only when the value is produced in a response body JSON field.
+- For CSS extractors, use only when the failing response evidence shows an HTML input/meta value.
+- Remove assertions only when failing response evidence shows the assertion is wrong for a healthy response shape.
 - If a failure cannot be fixed from the provided evidence, omit it. An empty fix list is better than a hallucinated patch.
 
-## FAILURES
+${blueprintEvidence ? `## BLUEPRINT EVIDENCE
+${JSON.stringify(blueprintEvidence, null, 2)}
+
+` : ''}## FAILURES
 ${JSON.stringify(failureSummary, null, 2)}
 
 ## FAILURE TRIAGE
@@ -410,6 +449,33 @@ function recoverSamplesFromJtl(result, stableJtl, outDir, onLog) {
     return result;
 }
 
+function applyStatusRootCauseToResult(result = {}, entries = []) {
+    const statusRootCause = statusAnalysis.traceStatusRootCause({
+        entries,
+        samples: result.samples || [],
+    });
+    result.statusRootCause = statusRootCause;
+    if (statusRootCause) {
+        result.success = false;
+        result.recordingDriftFailure = true;
+        result.failureMessage = statusRootCause.summary;
+    } else {
+        delete result.recordingDriftFailure;
+    }
+    return result;
+}
+
+function refreshBlueprintFirstFailure(ctx, result = {}) {
+    if (!ctx || !ctx.loop) return null;
+    if (result.statusRootCause) {
+        if (ctx.validation) ctx.validation.statusRootCause = result.statusRootCause;
+        ctx.loop.firstFailure = classifyFirstFailure(result);
+        return ctx.loop.firstFailure;
+    }
+    ctx.loop.firstFailure = ctx.loop.firstFailure || classifyFirstFailure(result);
+    return ctx.loop.firstFailure;
+}
+
 function applyBusinessVerification(result, finalJmxPath, guard, blockedDisables = []) {
     let xml = '';
     try { xml = finalJmxPath && fs.existsSync(finalJmxPath) ? fs.readFileSync(finalJmxPath, 'utf8') : ''; }
@@ -476,6 +542,42 @@ function applyJavaSafeGuard({ jmxPath, outDir, name, label, enabled, onLog }) {
     return sanitized;
 }
 
+function summarizeBlueprintEvidence(ctx) {
+    if (!ctx) return null;
+    return {
+        firstFailure: ctx.loop.firstFailure || null,
+        statusRootCause: ctx.validation.statusRootCause || null,
+        seniorPe: ctx.seniorPe ? summarizeSeniorPeDebrief(ctx.seniorPe) : null,
+        lineageSummary: (ctx.lineage.links || []).slice(0, 25).map(l => ({
+            variable: l.varName || l.variable,
+            producer: l.producer,
+            consumer: l.consumer,
+        })),
+        orphanCount: (ctx.lineage.orphans || []).length,
+        repairAttempts: ctx.loop.attempts || [],
+    };
+}
+
+function summarizeSeniorPeDebrief(debrief) {
+    return {
+        objective: debrief.objective || null,
+        flowNarrative: debrief.flow && debrief.flow.narrative,
+        stackFingerprint: (debrief.stackFingerprint && debrief.stackFingerprint.signals || []).slice(0, 8),
+        valueLedger: (debrief.valueLedger || []).slice(0, 25).map(v => ({
+            name: v.name,
+            role: v.role,
+            decision: v.decision,
+            native: v.native,
+            rationale: v.necessityRationale,
+            provenance: v.provenance,
+        })),
+        nativeManagers: debrief.nativeManagers || [],
+        validityGates: debrief.validityGates || [],
+        negativeSpace: debrief.negativeSpace || [],
+        coverage: debrief.coverage || null,
+    };
+}
+
 async function tryMemoryPatchRound({ result, jmxPath, config, gen, outDir, name, onLog, agent, learning, guard }) {
     const matches = learning.enabled
         ? learningStore.findMatchingLessons({
@@ -536,7 +638,140 @@ async function tryMemoryPatchRound({ result, jmxPath, config, gen, outDir, name,
     }
 }
 
-async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, onLog, agentCfg, learningCfg, guard, flowNotes = [] }) {
+async function tryVerifiedCorrelationRepairRound({
+    result,
+    jmxPath,
+    config,
+    gen,
+    outDir,
+    name,
+    onLog,
+    agent = normalizeAgentCfg({ enabled: true }),
+    guard = null,
+    blueprintCtx = null,
+    feedbackLoop = runFeedbackLoop,
+} = {}) {
+    const failures = collectLlmFailures(result);
+    const xml = fs.existsSync(jmxPath) ? fs.readFileSync(jmxPath, 'utf8') : '';
+    const hypotheses = correlationHypotheses.proposeCorrelationHypotheses({
+        xml,
+        entries: gen.flat,
+        failures,
+    });
+    fs.writeFileSync(
+        path.join(outDir, `${name}_correlation_hypotheses.json`),
+        JSON.stringify(hypotheses, null, 2)
+    );
+    if (blueprintCtx) {
+        blueprintCtx.loop.attempts.push({
+            phase: 'verified-correlation-repair',
+            proposedFixes: hypotheses.fixes.length,
+            attempts: hypotheses.attempts,
+            rejected: hypotheses.rejected,
+        });
+    }
+    if (!hypotheses.fixes.length) {
+        return {
+            result,
+            jmxPath,
+            repair: { attempted: false, success: false, hypotheses },
+            successfulFixes: [],
+        };
+    }
+
+    const validation = filterProtectedPatchDisables(validateLlmPatches(hypotheses.fixes), guard);
+    fs.writeFileSync(
+        path.join(outDir, `${name}_correlation_hypothesis_validation.json`),
+        JSON.stringify(validation, null, 2)
+    );
+    if (!validation.accepted.length) {
+        onLog(`verified correlation repair: ${hypotheses.fixes.length} proposed fix(es), schema gate accepted none`);
+        return {
+            result,
+            jmxPath,
+            repair: { attempted: true, success: false, hypotheses, validation },
+            successfulFixes: [],
+        };
+    }
+
+    const fastRepair = await fastRepairLoop.runFastRepairLoop({
+        xml,
+        entries: gen.flat,
+        fixes: validation.accepted,
+        targetBaseUrl: config.targetBaseUrl,
+        insecure: true,
+        timeoutMs: config.timeoutMs,
+        onLog,
+    });
+    fs.writeFileSync(
+        path.join(outDir, `${name}_correlation_fast_repair.json`),
+        JSON.stringify(fastRepair, null, 2)
+    );
+    if (fastRepair.skipped || !fastRepair.replay || !fastRepair.replay.ok) {
+        onLog(`verified correlation repair: rejected hypothesis before JMeter (${fastRepair.reason || 'fast replay did not verify'})`);
+        return {
+            result,
+            jmxPath,
+            repair: { attempted: true, success: false, hypotheses, validation, fastRepair },
+            successfulFixes: [],
+        };
+    }
+
+    const patched = applyLlmPatches(xml, validation.accepted);
+    fs.writeFileSync(
+        path.join(outDir, `${name}_correlation_patches.json`),
+        JSON.stringify({ applied: patched.applied, skipped: patched.skipped }, null, 2)
+    );
+    if (!patched.applied.length) {
+        onLog(`verified correlation repair: fast replay passed but no patch applied`);
+        return {
+            result,
+            jmxPath,
+            repair: { attempted: true, success: false, hypotheses, validation, fastRepair, patched },
+            successfulFixes: [],
+        };
+    }
+
+    const patchedJmxPath = path.join(outDir, `${name}.correlation-patched.jmx`);
+    fs.writeFileSync(patchedJmxPath, patched.xml);
+    applyJavaSafeGuard({
+        jmxPath: patchedJmxPath,
+        outDir,
+        name,
+        label: 'verified_correlation',
+        enabled: agent.javaSafeMode,
+        onLog,
+    });
+
+    onLog(`verified correlation repair: applied ${patched.applied.length} patch(es) · re-verifying with JMeter`);
+    const result2 = await feedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: 1 }, gen.flat);
+    const success = !!result2.success;
+    if (blueprintCtx) {
+        blueprintCtx.loop.patches.push({
+            phase: 'verified-correlation-repair',
+            applied: patched.applied,
+            skipped: patched.skipped,
+            success,
+        });
+    }
+    return {
+        success,
+        result: result2,
+        jmxPath: result2.finalJmxPath || patchedJmxPath,
+        repair: {
+            attempted: true,
+            success,
+            hypotheses,
+            validation,
+            fastRepair,
+            applied: patched.applied,
+            skipped: patched.skipped,
+        },
+        successfulFixes: success ? validation.accepted : [],
+    };
+}
+
+async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, onLog, agentCfg, learningCfg, guard, flowNotes = [], blueprintEvidence = null, blueprintCtx = null }) {
     const agent = normalizeAgentCfg(agentCfg);
     if (!agent.enabled) {
         onLog('agent mode disabled — keeping deterministic JMX as final');
@@ -556,6 +791,7 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
     finalResult = memoryAttempt.result;
     finalJmxPath = memoryAttempt.jmxPath;
     successfulFixes.push(...memoryAttempt.successfulFixes);
+    applyStatusRootCauseToResult(finalResult, gen.flat);
 
     if (finalResult.success) {
         onLog('learning memory round succeeded — shipping memory-patched JMX as final');
@@ -571,10 +807,45 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
         };
     }
 
+    const verifiedCorrelationAttempt = await tryVerifiedCorrelationRepairRound({
+        result: finalResult,
+        jmxPath: finalJmxPath,
+        config,
+        gen,
+        outDir,
+        name,
+        onLog,
+        agent,
+        guard,
+        blueprintCtx,
+    });
+    finalResult = verifiedCorrelationAttempt.result;
+    finalJmxPath = verifiedCorrelationAttempt.jmxPath;
+    successfulFixes.push(...verifiedCorrelationAttempt.successfulFixes);
+    applyStatusRootCauseToResult(finalResult, gen.flat);
+    if (verifiedCorrelationAttempt.repair.attempted) {
+        onLog(`verified correlation repair: ${verifiedCorrelationAttempt.repair.success ? 'succeeded' : 'did not close all failures'}`);
+    }
+
+    if (finalResult.success) {
+        return {
+            result: finalResult,
+            jmxPath: finalJmxPath,
+            llmPatch: {
+                memory: memoryAttempt.memoryPatch,
+                verifiedCorrelation: verifiedCorrelationAttempt.repair,
+                rounds,
+                success: true,
+                successfulFixes,
+            },
+        };
+    }
+
+    const fastRepairRounds = [];
     for (let round = 1; round <= agent.maxLlmRounds && !finalResult.success; round++) {
         const fixes = await escalateToLlm({
             result: finalResult, jmxPath: finalJmxPath,
-            correlations: gen.correlations, outDir, name, onLog, flowNotes,
+            correlations: gen.correlations, outDir, name, onLog, flowNotes, blueprintEvidence,
         });
         if (!fixes || !fixes.length) break;
 
@@ -590,6 +861,25 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
 
         try {
             const before = fs.readFileSync(finalJmxPath, 'utf8');
+            const fastRepair = await fastRepairLoop.runFastRepairLoop({
+                xml: before,
+                entries: gen.flat,
+                fixes: validation.accepted,
+                targetBaseUrl: config.targetBaseUrl,
+                insecure: true,
+                timeoutMs: config.timeoutMs,
+                onLog,
+            });
+            fastRepairRounds.push({ round, ...fastRepair });
+            fs.writeFileSync(
+                path.join(outDir, `${name}_fast_repair_rounds.json`),
+                JSON.stringify(fastRepairRounds, null, 2)
+            );
+            if (!fastRepair.skipped && !fastRepair.replay.ok) {
+                onLog(`fast repair loop round ${round}: rejected patch hypothesis before JMeter`);
+                rounds.push({ round, applied: 0, skipped: 0, success: false, fastReplay: false });
+                break;
+            }
             const patched = applyLlmPatches(before, validation.accepted);
             const patchedJmxPath = path.join(outDir, `${name}.llm-patched.round${round}.jmx`);
             fs.writeFileSync(
@@ -611,6 +901,7 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
 
             onLog(`LLM patcher round ${round}: applied ${patched.applied.length} / skipped ${patched.skipped.length} · re-verifying`);
             const result2 = await runFeedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: 1 }, gen.flat);
+            applyStatusRootCauseToResult(result2, gen.flat);
             const success = !!result2.success;
             rounds.push({ round, applied: patched.applied.length, skipped: patched.skipped.length, success });
             finalResult = result2;
@@ -632,8 +923,8 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
     return {
         result: finalResult,
         jmxPath: finalJmxPath,
-        llmPatch: (rounds.length || memoryAttempt.memoryPatch)
-            ? { memory: memoryAttempt.memoryPatch, rounds, success: !!finalResult.success, successfulFixes }
+        llmPatch: (rounds.length || memoryAttempt.memoryPatch || verifiedCorrelationAttempt.repair.attempted)
+            ? { memory: memoryAttempt.memoryPatch, verifiedCorrelation: verifiedCorrelationAttempt.repair, rounds, success: !!finalResult.success, successfulFixes, fastRepair: fastRepairRounds }
             : null,
     };
 }
@@ -702,8 +993,9 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // 4. Target + credentials. targetBaseUrl is the loop's connection context;
     //    cross-env host rewrite (recorded host -> target) IS applied in generate
     //    via rewriteHost when runCfg.hostRewrite is set (auto-derived above).
-    const targetBaseUrl = (runCfg.targetBaseUrlOverride || '').trim() || deriveBaseUrl(gen.flat);
+    const targetBaseUrl = (enrichedRunCfg.targetBaseUrlOverride || '').trim() || deriveBaseUrl(gen.flat);
     if (!targetBaseUrl) return { ok: false, error: 'No target base URL could be determined (set run.targetBaseUrlOverride).' };
+    enrichedRunCfg.targetBaseUrl = targetBaseUrl;
     const credentials = (runCfg.credentials && runCfg.credentials.username) ? runCfg.credentials : undefined;
 
     onLog(`target=${targetBaseUrl} · credentials=${credentials ? 'yes' : 'no'} · jmeter=${jmeterBinPath} · maxIter=${maxIterations}`);
@@ -756,10 +1048,52 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     } catch (e) { onLog(`java-safe guard skipped: ${e.message}`); }
 
     const guardXml = fs.readFileSync(gen.jmxPath, 'utf8');
-    const strictGuard = businessGuard.buildBusinessGuard({ xml: guardXml, flowName: name, runCfg: enrichedRunCfg });
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries: gen.flat,
+        protectedCalls: enrichedRunCfg.protectedCalls,
+    });
+    const strictGuard = businessGuard.buildBusinessGuard({
+        xml: guardXml,
+        flowName: name,
+        runCfg: enrichedRunCfg,
+        valueFlowDecisions: valueFlow,
+    });
     const blockedDisables = [];
     if (strictGuard.enabled) {
         onLog(`strict business guard: protecting ${strictGuard.protectedSamplers.length} sampler(s) from disable`);
+    }
+
+    const blueprintCtx = blueprintContext.createBlueprintContext({
+        entries,
+        secondaryEntries: genOpts.secondaryEntries || [],
+        pages,
+        mode: 'run',
+        outDir,
+        name,
+        runCfg: enrichedRunCfg,
+        agentCfg: agent,
+    });
+    blueprintCtx.validation.businessGuard = {
+        enabled: strictGuard.enabled,
+        protectedSamplers: strictGuard.protectedSamplers,
+    };
+    blueprintCtx.seniorPe = gen.seniorPeDebrief || null;
+    blueprintCtx.lineage.disableDecisions = valueFlow;
+    let blueprintEvidence = null;
+    if (agent.enabled) {
+        try {
+            await blueprintAgent.runBlueprintPreflight({
+                ctx: blueprintCtx,
+                entries: gen.flat,
+                runCfg: enrichedRunCfg,
+                onLog,
+            });
+            blueprintEvidence = summarizeBlueprintEvidence(blueprintCtx);
+        } catch (e) {
+            onLog(`blueprint preflight skipped after error: ${e.message}`);
+            blueprintCtx.loop.attempts.push({ phase: 'replay-preflight', error: e.message });
+            blueprintEvidence = summarizeBlueprintEvidence(blueprintCtx);
+        }
     }
 
     // Run the engine loop, but guard against its parseJtl STALLING on a large
@@ -799,20 +1133,84 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     } else if (strictGuard.enabled) {
         onLog(`strict business guard: ${verified.evaluation.reason}`);
     }
+    applyStatusRootCauseToResult(finalResult, gen.flat);
+    if (finalResult.statusRootCause) {
+        blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
+        onLog(`status root cause: ${finalResult.statusRootCause.summary}`);
+    }
+    refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+    blueprintEvidence = summarizeBlueprintEvidence(blueprintCtx);
     let llmPatch = null;
     if (!finalResult.success) {
+        if (agent.enabled && targetBaseUrl) {
+            try {
+                const failingResponses = await responseEvidence.collectFailingResponseEvidence({
+                    entries: gen.flat,
+                    failures: collectLlmFailures(finalResult),
+                    targetBaseUrl,
+                    insecure: !!(enrichedRunCfg.fastReplay && enrichedRunCfg.fastReplay.insecure),
+                    timeoutMs: enrichedRunCfg.fastReplay && enrichedRunCfg.fastReplay.timeoutMs,
+                });
+                if (failingResponses.length) {
+                    blueprintCtx.validation.failingResponses = failingResponses;
+                    blueprintEvidence = { ...summarizeBlueprintEvidence(blueprintCtx), failingResponses };
+                    onLog(`blueprint evidence: captured ${failingResponses.length} failing response body excerpt(s)`);
+                }
+            } catch (e) {
+                onLog(`blueprint failing-response evidence skipped: ${e.message}`);
+            }
+        }
         const flowNotes = Array.isArray(enrichedRunCfg.llmFlowNotes) ? enrichedRunCfg.llmFlowNotes : [];
         const llm = await runLlmPatchRounds({
-            result: finalResult, jmxPath: finalJmxPath, config, gen, outDir, name, onLog, agentCfg: agent, learningCfg: learning, guard: strictGuard, flowNotes,
+            result: finalResult, jmxPath: finalJmxPath, config, gen, outDir, name, onLog, agentCfg: agent, learningCfg: learning, guard: strictGuard, flowNotes, blueprintEvidence, blueprintCtx,
         });
         finalJmxPath = llm.jmxPath;
         recoverSamplesFromJtl(llm.result, stableJtl, outDir, onLog);
         verified = applyBusinessVerification(llm.result, finalJmxPath, strictGuard, blockedDisables);
         finalResult = verified.result;
+        applyStatusRootCauseToResult(finalResult, gen.flat);
+        if (finalResult.statusRootCause) {
+            blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
+        }
         if (!verified.evaluation.ok) {
             onLog(`strict business guard after AI escalation: NOT GREEN — ${verified.evaluation.reason}`);
         }
         llmPatch = llm.llmPatch;
+    }
+
+    if (blueprintCtx) {
+        refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+        blueprintCtx.ai.promptEvidence = blueprintEvidence;
+        blueprintContext.writeBlueprintArtifacts(blueprintCtx);
+    }
+
+    // 5b. Baseline-vs-test diff: status / body length / JSON shape per sampler.
+    //     Run before learning so false-green drift never becomes a verified lesson.
+    let baselineDiff = null;
+    try {
+        baselineDiff = diffRunAgainstRecording({ outDir, flatEntries: gen.flat });
+        if (baselineDiff.drift.length) {
+            fs.writeFileSync(path.join(outDir, `${name}_baseline_diff.json`), JSON.stringify(baselineDiff, null, 2));
+            onLog(`baseline drift detected on ${baselineDiff.drift.length}/${baselineDiff.samplesCompared} sampler(s) — see _baseline_diff.json`);
+        } else if (baselineDiff.samplesCompared > 0) {
+            onLog(`baseline diff clean (${baselineDiff.samplesCompared} sampler(s) match recording)`);
+        }
+    } catch (e) { onLog(`baseline diff skipped: ${e.message}`); }
+
+    const finalGate = finalGreenGate.evaluateFinalGreenGate({
+        result: finalResult,
+        baselineDiff,
+        semanticDiff: finalResult.semanticDiff || null,
+        businessVerification: finalResult.businessVerification || null,
+    });
+    finalResult.finalGreenGate = finalGate;
+    fs.writeFileSync(path.join(outDir, `${name}_final_green_gate.json`), JSON.stringify(finalGate, null, 2));
+    if (!finalGate.ok) {
+        finalResult.success = false;
+        finalResult.finalGreenFailure = true;
+        onLog(`final green gate: NOT GREEN — ${finalGate.reason}`);
+    } else {
+        onLog('final green gate: GREEN');
     }
 
     let learnedLessons = null;
@@ -835,20 +1233,6 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         }
     }
 
-    // 5b. Baseline-vs-test diff: status / body length / JSON shape per sampler.
-    //     Run this after optional LLM rounds so artifacts describe the final
-    //     verification attempt, not an earlier pre-patch JTL.
-    let baselineDiff = null;
-    try {
-        baselineDiff = diffRunAgainstRecording({ outDir, flatEntries: gen.flat });
-        if (baselineDiff.drift.length) {
-            fs.writeFileSync(path.join(outDir, `${name}_baseline_diff.json`), JSON.stringify(baselineDiff, null, 2));
-            onLog(`baseline drift detected on ${baselineDiff.drift.length}/${baselineDiff.samplesCompared} sampler(s) — see _baseline_diff.json`);
-        } else if (baselineDiff.samplesCompared > 0) {
-            onLog(`baseline diff clean (${baselineDiff.samplesCompared} sampler(s) match recording)`);
-        }
-    } catch (e) { onLog(`baseline diff skipped: ${e.message}`); }
-
     // 5c. JMeter HTML dashboard. Best-effort; uses the stable JTL when present
     //     (SimpleDataWriter), otherwise the last iteration's JTL.
     try {
@@ -862,7 +1246,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
 
     return {
         ok: true, result: finalResult, jmxPath: finalJmxPath,
-        stats: gen.stats, baselineDiff,
+        stats: gen.stats, baselineDiff, finalGreenGate: finalResult.finalGreenGate || null,
         memoryMatches: llmPatch && llmPatch.memory ? llmPatch.memory.matches || [] : [],
         learnedLessons,
         // Surface the generator's deeper artifacts for the HTML report so
@@ -891,7 +1275,11 @@ module.exports = {
         filterProtectedPatchDisables,
         applyBusinessVerification,
         recoverSamplesFromJtl,
+        applyStatusRootCauseToResult,
+        refreshBlueprintFirstFailure,
         applyJavaSafeGuard,
+        tryVerifiedCorrelationRepairRound,
+        summarizeBlueprintEvidence,
         buildGeminiFixPrompt,
         normalizeGeminiFixes,
         extractRelevantJmxSnippets,

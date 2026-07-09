@@ -49,6 +49,8 @@
   "run": {
     "_comment": "Phase 2 (--run against a live target).",
     "targetBaseUrlOverride": "",
+    "_testObjective_comment": "Required for senior PE judgment. Examples: single-scenario certification, stress/capacity, soak/endurance, search/cache-behavior, spike. If blank, the agent assumes mixed-load capacity and reports that assumption.",
+    "testObjective": "",
     "credentials": { "username": "", "password": "" },
     "dataFiles": [],
 
@@ -57,6 +59,18 @@
 
     "_oauth_comment": "dropBareStateNonce: opt-in per flow. When true, bare state/nonce correlations are removed and the recorded literals stay in /authorize. Leave false for standard OAuth flows that need fresh state threaded.",
     "oauth": { "dropBareStateNonce": false },
+
+    "_allowJsr223_comment": "Default false. Leave JSR223/Groovy helpers stripped for Java-safe JMXs. Set true only when you deliberately need generated Groovy helpers and have a compatible JMeter/Java runtime.",
+    "allowJsr223": false,
+
+    "_protectedCalls_comment": "Optional business-critical samplers matched by testname/path substring. Protected calls must execute and cannot be disabled by repair.",
+    "protectedCalls": [],
+
+    "_parameterization_comment": "Optional guardrails for test-data parameterization. Exclude protocol/auth/session/signature fields from CSV data; include only stable user/business data.",
+    "parameterization": {
+      "includeNames": [],
+      "excludeNames": ["csrf", "xsrf", "token", "session", "authorization", "signature", "hmac", "state", "nonce", "code"]
+    },
 
     "_llmFlowNotes_comment": "Flow-specific guidance appended to the AI escalation prompt (which endpoints are plumbing for THIS app, etc). Keep app names/paths here, not in code.",
     "llmFlowNotes": [],

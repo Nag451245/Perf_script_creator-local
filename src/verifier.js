@@ -54,6 +54,7 @@ function findLastJtl(outDir) {
  * @returns {{ jtlPath:string|null, samplesCompared:number, drift:Array }}
  */
 function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_LENGTH_DRIFT_PCT }) {
+    const statusAnalysis = require('./status-analysis');
     const jtlPath = findLastJtl(outDir);
     if (!jtlPath) return { jtlPath: null, samplesCompared: 0, drift: [] };
 
@@ -80,7 +81,17 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
         const jBodyLen = Number(j.response?.content?.size || (j.response?.content?.text || '').length || 0);
         const jShape = safeJsonShape(j.response?.content?.text || '');
         const issues = [];
-        if (r.status && jStatus && r.status !== jStatus) issues.push({ kind: 'statusDiff', recorded: r.status, observed: jStatus });
+        if (r.status && jStatus && r.status !== jStatus) {
+            const status = statusAnalysis.classifyStatusTransition(r.status, jStatus);
+            issues.push({
+                kind: 'statusDiff',
+                recorded: r.status,
+                observed: jStatus,
+                category: status.category,
+                relevance: status.relevance,
+                repairHint: status.repairHint,
+            });
+        }
         if (r.bodyLen > 0 && jBodyLen > 0) {
             const pct = Math.abs(jBodyLen - r.bodyLen) / r.bodyLen * 100;
             if (pct > thresholdPct) issues.push({ kind: 'lengthDriftPct', pct: Math.round(pct), recorded: r.bodyLen, observed: jBodyLen });
@@ -88,7 +99,16 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
         if (r.shape && jShape && r.shape !== jShape) issues.push({ kind: 'shapeDiff', recorded: r.shape, observed: jShape });
         if (issues.length) drift.push({ index: i, sampler: `${r.method} ${r.url}`, issues });
     }
-    return { jtlPath, samplesCompared: compareLen, drift };
+    const rootCause = statusAnalysis.traceStatusRootCause({
+        entries: flatEntries,
+        samples: jtlEntries.map((j, i) => ({
+            label: j.label || j.name || (flatEntries[i] ? `${recBy[i].method} ${recBy[i].url}` : ''),
+            code: j.response && j.response.status,
+            success: Number(j.response && j.response.status || 0) < 400,
+            isTransaction: false,
+        })),
+    });
+    return { jtlPath, samplesCompared: compareLen, drift, rootCause };
 }
 
 /**

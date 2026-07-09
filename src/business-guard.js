@@ -7,7 +7,7 @@ const REDIRECT_PLUMBING_PATH = /\/(?:s\/interceptor|interceptor|authorize\/resum
 const AUTH_OR_SESSION_PATH = /\/(?:u\/login|user\/login|jwt\/v2\/create-cookie|authorization|user\/iam\/save|scheduler\/index\/data)/i;
 const MUTATING_METHOD = /^(POST|PUT|PATCH|DELETE)$/i;
 
-function buildBusinessGuard({ xml, flowName = '', runCfg = {} } = {}) {
+function buildBusinessGuard({ xml, flowName = '', runCfg = {}, valueFlowDecisions = null } = {}) {
     const samplers = indexSamplers(xml || '');
     const goalTerms = goalTermsFor(flowName, runCfg);
     // Operator override: anything explicitly listed in run.disableCalls was
@@ -15,13 +15,13 @@ function buildBusinessGuard({ xml, flowName = '', runCfg = {} } = {}) {
     // protect it, or an intentional disable fails the whole verdict.
     const operatorDisables = Array.isArray(runCfg.disableCalls) ? runCfg.disableCalls.filter(Boolean) : [];
     const protectedSamplers = samplers
-        .filter(s => isProtectedSampler(s, goalTerms, runCfg) && !matchesAnyConfigured(s, operatorDisables))
+        .filter(s => isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions) && !matchesAnyConfigured(s, operatorDisables))
         .map(s => ({
             name: s.name,
             method: s.method,
             path: s.path,
             domain: s.domain,
-            reason: protectionReason(s, goalTerms),
+            reason: protectionReason(s, goalTerms, valueFlowDecisionFor(s, valueFlowDecisions)),
         }));
     const protectedNames = new Set(protectedSamplers.map(s => s.name));
     return { enabled: runCfg.strictBusiness !== false, goalTerms, protectedSamplers, protectedNames };
@@ -115,12 +115,15 @@ function indexSamplers(xml) {
     return samplers;
 }
 
-function isProtectedSampler(s, goalTerms, runCfg) {
+function isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions = null) {
     if (!s || !s.name) return false;
     const hay = `${s.name} ${s.domain} ${s.path} ${s.body}`;
     if (THIRD_PARTY_NOISE.test(hay) || NOISE_PATH.test(s.path || '')) return false;
     if (REDIRECT_PLUMBING_PATH.test(s.path || '')) return false;
     if (matchesAnyConfigured(s, runCfg.protectedCalls)) return true;
+    const valueFlow = valueFlowDecisionFor(s, valueFlowDecisions);
+    if (valueFlow && valueFlow.consumedOutputCount > 0) return true;
+    if (valueFlow && valueFlow.consumedOutputCount === 0 && !MUTATING_METHOD.test(s.method || '')) return false;
     if (goalTerms.length && goalTerms.every(term => hay.toLowerCase().includes(term))) return true;
     if (/\bcreate\b|\/tasks\b|task/i.test(hay) && MUTATING_METHOD.test(s.method || '')) return true;
     if (/GraphQL mutation/i.test(s.name) && /(create|task|login|authenticate|verify)/i.test(hay)) return true;
@@ -129,14 +132,20 @@ function isProtectedSampler(s, goalTerms, runCfg) {
     return false;
 }
 
-function protectionReason(s, goalTerms) {
+function protectionReason(s, goalTerms, valueFlow = null) {
     const hay = `${s.name} ${s.path}`.toLowerCase();
+    if (valueFlow && valueFlow.consumedOutputCount > 0) return 'downstream value-flow producer';
     if (goalTerms.length && goalTerms.every(term => hay.includes(term))) return 'matches business goal';
     if (/\bcreate\b|\/tasks\b|task/i.test(hay)) return 'task/create business endpoint';
     if (/GraphQL mutation/i.test(s.name || '')) return 'GraphQL mutation';
     if (AUTH_OR_SESSION_PATH.test(s.path || '')) return 'auth/session producer';
     if (MUTATING_METHOD.test(s.method || '')) return 'first-party mutating request';
     return 'business-critical';
+}
+
+function valueFlowDecisionFor(s, valueFlowDecisions) {
+    if (!s || !valueFlowDecisions) return null;
+    return valueFlowDecisions.bySampler && valueFlowDecisions.bySampler[s.name] || null;
 }
 
 function goalTermsFor(flowName, runCfg) {
@@ -196,5 +205,5 @@ module.exports = {
     buildBusinessGuard,
     filterProtectedDisables,
     evaluateBusinessResult,
-    _internal: { indexSamplers, goalTermsFor, isProtectedSampler },
+    _internal: { indexSamplers, goalTermsFor, isProtectedSampler, valueFlowDecisionFor },
 };

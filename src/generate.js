@@ -28,8 +28,11 @@ const { synthesizeCsv } = E.dataSynth;
 const { detectClientSideDynamic } = E.clientSide;
 const { knownDefinedVars, planExtractor, injectAfterSampler } = require('./extractors');
 const { correlateBodyDynamics } = require('./auto-correlate');
+const { propagateGraphqlCsrfTokens } = require('./graphql-auth-repair');
 const { rewriteHost } = require('./host-rewrite');
 const { sanitizeJavaUnsafeJmx } = require('./java-safe');
+const volatileProtocol = require('./volatile-protocol');
+const seniorPe = require('./senior-pe');
 const {
     wrapPollingInWhileController,
     injectGhostSynthesizers,
@@ -199,8 +202,20 @@ const DEFAULT_DISABLE_PATTERNS = [
     '/v2/logout',
 ];
 
-function filterParameterCandidates(candidates) {
-    return (candidates || []).filter(c => !isGraphqlOperationDocument(c));
+function filterParameterCandidates(candidates, policy = {}) {
+    const include = toLowerList(policy.includeNames);
+    const exclude = toLowerList(policy.excludeNames);
+    return (candidates || []).filter(c => {
+        if (isGraphqlOperationDocument(c)) return false;
+        const name = String(c.name || '').toLowerCase();
+        if (include.length && !include.some(term => name.includes(term))) return false;
+        if (exclude.length && exclude.some(term => name.includes(term))) return false;
+        return true;
+    });
+}
+
+function toLowerList(values) {
+    return Array.isArray(values) ? values.map(v => String(v || '').toLowerCase()).filter(Boolean) : [];
 }
 
 function isGraphqlOperationDocument(candidate) {
@@ -211,17 +226,11 @@ function isGraphqlOperationDocument(candidate) {
 }
 
 function filterBareOauthStateNonceCorrelations(corrs, entries) {
-    const kept = [];
-    const removed = [];
-    for (const c of corrs || []) {
-        const name = String(c.variableName || c.name || '').toLowerCase();
-        if (name === 'state' || name === 'nonce') {
-            removed.push(c);
-        } else {
-            kept.push(c);
-        }
-    }
-    return { kept, removed };
+    return volatileProtocol.filterVolatileProtocolCorrelations(corrs, entries);
+}
+
+function observedVolatileAuthProtocolNames(entries) {
+    return volatileProtocol.observedVolatileProtocolNames(entries);
 }
 
 function generate(entriesRaw, pages, outDir, name, opts = {}) {
@@ -246,18 +255,16 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // 2. Correlate + relevance gate.
     const rawCorrs = new CorrelationEngine().detectCorrelations(flat);
     let { kept: corrs } = filterForGeneration(rawCorrs);
-    // Dropping bare state/nonce correlations is a per-flow judgment call, not a
-    // universal rule: on standard OAuth flows the state MUST be threaded fresh
-    // or every /authorize replay carries a stale value. Opt in per flow via
-    // run.oauth.dropBareStateNonce in perfscript.config.json.
-    if (runCfg.oauth && runCfg.oauth.dropBareStateNonce) {
-        const oauthStatic = filterBareOauthStateNonceCorrelations(corrs, flat);
-        corrs = oauthStatic.kept;
-        if (oauthStatic.removed.length) note('oauth-static',
-            `${oauthStatic.removed.length} bare OAuth state/nonce correlation(s) removed`,
-            `run.oauth.dropBareStateNonce: this flow does not require correlating bare state/nonce`,
-            `left recorded state/nonce values unchanged in /authorize`);
-    }
+    const oauthStatic = filterBareOauthStateNonceCorrelations(corrs, flat);
+    corrs = oauthStatic.kept;
+    const volatileNames = new Set([
+        ...oauthStatic.removed.map(c => String(c.variableName || c.name || '').toLowerCase()),
+        ...observedVolatileAuthProtocolNames(flat),
+    ]);
+    if (volatileNames.size) note('oauth-volatile-ignore',
+        `${volatileNames.size} volatile OAuth/protocol field name(s) identified: ${[...volatileNames].join(', ')}`,
+        `state/nonce/code-style values in auth protocol context are single-use or client-minted protocol plumbing`,
+        `left them out of correlation planning so deterministic repair and AI do not fight stale protocol values`);
     uniquifyVariableNames(corrs); // disambiguate name collisions (state x7, nonce x3, id x9)
     placementFixer.fix(corrs, flat);
 
@@ -287,7 +294,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // 4. Parameterization + unique data (state-pollution defense). Discover
     //    user-input fields, synthesize a multi-row pool, wire one CSV Data Set.
     const rawCandidates = suggestParameterizations(flat) || [];
-    const candidates = filterParameterCandidates(rawCandidates);
+    const candidates = filterParameterCandidates(rawCandidates, runCfg.parameterization || {});
     const skippedParameterCandidates = rawCandidates.length - candidates.length;
     if (skippedParameterCandidates > 0) {
         note('parameterization',
@@ -532,11 +539,19 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         } catch (e) { note('body-correlation', 'skipped (non-fatal)', e.message); }
     }
 
+    const gqlCsrf = propagateGraphqlCsrfTokens(xml);
+    xml = gqlCsrf.xml;
+    if (gqlCsrf.substitutions) note('graphql-auth-csrf',
+        `${gqlCsrf.substitutions} downstream GraphQL X-CSRF-TOKEN header(s) rewired`,
+        `preceding GraphQL auth/session sampler(s) select csrfToken in the response`,
+        `emitted ${gqlCsrf.extractors} JSON extractor(s) and propagated the freshest csrfToken variable`);
+
     // Final hard safety gate for manual JMeter use. JMeter 5.6.3 bundles Groovy
     // 3.0.x, which cannot compile JSR223 scripts under Java 25
     // (Unsupported class file major version 69). The generated .jmx must be
     // runnable when a user opens it directly in JMeter, not only through --run.
-    const javaSafe = sanitizeJavaUnsafeJmx(xml);
+    const allowJsr223 = runCfg.allowJsr223 === true;
+    const javaSafe = allowJsr223 ? { changed: false, removed: [] } : sanitizeJavaUnsafeJmx(xml);
     if (javaSafe.changed) {
         xml = javaSafe.xml;
         fs.writeFileSync(
@@ -547,6 +562,11 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             javaSafe.removed.length + ' Groovy JSR223 pre/post processor(s) stripped from generated JMX',
             'JMeter 5.6.3 Groovy fails under Java 25 (class major 69)',
             'shipped ' + name + '.jmx without JSR223 so users can run it manually');
+    } else if (allowJsr223) {
+        note('java-safe',
+            'JSR223 Java-safe stripping disabled by run.allowJsr223=true',
+            'operator explicitly allowed Groovy helpers in generated JMX',
+            'left JSR223 blocks intact; validate with a compatible JMeter/Java runtime');
     }
 
     // Re-validate after our edits so reported stats reflect what we ship.
@@ -554,6 +574,26 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
 
     const jmxPath = path.join(outDir, `${name}.jmx`);
     fs.writeFileSync(jmxPath, xml);
+
+    const seniorPeDebrief = seniorPe.buildSeniorPeDebrief({
+        name,
+        entries: flat,
+        pages,
+        runCfg,
+        correlations: corrs,
+        parameterCandidates: candidates,
+        ghosts,
+        polling,
+        plannedExtractors,
+        stats: {
+            correlations: corrs.length,
+            parameterized: params.length,
+            nativeExtractorsPlanned: plannedExtractors.length,
+            pacingTimers: pacingInj.injected,
+        },
+    });
+    fs.writeFileSync(path.join(outDir, `${name}_senior_pe_debrief.json`), JSON.stringify(seniorPeDebrief, null, 2));
+    fs.writeFileSync(path.join(outDir, `${name}_senior_pe_debrief.md`), seniorPe.renderSeniorPeDebriefMarkdown(seniorPeDebrief));
 
     if (reasoning.length) {
         fs.writeFileSync(path.join(outDir, `${name}_reasoning.json`), JSON.stringify(reasoning, null, 2));
@@ -565,13 +605,15 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
                 whileControllers: wc.wrapped, assertions: assertInj.injected, pacing: pacingInj.injected,
                 nativeExtractors: plannedExtractors.length, falseOrphansFiltered: filteredOut,
                 skippedParameterCandidates,
+                jsr223Stripped: javaSafe.removed.length,
+                allowJsr223,
             },
         }));
     }
 
     return {
         jmxPath, flat, csvFile, candidates, ghosts, polling, correlations: corrs,
-        plannedExtractors, reasoning, dualHarHints, loadProfile: loadProfileApplied,
+        plannedExtractors, reasoning, dualHarHints, loadProfile: loadProfileApplied, seniorPeDebrief,
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
             correlations: corrs.length, parameterized: params.length,
@@ -584,9 +626,12 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             whileControllers: wc.wrapped,
             ghostSynthesizers: ghostInj.injected,
             ghostsRefused: ghostInj.refused.length,
+            jsr223Stripped: javaSafe.removed.length,
+            allowJsr223,
             assertions: assertInj.injected,
             pacingTimers: pacingInj.injected,
             bodyCorrelations: bodyCorrelated,
+            graphqlCsrfHeaderRepairs: gqlCsrf.substitutions,
             formCorrelations: formCorr.wired.length,
             loadProfile: loadProfileApplied,
         },
@@ -652,4 +697,4 @@ function lookupValueForVar(flat, varName, params) {
     return '';
 }
 
-module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations } };
+module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates } };

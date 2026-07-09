@@ -102,6 +102,11 @@ Output per input file lands in `output/<name>/`:
   mode is enabled
 - `<name>_java_safe_generate.json` — Groovy JSR223 blocks stripped from the
   shipped `.jmx` so manual JMeter runs work under Java 22+/25
+- `<name>_final_green_gate.json` — final verdict requiring JMeter success,
+  recording comparison, semantic checks when available, and business guard pass
+- `<name>_senior_pe_debrief.json` / `.md` — senior performance-engineering
+  objective, flow narrative, value ledger, native-manager audit, validity gates,
+  coverage estimate, and negative-space gaps
 - `<name>_memory_matches.json` / `_memory_patches.json` — verified lessons the
   agent tried before AI escalation, plus what the schema-gated patcher applied
 - `<name>_learned_lessons.json` — redacted lessons saved only after green
@@ -142,6 +147,17 @@ to set things without command-line flags:
 - `run.targetBaseUrlOverride` / `run.credentials` / `run.dataFiles` — used by
   `--run` (credentials become `-JUSERNAME`/`-JPASSWORD`; data files are staged
   next to the JMX)
+- `run.testObjective` — senior PE workload objective. Examples:
+  `single-scenario certification`, `stress/capacity`, `soak/endurance`,
+  `search/cache-behavior`, `spike`. If blank, the agent assumes mixed-load
+  capacity and reports the assumption.
+- `run.allowJsr223` — default `false`; keep generated JMX Java-safe by stripping
+  Groovy helpers. Set `true` only when you intentionally need JSR223 and have a
+  compatible JMeter/Java runtime.
+- `run.protectedCalls` / `run.disableCalls` — per-flow business samplers to
+  protect or intentional noise/plumbing to disable.
+- `run.parameterization.includeNames` / `excludeNames` — optional guardrails so
+  CSV data is limited to business/user data, not auth/session/protocol values.
 
 Secrets can equivalently come from the environment (see `.env.example`).
 

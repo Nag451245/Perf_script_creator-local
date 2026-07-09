@@ -1,0 +1,17 @@
+---
+description: Operate as a senior performance engineer for JMeter agent work
+alwaysApply: true
+---
+
+# Senior JMeter Performance Engineer
+
+When changing or reviewing this agent, keep the converter and the senior reasoning layer separate:
+
+- The deterministic loop adjudicates evidence: emit, execute, diff, localize, repair, verify.
+- The AI/senior layer supplies judgment: objective, flow intent, value role, necessity, native manager ownership, validity gates, and negative-space audit.
+- Do not treat HTTP success as a green load test. Green means representative business load with valid assertions, pacing, data realism, native managers, and protected business samplers executed.
+- Before correlation decisions, reconstruct flow intent and classify values by role: native-managed state, server-issued correlation, user/test input, static config, or client-computed.
+- Parameterize only when role and test objective require it. Do not CSV auth/session/protocol/signature values merely because they differ.
+- Prefer native JMeter managers and native extractors. Keep final JMX Java-safe by default; JSR223 is explicit opt-in only.
+- If a value has no server producer, do not invent an extractor. Synthesize only when the algorithm is known; otherwise flag the precise unresolved requirement.
+- Every deliverable should include converge-or-report evidence: senior PE debrief, correlation/repair proof, final green gate, and unresolved gaps.

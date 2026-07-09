@@ -22,6 +22,7 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 const { safeJsonShape } = require('./verifier')._internal;
+const semanticResponse = require('./semantic-response');
 
 const DEFAULT_TIMEOUT_MS = 30000;
 
@@ -108,8 +109,10 @@ function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs 
         if (pd && typeof pd.text === 'string') body = substituteVars(pd.text, vars);
 
         const start = Date.now();
+        const method = (entry.request.method || 'GET').toUpperCase();
+        const observedRequest = { method, url: u.toString(), headers: { ...headers }, body: body || '' };
         const req = pickClient(u).request({
-            method: (entry.request.method || 'GET').toUpperCase(),
+            method,
             protocol: u.protocol, hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
             path: u.pathname + u.search, headers,
             rejectUnauthorized: !insecure,
@@ -125,6 +128,7 @@ function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs 
                     headers: res.headers,
                     body: buf.toString('utf8'),
                     durationMs: Date.now() - start,
+                    request: observedRequest,
                 });
             });
         });
@@ -167,6 +171,21 @@ async function replayAll({ entries, vars = {}, targetBaseUrl = null, insecure = 
                 if (pct > 30) issues.push({ kind: 'lengthDriftPct', pct: Math.round(pct), recorded: recBody.length, observed: r.body.length });
             }
             if (recShape && obsShape && recShape !== obsShape) issues.push({ kind: 'shapeDiff', recorded: recShape, observed: obsShape });
+            const semantic = semanticResponse.compareRecordedLiveResponse({
+                recorded: {
+                    status: recStatus,
+                    body: recBody,
+                    contentType: contentTypeFromHar(e.response && e.response.headers),
+                },
+                observed: {
+                    status: r.status,
+                    body: r.body,
+                    headers: r.headers || {},
+                },
+                sampler: `${e.request.method} ${e.request.url}`,
+                index: i,
+            });
+            for (const issue of semantic.issues) issues.push({ ...issue, kind: issue.kind || 'semanticDiff' });
             samples.push({ index: i, url: e.request.url, status: r.status, durationMs: r.durationMs, success: r.status > 0 && r.status < 400 && issues.length === 0 });
             if (issues.length) drift.push({ index: i, sampler: `${e.request.method} ${e.request.url}`, issues });
         } catch (err) {
@@ -179,4 +198,9 @@ async function replayAll({ entries, vars = {}, targetBaseUrl = null, insecure = 
     return { ok, samples, drift, errors, durationMs: Date.now() - start };
 }
 
-module.exports = { replayAll, replayOne, _internal: { substituteVars, joinCookies, rememberSetCookie, cookieDomainMatches } };
+function contentTypeFromHar(headers = []) {
+    const h = (headers || []).find(item => /^content-type$/i.test(String(item.name || '')));
+    return h ? String(h.value || '') : '';
+}
+
+module.exports = { replayAll, replayOne, _internal: { substituteVars, joinCookies, rememberSetCookie, cookieDomainMatches, contentTypeFromHar } };

@@ -36,7 +36,21 @@ const { diffRunAgainstRecording, summarizeJtlFast, _internal: verifierInternal }
 const { replayAll, _internal: replayInternal } = require('../src/fast-replay');
 const { correlateAndReplay } = require('../src/replay-correlate');
 const { applyLlmPatches, validateLlmPatches } = require('../src/llm-patcher');
+const { propagateGraphqlCsrfTokens } = require('../src/graphql-auth-repair');
+const correlationHypotheses = require('../src/correlation-hypotheses');
 const { writeHtmlReport: writeHtmlReportFn } = require('../src/report');
+const volatileProtocol = require('../src/volatile-protocol');
+const blueprintContext = require('../src/blueprint-context');
+const failureClassifier = require('../src/failure-classifier');
+const blueprintAgent = require('../src/blueprint-agent');
+const valueFlowDecisions = require('../src/value-flow-decisions');
+const responseEvidence = require('../src/response-evidence');
+const fastRepairLoop = require('../src/fast-repair-loop');
+const statusAnalysis = require('../src/status-analysis');
+const semanticResponse = require('../src/semantic-response');
+const finalGreenGate = require('../src/final-green-gate');
+const requestDiff = require('../src/request-diff');
+const seniorPe = require('../src/senior-pe');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
 function listenLocal(server) {
@@ -732,6 +746,112 @@ test('generate: GraphQL query text is not parameterized as test data', () => {
     }
 });
 
+test('parameterization policy: excludes protocol/auth/session fields from CSV candidates', () => {
+    const candidates = generateInternal.filterParameterCandidates([
+        { name: 'username', value: 'user@example.com' },
+        { name: 'csrfToken', value: 'csrfRecorded123' },
+        { name: 'sessionId', value: 'sessRecorded123' },
+        { name: 'query', value: 'query GetMe { me { id } }' },
+    ], {
+        excludeNames: ['csrf', 'session', 'token'],
+    });
+
+    assert.deepStrictEqual(candidates.map(c => c.name), ['username']);
+});
+
+test('senior PE debrief: reconstructs objective, flow, value ledger, native managers, and negative space', () => {
+    const entries = [
+        entry('GET', 'https://app.test/login', {
+            status: 200,
+            body: '<html><input name="csrf" value="csrfRecorded1234"></html>',
+        }),
+        entry('POST', 'https://app.test/login', {
+            reqHeaders: [{ name: 'Content-Type', value: 'application/x-www-form-urlencoded' }],
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'username=alice&csrf=csrfRecorded1234' },
+            status: 302,
+        }),
+        entry('GET', 'https://app.test/search?q=laptop&page=1', {
+            reqHeaders: [{ name: 'If-None-Match', value: 'etagRecorded1234' }],
+            status: 200,
+            body: '{"results":[{"id":"r1"}]}',
+        }),
+    ];
+    const debrief = seniorPe.buildSeniorPeDebrief({
+        name: 'flow',
+        entries,
+        runCfg: {},
+        correlations: [{ variableName: 'csrf', value: 'csrfRecorded1234', sourceRequestIndex: 0, targetRequestIndex: 1 }],
+        parameterCandidates: [{ name: 'username', value: 'alice' }, { name: 'q', value: 'laptop' }],
+        ghosts: [{ name: 'x-request-id', kind: 'X_REQUEST_ID', sampleValue: 'reqRecorded1234' }],
+        polling: [{ endpoint: 'GET /api/status', count: 3 }],
+    });
+
+    assert.strictEqual(debrief.objective.assumed, true);
+    assert.match(debrief.flow.narrative, /authenticate/i);
+    assert.ok(debrief.flow.samplerMap.length >= 3);
+    assert.ok(debrief.nativeManagers.some(m => m.manager === 'HTTP Cache Manager'));
+    assert.ok(debrief.valueLedger.some(v => v.role === 'server_generated_echoed_by_client' && v.decision === 'correlate'));
+    assert.ok(debrief.valueLedger.some(v => v.role === 'user_test_input' && /objective/i.test(v.necessityRationale)));
+    assert.ok(debrief.negativeSpace.some(g => /token expiry/i.test(g.gap)));
+});
+
+test('generate: writes senior PE debrief artifacts for reviewer and AI context', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/login', { body: '<html><input name="csrf" value="csrfRecorded1234"></html>' }),
+        entry('POST', 'https://app.test/login', {
+            reqHeaders: [{ name: 'Content-Type', value: 'application/x-www-form-urlencoded' }],
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'username=alice&csrf=csrfRecorded1234' },
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'senior', {
+        runCfg: { testObjective: 'single-scenario certification' },
+    });
+
+    assert.ok(gen.seniorPeDebrief);
+    assert.ok(fs.existsSync(path.join(out, 'senior_senior_pe_debrief.json')));
+    assert.ok(fs.existsSync(path.join(out, 'senior_senior_pe_debrief.md')));
+    assert.strictEqual(gen.seniorPeDebrief.objective.assumed, false);
+});
+
+test('GraphQL auth repair: latest csrfToken producer feeds downstream X-CSRF-TOKEN headers', () => {
+    const gql = (name, query, headerValue = null) => `
+      <HTTPSamplerProxy testname="GraphQL ${name}">
+        <stringProp name="HTTPSampler.path">/graphql</stringProp>
+        <stringProp name="GraphQLHTTPSampler.operationName">${name}</stringProp>
+        <stringProp name="GraphQLHTTPSampler.query">${query}</stringProp>
+      </HTTPSamplerProxy>
+      <hashTree>
+        <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="HTTP Header Manager">
+          <collectionProp name="HeaderManager.headers">
+            ${headerValue ? `<elementProp name="X-CSRF-TOKEN" elementType="Header">
+              <stringProp name="Header.name">X-CSRF-TOKEN</stringProp>
+              <stringProp name="Header.value">${headerValue}</stringProp>
+            </elementProp>` : ''}
+          </collectionProp>
+        </HeaderManager>
+        <hashTree/>
+      </hashTree>`;
+    const jmx = `<jmeterTestPlan><hashTree>
+      ${gql('SSOEmrAuthenticate', 'mutation SSOEmrAuthenticate { ssoEmrAuthenticate { csrfToken } }')}
+      ${gql('Login', 'mutation Login { login { csrfToken } }', 'recorded-sso-csrf')}
+      ${gql('Verify', 'query Verify { verify { csrfToken } }', 'recorded-login-csrf')}
+      ${gql('GetCurrentUserOrgs', 'query GetCurrentUserOrgs { currentUser { id } }', 'recorded-verify-csrf')}
+    </hashTree></jmeterTestPlan>`;
+
+    const repaired = propagateGraphqlCsrfTokens(jmx);
+
+    assert.strictEqual(repaired.substitutions, 3);
+    assert.strictEqual(repaired.extractors, 3);
+    assert.match(repaired.xml, /JSONPostProcessor\.referenceNames">gql_SSOEmrAuthenticate_csrfToken</);
+    assert.match(repaired.xml, /JSONPostProcessor\.referenceNames">gql_Login_csrfToken</);
+    assert.match(repaired.xml, /JSONPostProcessor\.referenceNames">gql_Verify_csrfToken</);
+    assert.match(repaired.xml, /Header\.value">\$\{gql_SSOEmrAuthenticate_csrfToken\}</);
+    assert.match(repaired.xml, /Header\.value">\$\{gql_Login_csrfToken\}</);
+    assert.match(repaired.xml, /Header\.value">\$\{gql_Verify_csrfToken\}</);
+    assert.doesNotMatch(repaired.xml, /recorded-verify-csrf/);
+});
+
 test('OAuth constants: response_type code is not correlated into protocol syntax', () => {
     const xml = `<jmeterTestPlan><hashTree>
       <HTTPSamplerProxy testname="authorize" enabled="true">
@@ -767,17 +887,523 @@ test('OAuth constants: response_type code is not correlated into protocol syntax
 
 test('OAuth manual rule: bare state and nonce are left recorded, not correlated', () => {
     const entries = [
-        entry('GET', 'https://login.example.com/authorize?response_type=code&client_id=abc&redirect_uri=https%3A%2F%2Fapp%2Fcb&state=recordedState123&nonce=recordedNonce456'),
+        entry('GET', 'https://login.example.com/authorize?response_type=code&client_id=abc&redirect_uri=https%3A%2F%2Fapp%2Fcb&state=recordedState123&state-small=smallState123&nonce=recordedNonce456'),
+        entry('GET', 'https://app.example.com/callback?code=authCode789&state=recordedState123'),
     ];
     const corrs = [
         { variableName: 'state', value: 'recordedState123' },
+        { variableName: 'state-small', value: 'smallState123' },
         { variableName: 'nonce', value: 'recordedNonce456' },
+        { variableName: 'code', value: 'authCode789' },
         { variableName: 'state', value: 'loginPageState789' },
         { variableName: 'state_4', value: 'serverIssuedLoginState789' },
     ];
     const filtered = generateInternal.filterBareOauthStateNonceCorrelations(corrs, entries);
-    assert.deepStrictEqual(filtered.removed.map(c => c.variableName).sort(), ['nonce', 'state', 'state']);
+    assert.deepStrictEqual(filtered.removed.map(c => c.variableName).sort(), ['code', 'nonce', 'state', 'state', 'state-small']);
     assert.deepStrictEqual(filtered.kept.map(c => c.variableName), ['state_4']);
+});
+
+test('OAuth manual rule: keeps business code values outside auth protocol context', () => {
+    const entries = [
+        entry('POST', 'https://shop.example.com/api/coupons', {
+            postData: { mimeType: 'application/json', text: JSON.stringify({ code: 'SAVE20' }) },
+        }),
+    ];
+    const corrs = [{ variableName: 'code', value: 'SAVE20' }];
+    const filtered = generateInternal.filterBareOauthStateNonceCorrelations(corrs, entries);
+    assert.deepStrictEqual(filtered.removed, []);
+    assert.deepStrictEqual(filtered.kept, corrs);
+});
+
+test('volatile protocol detector: ignores unknown single-use auth fields by context and value', () => {
+    const txn = 'a9Dk3LmN8Qx72ZpR';
+    const flow = 'flow-7f4a9c2d8e1b';
+    const entries = [
+        entry('GET', `https://idp.example.com/authorize?response_type=code&client_id=abc&redirect_uri=https%3A%2F%2Fapp%2Fcb&txnRef=${txn}&flowKey=${flow}`),
+    ];
+    const corrs = [
+        { variableName: 'txnRef', value: txn },
+        { variableName: 'flowKey', value: flow },
+    ];
+
+    const filtered = volatileProtocol.filterVolatileProtocolCorrelations(corrs, entries);
+
+    assert.deepStrictEqual(filtered.removed.map(c => c.variableName).sort(), ['flowKey', 'txnRef']);
+    assert.deepStrictEqual(filtered.kept, []);
+    assert.deepStrictEqual(filtered.observedNames.sort(), ['flowkey', 'response_type', 'txnref']);
+});
+
+test('volatile protocol detector: keeps ordinary business values outside auth context', () => {
+    const entries = [
+        entry('POST', 'https://shop.example.com/api/orders', {
+            postData: { mimeType: 'application/json', text: JSON.stringify({ flowKey: 'checkout-flow-2026', couponCode: 'SAVE20' }) },
+        }),
+    ];
+    const corrs = [
+        { variableName: 'flowKey', value: 'checkout-flow-2026' },
+        { variableName: 'couponCode', value: 'SAVE20' },
+    ];
+
+    const filtered = volatileProtocol.filterVolatileProtocolCorrelations(corrs, entries);
+
+    assert.deepStrictEqual(filtered.removed, []);
+    assert.deepStrictEqual(filtered.kept, corrs);
+});
+
+test('blueprint context: creates a serializable run context', () => {
+    const ctx = blueprintContext.createBlueprintContext({
+        entries: [entry('GET', 'https://app.test/start')],
+        secondaryEntries: [],
+        pages: [],
+        mode: 'har',
+        outDir: 'out',
+        name: 'flow',
+        runCfg: { targetBaseUrlOverride: 'https://stage.test' },
+        agentCfg: { enabled: true },
+    });
+
+    assert.strictEqual(ctx.name, 'flow');
+    assert.strictEqual(ctx.mode, 'har');
+    assert.deepStrictEqual(ctx.lineage.links, []);
+    assert.deepStrictEqual(ctx.loop.attempts, []);
+    assert.strictEqual(ctx.runCfg.targetBaseUrlOverride, 'https://stage.test');
+});
+
+test('blueprint context: writes audit artifacts', () => {
+    const out = tmp();
+    const ctx = blueprintContext.createBlueprintContext({
+        entries: [], secondaryEntries: [], pages: [], mode: 'har',
+        outDir: out, name: 'audit', runCfg: {}, agentCfg: {},
+    });
+    ctx.lineage.links.push({ varName: 'c_token', producer: 0, consumer: 1 });
+    ctx.loop.attempts.push({ round: 1, firstFailure: { category: 'auth_correlation_failed' } });
+
+    const written = blueprintContext.writeBlueprintArtifacts(ctx);
+
+    assert.ok(fs.existsSync(written.contextPath));
+    assert.ok(fs.existsSync(written.lineagePath));
+    assert.ok(fs.existsSync(written.repairRoundsPath));
+});
+
+test('failure classifier: classifies auth and correlation failures', () => {
+    const auth = failureClassifier.classifyFirstFailure({
+        samples: [{ label: 'Step 04 - GET /me', success: false, responseCode: '401', isTransaction: false }],
+    });
+    assert.strictEqual(auth.category, 'auth_correlation_failed');
+
+    const unresolved = failureClassifier.classifyFirstFailure({
+        unresolvedFailures: [{ samplerLabel: 'Step 05 - GET /cb', varName: 'code', issue: 'unresolved variable' }],
+    });
+    assert.strictEqual(unresolved.category, 'unresolved_variable');
+    assert.strictEqual(unresolved.variable, 'code');
+});
+
+test('failure classifier: classifies payload and soft failure signals', () => {
+    const badPayload = failureClassifier.classifyFirstFailure({
+        samples: [{ label: 'Step 07 - POST /graphql', success: false, responseCode: '400', isTransaction: false }],
+    });
+    assert.strictEqual(badPayload.category, 'payload_or_header_failed');
+
+    const soft = failureClassifier.classifyFirstFailure({
+        samples: [{ label: 'Step 08 - POST /api', success: false, responseCode: '200', failureMessage: 'Session Expired', isTransaction: false }],
+    });
+    assert.strictEqual(soft.category, 'soft_failure_200');
+});
+
+test('status analysis: recording-first status semantics explain 2xx, 3xx, 4xx, and 5xx relevance', () => {
+    assert.deepStrictEqual(statusAnalysis.classifyStatusTransition(202, 202), {
+        recorded: 202,
+        observed: 202,
+        recordedFamily: '2xx',
+        observedFamily: '2xx',
+        matchesRecording: true,
+        category: 'status_matches_recording',
+        relevance: 'accepted_async_success',
+        repairHint: 'No status repair needed; compare body/headers if later samplers drift.',
+    });
+
+    const changedSuccess = statusAnalysis.classifyStatusTransition(202, 200);
+    assert.strictEqual(changedSuccess.matchesRecording, false);
+    assert.strictEqual(changedSuccess.category, 'success_code_drift');
+    assert.match(changedSuccess.repairHint, /recording expected 202/i);
+
+    const redirectLost = statusAnalysis.classifyStatusTransition(302, 200);
+    assert.strictEqual(redirectLost.category, 'redirect_flow_drift');
+    assert.strictEqual(redirectLost.recordedFamily, '3xx');
+
+    assert.strictEqual(statusAnalysis.classifyStatusTransition(200, 401).category, 'auth_or_session_correlation_failed');
+    assert.strictEqual(statusAnalysis.classifyStatusTransition(200, 422).category, 'request_payload_or_header_failed');
+    assert.strictEqual(statusAnalysis.classifyStatusTransition(200, 500).category, 'server_error_after_replay_request');
+});
+
+test('status analysis: traces root cause to earliest upstream recording drift before failing sampler', () => {
+    const entries = [
+        entry('GET', 'https://app.test/auth', { status: 302 }),
+        entry('GET', 'https://app.test/callback', { status: 200, body: '{"ok":true}' }),
+        entry('GET', 'https://app.test/me', { status: 200, body: '{"user":true}' }),
+    ];
+    const samples = [
+        { label: 'Step 01 - GET /auth', code: '200', success: true, isTransaction: false },
+        { label: 'Step 02 - GET /callback', code: '200', success: true, isTransaction: false },
+        { label: 'Step 03 - GET /me', code: '401', success: false, isTransaction: false },
+    ];
+
+    const root = statusAnalysis.traceStatusRootCause({ entries, samples, failingIndex: 2 });
+
+    assert.strictEqual(root.rootCauseIndex, 0);
+    assert.strictEqual(root.rootCause.category, 'redirect_flow_drift');
+    assert.strictEqual(root.failing.category, 'auth_or_session_correlation_failed');
+    assert.match(root.summary, /earliest upstream divergence/i);
+});
+
+test('failure classifier: uses status root cause evidence when available', () => {
+    const classified = failureClassifier.classifyFirstFailure({
+        statusRootCause: {
+            rootCauseIndex: 0,
+            rootCause: { category: 'redirect_flow_drift', recorded: 302, observed: 200 },
+            failing: { category: 'auth_or_session_correlation_failed', recorded: 200, observed: 401 },
+            summary: 'earliest upstream divergence at Step 01',
+        },
+        samples: [{ label: 'Step 03 - GET /me', success: false, responseCode: '401', isTransaction: false }],
+    });
+
+    assert.strictEqual(classified.category, 'redirect_flow_drift');
+    assert.strictEqual(classified.rootCauseIndex, 0);
+    assert.match(classified.message, /earliest upstream divergence/i);
+});
+
+test('runner: LLM failure collection prioritizes status root cause before downstream symptom', () => {
+    const failures = runnerInternal.collectLlmFailures({
+        statusRootCause: {
+            rootCauseIndex: 0,
+            rootCause: { sampler: 'Step 01 - GET /auth', category: 'redirect_flow_drift', observed: 200 },
+            failingIndex: 2,
+            failing: { sampler: 'Step 03 - GET /me', category: 'auth_or_session_correlation_failed', observed: 401 },
+            summary: 'earliest upstream divergence at Step 01',
+        },
+        samples: [
+            { label: 'Step 03 - GET /me', index: 2, success: false, responseCode: '401', isTransaction: false },
+        ],
+    });
+
+    assert.strictEqual(failures[0].samplerName, 'Step 01 - GET /auth');
+    assert.strictEqual(failures[0].category, 'redirect_flow_drift');
+    assert.match(failures[0].failureMessage, /earliest upstream divergence/);
+});
+
+test('runner: recording status drift makes an HTTP-success result not green', () => {
+    const result = runnerInternal.applyStatusRootCauseToResult({
+        success: true,
+        samples: [
+            { label: 'Step 01 - POST /job', code: '200', success: true, isTransaction: false },
+        ],
+    }, [
+        entry('POST', 'https://app.test/job', { status: 202 }),
+    ]);
+
+    assert.strictEqual(result.success, false);
+    assert.strictEqual(result.recordingDriftFailure, true);
+    assert.strictEqual(result.statusRootCause.rootCause.category, 'success_code_drift');
+});
+
+test('runner: blueprint first failure refreshes from status root cause evidence', () => {
+    const ctx = {
+        loop: { firstFailure: { category: 'auth_correlation_failed', sampler: 'Step 03 - GET /me' } },
+        validation: {},
+    };
+    const result = {
+        statusRootCause: {
+            rootCauseIndex: 0,
+            failingIndex: 2,
+            rootCause: { sampler: 'Step 01 - GET /auth', category: 'redirect_flow_drift', observed: 200 },
+            failing: { sampler: 'Step 03 - GET /me', category: 'auth_or_session_correlation_failed', observed: 401 },
+            summary: 'earliest upstream divergence at Step 01',
+        },
+    };
+
+    runnerInternal.refreshBlueprintFirstFailure(ctx, result);
+
+    assert.strictEqual(ctx.loop.firstFailure.category, 'redirect_flow_drift');
+    assert.strictEqual(ctx.loop.firstFailure.sampler, 'Step 01 - GET /auth');
+});
+
+test('semantic response: detects false 200 login pages and GraphQL errors', () => {
+    const loginDrift = semanticResponse.compareRecordedLiveResponse({
+        recorded: { status: 200, body: '{"data":{"me":{"id":"u1"}}}', contentType: 'application/json' },
+        observed: { status: 200, body: '<html><title>Login</title><form action="/login"></form></html>', headers: { 'content-type': 'text/html' } },
+        sampler: 'Step 03 - GET /me',
+        index: 2,
+    });
+    assert.strictEqual(loginDrift.ok, false);
+    assert.strictEqual(loginDrift.issues[0].kind, 'htmlLoginInsteadOfRecordedJson');
+
+    const gqlDrift = semanticResponse.compareRecordedLiveResponse({
+        recorded: { status: 200, body: '{"data":{"createTask":{"id":"t1"}}}', contentType: 'application/json' },
+        observed: { status: 200, body: '{"errors":[{"message":"Unauthorized"}],"data":null}', headers: { 'content-type': 'application/json' } },
+        sampler: 'GraphQL mutation createTask',
+        index: 4,
+    });
+    assert.strictEqual(gqlDrift.ok, false);
+    assert.strictEqual(gqlDrift.issues[0].kind, 'graphqlErrors');
+});
+
+test('final green gate: rejects status drift, semantic drift, and failed business verification', () => {
+    const green = finalGreenGate.evaluateFinalGreenGate({
+        result: { success: true },
+        baselineDiff: { samplesCompared: 1, drift: [] },
+        semanticDiff: { issues: [] },
+        businessVerification: { ok: true },
+    });
+    assert.strictEqual(green.ok, true);
+
+    const rejected = finalGreenGate.evaluateFinalGreenGate({
+        result: { success: true },
+        baselineDiff: { samplesCompared: 2, drift: [{ sampler: 'GET /me', issues: [{ kind: 'statusDiff' }] }] },
+        semanticDiff: { issues: [{ sampler: 'GraphQL createTask', kind: 'graphqlErrors' }] },
+        businessVerification: { ok: false, reason: 'protected sampler missing' },
+    });
+    assert.strictEqual(rejected.ok, false);
+    assert.deepStrictEqual(rejected.categories, ['baseline_drift', 'semantic_drift', 'business_verification_failed']);
+});
+
+test('request diff: identifies stale request values and redirect header drift', () => {
+    const recorded = entry('GET', 'https://app.test/me?state=RECORDED1234', {
+        reqHeaders: [{ name: 'X-CSRF-TOKEN', value: 'csrfRecorded1234' }],
+    });
+    const observedRequest = {
+        method: 'GET',
+        url: 'https://app.test/me?state=LIVE5678',
+        headers: { 'x-csrf-token': 'csrfRecorded1234', authorization: 'Bearer liveToken1234' },
+        body: '',
+    };
+    const diff = requestDiff.compareRecordedRequestToObserved({
+        entry: recorded,
+        observedRequest,
+        index: 1,
+        sampler: 'Step 02 - GET /me',
+    });
+
+    assert.strictEqual(diff.ok, false);
+    assert.ok(diff.issues.some(i => i.kind === 'queryValueDiff' && i.name === 'state'));
+    assert.ok(diff.issues.some(i => i.kind === 'headerStillRecorded' && i.name === 'x-csrf-token'));
+
+    const redirect = requestDiff.compareRedirectResponse({
+        recorded: { status: 302, headers: { location: '/callback?code=rec&state=old' } },
+        observed: { status: 302, headers: { location: '/callback?code=live&state=new' } },
+        sampler: 'Step 01 - GET /authorize',
+        index: 0,
+    });
+    assert.strictEqual(redirect.ok, false);
+    assert.ok(redirect.issues.some(i => i.kind === 'locationParamDiff' && i.name === 'code'));
+});
+
+test('blueprint agent: skips replay preflight without a target', async () => {
+    const ctx = blueprintContext.createBlueprintContext({
+        entries: [entry('GET', 'https://app.test/start')],
+        outDir: tmp(), name: 'skip', mode: 'har', runCfg: {}, agentCfg: { enabled: true },
+    });
+
+    const res = await blueprintAgent.runBlueprintPreflight({
+        ctx,
+        entries: [entry('GET', 'https://app.test/start')],
+        runCfg: {},
+        onLog: () => {},
+    });
+
+    assert.strictEqual(res.skipped, true);
+    assert.match(res.reason, /targetBaseUrl/);
+});
+
+test('blueprint agent: records replay lineage evidence', async () => {
+    const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+    });
+    await listenLocal(server);
+    const port = server.address().port;
+    const out = tmp();
+    const ctx = blueprintContext.createBlueprintContext({
+        entries: [entry('GET', 'http://recorded.test/start')],
+        outDir: out, name: 'preflight', mode: 'har',
+        runCfg: { targetBaseUrlOverride: `http://127.0.0.1:${port}` },
+        agentCfg: { enabled: true },
+    });
+
+    try {
+        const res = await blueprintAgent.runBlueprintPreflight({
+            ctx,
+            entries: [entry('GET', 'http://recorded.test/start')],
+            runCfg: { targetBaseUrlOverride: `http://127.0.0.1:${port}` },
+            onLog: () => {},
+        });
+
+        assert.strictEqual(res.skipped, false);
+        assert.ok(Array.isArray(ctx.lineage.links));
+        assert.strictEqual(ctx.loop.attempts.length, 1);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('blueprint agent: uses resolved targetBaseUrl when override is blank', async () => {
+    const server = http.createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+    });
+    await listenLocal(server);
+    const port = server.address().port;
+    const ctx = blueprintContext.createBlueprintContext({
+        entries: [entry('GET', 'http://recorded.test/start')],
+        outDir: tmp(), name: 'resolved-target', mode: 'har',
+        runCfg: { targetBaseUrl: `http://127.0.0.1:${port}` },
+        agentCfg: { enabled: true },
+    });
+
+    try {
+        const res = await blueprintAgent.runBlueprintPreflight({
+            ctx,
+            entries: [entry('GET', 'http://recorded.test/start')],
+            runCfg: { targetBaseUrlOverride: '', targetBaseUrl: `http://127.0.0.1:${port}` },
+            onLog: () => {},
+        });
+
+        assert.strictEqual(res.skipped, false);
+        assert.strictEqual(ctx.loop.attempts[0].skipped, false);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('AI fix prompt: includes blueprint lineage and first-failure evidence when provided', () => {
+    const built = runnerInternal.buildGeminiFixPrompt({
+        failures: [{ samplerName: 'Step 02 - GET /me', responseCode: '401', failureMessage: 'Unauthorized' }],
+        jmxContent: '<HTTPSamplerProxy testname="Step 02 - GET /me" enabled="true"></HTTPSamplerProxy><hashTree/>',
+        correlations: [],
+        blueprintEvidence: {
+            firstFailure: { category: 'auth_correlation_failed', sampler: 'Step 02 - GET /me' },
+            lineageSummary: [{ variable: 'c_session', producer: 0, consumer: 1 }],
+            repairAttempts: [{ phase: 'replay-preflight', reachedEnd: false }],
+        },
+    });
+
+    assert.match(built.userPrompt, /BLUEPRINT EVIDENCE/);
+    assert.match(built.userPrompt, /auth_correlation_failed/);
+    assert.match(built.userPrompt, /c_session/);
+});
+
+test('HTML report: links blueprint agent artifacts', () => {
+    const out = tmp();
+    fs.writeFileSync(path.join(out, 'bp_blueprint_context.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_lineage.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_repair_rounds.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_correlation_hypotheses.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_correlation_fast_repair.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_correlation_patches.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_senior_pe_debrief.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_senior_pe_debrief.md'), '# Senior PE');
+
+    const reportPath = writeHtmlReportFn(out, 'bp', {
+        mode: 'agent', verdict: 'needs attention', stats: {}, samples: [],
+    });
+    const html = fs.readFileSync(reportPath, 'utf8');
+
+    assert.match(html, /bp_blueprint_context\.json/);
+    assert.match(html, /bp_lineage\.json/);
+    assert.match(html, /bp_repair_rounds\.json/);
+    assert.match(html, /bp_correlation_hypotheses\.json/);
+    assert.match(html, /bp_correlation_fast_repair\.json/);
+    assert.match(html, /bp_correlation_patches\.json/);
+    assert.match(html, /bp_senior_pe_debrief\.json/);
+    assert.match(html, /bp_senior_pe_debrief\.md/);
+});
+
+test('value-flow decisions: consumed outputs make a failing sampler must-fix', () => {
+    const token = 'tok_A1B2C3D4E5F6';
+    const entries = [
+        entry('GET', 'https://app.test/bootstrap', {
+            body: JSON.stringify({ token }),
+            reqHeaders: [],
+        }),
+        entry('GET', `https://app.test/api/items?token=${token}`),
+    ];
+
+    const decisions = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries,
+        failures: [{ index: 0, samplerLabel: 'Step 01 - GET /bootstrap', responseCode: '500' }],
+    });
+
+    assert.strictEqual(decisions.byIndex[0].decision, 'must_fix');
+    assert.strictEqual(decisions.byIndex[0].consumedOutputCount, 1);
+    assert.deepStrictEqual(decisions.byIndex[0].consumerIndexes, [1]);
+});
+
+test('value-flow decisions: failing sampler with no consumed output is disposable plumbing', () => {
+    const entries = [
+        entry('GET', 'https://app.test/tasks.json', { body: '{"asset":"static"}' }),
+        entry('GET', 'https://app.test/home'),
+    ];
+
+    const decisions = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries,
+        failures: [{ index: 0, samplerLabel: 'Step 01 - GET /tasks.json', responseCode: '404' }],
+    });
+
+    assert.strictEqual(decisions.byIndex[0].decision, 'disposable_plumbing');
+    assert.strictEqual(decisions.byIndex[0].consumedOutputCount, 0);
+});
+
+test('business guard: value-flow evidence overrides heuristic protection for unconsumed plumbing', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /tasks.json" enabled="true">
+        <stringProp name="HTTPSampler.domain">app.test</stringProp>
+        <stringProp name="HTTPSampler.path">/tasks.json</stringProp>
+        <stringProp name="HTTPSampler.method">GET</stringProp>
+      </HTTPSamplerProxy>
+    </hashTree></jmeterTestPlan>`;
+    const entries = [entry('GET', 'https://app.test/tasks.json')];
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({ entries });
+
+    const guard = businessGuard.buildBusinessGuard({
+        xml,
+        flowName: 'tasks',
+        runCfg: {},
+        valueFlowDecisions: valueFlow,
+    });
+
+    assert.strictEqual(guard.protectedNames.has('Step 01 - GET /tasks.json'), false);
+
+    const explicit = businessGuard.buildBusinessGuard({
+        xml,
+        flowName: 'tasks',
+        runCfg: { protectedCalls: ['/tasks.json'] },
+        valueFlowDecisions: valueFlow,
+    });
+    assert.strictEqual(explicit.protectedNames.has('Step 01 - GET /tasks.json'), true);
+});
+
+test('response evidence: captures scrubbed failing body for LLM prompt', async () => {
+    const server = http.createServer((req, res) => {
+        res.writeHead(401, { 'Content-Type': 'application/json', 'Set-Cookie': 'sid=secret-cookie-value' });
+        res.end(JSON.stringify({ error: 'Session Expired', access_token: 'secret-token-value-123456' }));
+    });
+    await listenLocal(server);
+    const port = server.address().port;
+    try {
+        const evidence = await responseEvidence.collectFailingResponseEvidence({
+            entries: [entry('GET', 'http://recorded.test/me')],
+            failures: [{ index: 0, samplerName: 'Step 01 - GET /me' }],
+            targetBaseUrl: `http://127.0.0.1:${port}`,
+            insecure: true,
+        });
+
+        assert.strictEqual(evidence.length, 1);
+        assert.strictEqual(evidence[0].status, 401);
+        assert.match(evidence[0].bodyExcerpt, /Session Expired/);
+        assert.doesNotMatch(evidence[0].bodyExcerpt, /secret-token-value/);
+        assert.doesNotMatch(JSON.stringify(evidence[0].headers), /secret-cookie-value/);
+    } finally {
+        await closeServer(server);
+    }
 });
 
 test('generate: generic browser/OIDC noise is disabled by default; app-specific paths only via run.disableCalls', () => {
@@ -1242,6 +1868,336 @@ test('LLM patcher: setSamplerEnabled flips the enabled attribute on a named samp
     assert.match(r.xml, /testname="Bad Step" enabled="false"/);
 });
 
+test('LLM patcher: addExtractor supports CSS/HtmlExtractor patches', () => {
+    const xml = `<HTTPSamplerProxy testname="Step 01 - GET /login" enabled="true"></HTTPSamplerProxy>\n<hashTree/>`;
+    const fix = {
+        kind: 'addExtractor',
+        sampler: 'Step 01 - GET /login',
+        variable: 'csrf',
+        type: 'css',
+        selector: 'input[name="csrf"]',
+        attribute: 'value',
+    };
+    const validation = validateLlmPatches([fix]);
+    assert.strictEqual(validation.accepted.length, 1);
+
+    const r = applyLlmPatches(xml, validation.accepted);
+    assert.strictEqual(r.applied[0].type, 'css');
+    assert.match(r.xml, /HtmlExtractor\.refname">csrf/);
+    assert.match(r.xml, /HtmlExtractor\.expr">input\[name=&quot;csrf&quot;\]/);
+});
+
+test('LLM patcher: removeAssertion removes a named ResponseAssertion under a sampler', () => {
+    const xml = `<HTTPSamplerProxy testname="Step 01 - GET /api" enabled="true"></HTTPSamplerProxy>
+<hashTree>
+  <ResponseAssertion testname="Stable text present" enabled="true">
+    <collectionProp name="Assertion.test_strings"><stringProp name="assert_0">ok</stringProp></collectionProp>
+  </ResponseAssertion>
+  <hashTree/>
+</hashTree>`;
+    const validation = validateLlmPatches([{ kind: 'removeAssertion', sampler: 'Step 01 - GET /api', assertion: 'Stable text present' }]);
+    assert.strictEqual(validation.accepted.length, 1);
+
+    const r = applyLlmPatches(xml, validation.accepted);
+    assert.strictEqual(r.applied[0].kind, 'removeAssertion');
+    assert.doesNotMatch(r.xml, /ResponseAssertion/);
+});
+
+test('LLM patcher: setSamplerEnabled can re-enable exact samplers', () => {
+    const xml = `<HTTPSamplerProxy testname="Step 01 - GET /callback" enabled="false"></HTTPSamplerProxy>`;
+    const r = applyLlmPatches(xml, [{ kind: 'setSamplerEnabled', sampler: 'Step 01 - GET /callback', enabled: true }]);
+    assert.strictEqual(r.applied[0].enabled, true);
+    assert.match(r.xml, /testname="Step 01 - GET \/callback" enabled="true"/);
+});
+
+test('fast repair loop: verifies disable hypotheses with fast replay before JMeter', async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url === '/ok') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{"ok":true}');
+            return;
+        }
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('missing');
+    });
+    await listenLocal(server);
+    const port = server.address().port;
+    const xml = `<HTTPSamplerProxy testname="Step 01 - GET /bad" enabled="true"></HTTPSamplerProxy>
+<hashTree/>
+<HTTPSamplerProxy testname="Step 02 - GET /ok" enabled="true"></HTTPSamplerProxy>
+<hashTree/>`;
+
+    try {
+        const res = await fastRepairLoop.runFastRepairLoop({
+            xml,
+            entries: [
+                entry('GET', 'http://recorded.test/bad', { status: 404, body: 'missing' }),
+                entry('GET', 'http://recorded.test/ok', { status: 200, body: '{"ok":true}' }),
+            ],
+            fixes: [{ kind: 'setSamplerEnabled', sampler: 'Step 01 - GET /bad', enabled: false }],
+            targetBaseUrl: `http://127.0.0.1:${port}`,
+            insecure: true,
+        });
+
+        assert.strictEqual(res.skipped, false);
+        assert.strictEqual(res.replay.ok, true);
+        assert.deepStrictEqual(res.replayedIndexes, [1]);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('correlation hypotheses: stale JSON response value consumed in later header becomes extractor and substitution fixes', () => {
+    const token = 'jsonTokenA123456789';
+    const entries = [
+        entry('POST', 'https://app.test/auth', { body: JSON.stringify({ sessionToken: token }) }),
+        entry('GET', 'https://app.test/me', { reqHeaders: [{ name: 'X-Session', value: token }] }),
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - POST /auth" enabled="true"><stringProp name="HTTPSampler.path">/auth</stringProp></HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="Step 02 - GET /me" enabled="true"><stringProp name="HTTPSampler.path">/me</stringProp></HTTPSamplerProxy><hashTree>
+        <HeaderManager><collectionProp name="HeaderManager.headers"><elementProp name="X-Session" elementType="Header"><stringProp name="Header.name">X-Session</stringProp><stringProp name="Header.value">${token}</stringProp></elementProp></collectionProp></HeaderManager><hashTree/>
+      </hashTree>
+    </hashTree></jmeterTestPlan>`;
+
+    const result = correlationHypotheses.proposeCorrelationHypotheses({
+        xml,
+        entries,
+        failures: [{ samplerName: 'Step 02 - GET /me', samplerIndex: 1, responseCode: '401' }],
+    });
+
+    assert.strictEqual(result.fixes.length, 2);
+    assert.deepStrictEqual(result.fixes[0], {
+        kind: 'addExtractor',
+        sampler: 'Step 01 - POST /auth',
+        variable: 'sessionToken',
+        type: 'json',
+        path: '$.sessionToken',
+    });
+    assert.deepStrictEqual(result.fixes[1], {
+        kind: 'replaceValueWithVar',
+        sampler: 'Step 02 - GET /me',
+        value: token,
+        variable: 'sessionToken',
+    });
+    assert.strictEqual(result.attempts[0].proof.verified, true);
+});
+
+test('correlation hypotheses: stale response header value consumed in later body becomes header regex extractor', () => {
+    const token = 'headerTokenA123456789';
+    const producer = entry('GET', 'https://app.test/bootstrap');
+    producer.response.headers.push({ name: 'X-Auth-Token', value: token });
+    const entries = [
+        producer,
+        entry('POST', 'https://app.test/api', {
+            postData: { mimeType: 'application/json', text: JSON.stringify({ authToken: token }) },
+        }),
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /bootstrap" enabled="true"><stringProp name="HTTPSampler.path">/bootstrap</stringProp></HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="Step 02 - POST /api" enabled="true"><stringProp name="HTTPSampler.path">/api</stringProp><stringProp name="Argument.value">{&quot;authToken&quot;:&quot;${token}&quot;}</stringProp></HTTPSamplerProxy><hashTree/>
+    </hashTree></jmeterTestPlan>`;
+
+    const result = correlationHypotheses.proposeCorrelationHypotheses({
+        xml,
+        entries,
+        failures: [{ samplerName: 'Step 02 - POST /api', samplerIndex: 1, responseCode: '401' }],
+    });
+
+    assert.strictEqual(result.fixes[0].kind, 'addExtractor');
+    assert.strictEqual(result.fixes[0].type, 'regex');
+    assert.strictEqual(result.fixes[0].useHeaders, true);
+    assert.match(result.fixes[0].regex, /X-Auth-Token/);
+    assert.deepStrictEqual(result.fixes[1], {
+        kind: 'replaceValueWithVar',
+        sampler: 'Step 02 - POST /api',
+        value: token,
+        variable: 'authToken',
+    });
+});
+
+test('correlation hypotheses: cookie value consumed outside Cookie header is correlated with a verified Set-Cookie extractor', () => {
+    const token = 'cookieTokenA123456789';
+    const producer = entry('GET', 'https://app.test/login');
+    producer.response.headers.push({ name: 'Set-Cookie', value: `sid=${token}; Path=/; HttpOnly` });
+    const entries = [
+        producer,
+        entry('POST', 'https://app.test/graphql', {
+            postData: { mimeType: 'application/json', text: JSON.stringify({ sessionId: `Token ${token}` }) },
+        }),
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /login" enabled="true"><stringProp name="HTTPSampler.path">/login</stringProp></HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="Step 02 - POST /graphql" enabled="true"><stringProp name="HTTPSampler.path">/graphql</stringProp><stringProp name="Argument.value">{&quot;sessionId&quot;:&quot;Token ${token}&quot;}</stringProp></HTTPSamplerProxy><hashTree/>
+    </hashTree></jmeterTestPlan>`;
+
+    const result = correlationHypotheses.proposeCorrelationHypotheses({
+        xml,
+        entries,
+        failures: [{ samplerName: 'Step 02 - POST /graphql', samplerIndex: 1, responseCode: '401' }],
+    });
+
+    assert.strictEqual(result.fixes[0].kind, 'addExtractor');
+    assert.strictEqual(result.fixes[0].type, 'regex');
+    assert.strictEqual(result.fixes[0].useHeaders, true);
+    assert.match(result.fixes[0].regex, /sid=/);
+    assert.strictEqual(result.fixes[1].value, token);
+});
+
+test('correlation hypotheses: response-only dynamic value is ignored when no failing request consumes it', () => {
+    const token = 'responseOnlyA123456789';
+    const entries = [
+        entry('GET', 'https://app.test/profile', { body: JSON.stringify({ userId: token }) }),
+        entry('GET', 'https://app.test/me'),
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /profile" enabled="true"><stringProp name="HTTPSampler.path">/profile</stringProp></HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="Step 02 - GET /me" enabled="true"><stringProp name="HTTPSampler.path">/me</stringProp></HTTPSamplerProxy><hashTree/>
+    </hashTree></jmeterTestPlan>`;
+
+    const result = correlationHypotheses.proposeCorrelationHypotheses({
+        xml,
+        entries,
+        failures: [{ samplerName: 'Step 02 - GET /me', samplerIndex: 1, responseCode: '401' }],
+    });
+
+    assert.deepStrictEqual(result.fixes, []);
+    assert.deepStrictEqual(result.attempts, []);
+});
+
+test('correlation hypotheses: unproved consumed value is rejected with evidence instead of guessed', () => {
+    const token = 'missingProducerA123456789';
+    const entries = [
+        entry('GET', 'https://app.test/start'),
+        entry('GET', 'https://app.test/me', { reqHeaders: [{ name: 'X-Session', value: token }] }),
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /start" enabled="true"><stringProp name="HTTPSampler.path">/start</stringProp></HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="Step 02 - GET /me" enabled="true"><stringProp name="HTTPSampler.path">/me</stringProp></HTTPSamplerProxy><hashTree>
+        <HeaderManager><collectionProp name="HeaderManager.headers"><elementProp name="X-Session" elementType="Header"><stringProp name="Header.name">X-Session</stringProp><stringProp name="Header.value">${token}</stringProp></elementProp></collectionProp></HeaderManager><hashTree/>
+      </hashTree>
+    </hashTree></jmeterTestPlan>`;
+
+    const result = correlationHypotheses.proposeCorrelationHypotheses({
+        xml,
+        entries,
+        failures: [{ samplerName: 'Step 02 - GET /me', samplerIndex: 1, responseCode: '401' }],
+    });
+
+    assert.deepStrictEqual(result.fixes, []);
+    assert.strictEqual(result.rejected[0].value, token);
+    assert.strictEqual(result.rejected[0].reason, 'no_verified_producer');
+});
+
+test('fast repair loop: verifies extractor and substitution hypotheses before JMeter', async () => {
+    const recordedToken = 'recordedTokenA123456789';
+    const liveToken = 'liveTokenB123456789';
+    const server = http.createServer((req, res) => {
+        if (req.url === '/auth') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sessionToken: liveToken }));
+            return;
+        }
+        if (req.url === '/me' && req.headers['x-session'] === liveToken) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{"ok":true}');
+            return;
+        }
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end('{"error":"unauthorized"}');
+    });
+    await listenLocal(server);
+    const port = server.address().port;
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /auth" enabled="true"><stringProp name="HTTPSampler.path">/auth</stringProp></HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="Step 02 - GET /me" enabled="true"><stringProp name="HTTPSampler.path">/me</stringProp></HTTPSamplerProxy><hashTree>
+        <HeaderManager><collectionProp name="HeaderManager.headers"><elementProp name="X-Session" elementType="Header"><stringProp name="Header.name">X-Session</stringProp><stringProp name="Header.value">${recordedToken}</stringProp></elementProp></collectionProp></HeaderManager><hashTree/>
+      </hashTree>
+    </hashTree></jmeterTestPlan>`;
+    try {
+        const result = await fastRepairLoop.runFastRepairLoop({
+            xml,
+            entries: [
+                entry('GET', 'http://recorded.test/auth', { body: JSON.stringify({ sessionToken: recordedToken }) }),
+                entry('GET', 'http://recorded.test/me', { reqHeaders: [{ name: 'X-Session', value: recordedToken }], body: '{"ok":true}' }),
+            ],
+            fixes: [
+                { kind: 'addExtractor', sampler: 'Step 01 - GET /auth', variable: 'sessionToken', type: 'json', path: '$.sessionToken' },
+                { kind: 'replaceValueWithVar', sampler: 'Step 02 - GET /me', variable: 'sessionToken', value: recordedToken },
+            ],
+            targetBaseUrl: `http://127.0.0.1:${port}`,
+            insecure: true,
+        });
+
+        assert.strictEqual(result.skipped, false);
+        assert.strictEqual(result.replay.ok, true);
+        assert.strictEqual(result.extractedVariables.sessionToken, liveToken);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('runner: verified correlation repair applies proven hypothesis before LLM escalation', async () => {
+    const recordedToken = 'runnerRecordedA123456789';
+    const liveToken = 'runnerLiveB123456789';
+    const server = http.createServer((req, res) => {
+        if (req.url === '/auth') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sessionToken: liveToken }));
+            return;
+        }
+        if (req.url === '/me' && req.headers['x-session'] === liveToken) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{"ok":true}');
+            return;
+        }
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end('{"error":"unauthorized"}');
+    });
+    await listenLocal(server);
+    const port = server.address().port;
+    const out = tmp();
+    const jmxPath = path.join(out, 'flow.jmx');
+    fs.writeFileSync(jmxPath, `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /auth" enabled="true"><stringProp name="HTTPSampler.path">/auth</stringProp></HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="Step 02 - GET /me" enabled="true"><stringProp name="HTTPSampler.path">/me</stringProp></HTTPSamplerProxy><hashTree>
+        <HeaderManager><collectionProp name="HeaderManager.headers"><elementProp name="X-Session" elementType="Header"><stringProp name="Header.name">X-Session</stringProp><stringProp name="Header.value">${recordedToken}</stringProp></elementProp></collectionProp></HeaderManager><hashTree/>
+      </hashTree>
+    </hashTree></jmeterTestPlan>`);
+
+    try {
+        const repair = await runnerInternal.tryVerifiedCorrelationRepairRound({
+            result: {
+                success: false,
+                samples: [{ label: 'Step 02 - GET /me', index: 1, success: false, responseCode: '401', isTransaction: false }],
+            },
+            jmxPath,
+            config: { targetBaseUrl: `http://127.0.0.1:${port}`, timeoutMs: 5000 },
+            gen: {
+                flat: [
+                    entry('GET', 'http://recorded.test/auth', { body: JSON.stringify({ sessionToken: recordedToken }) }),
+                    entry('GET', 'http://recorded.test/me', { reqHeaders: [{ name: 'X-Session', value: recordedToken }], body: '{"ok":true}' }),
+                ],
+            },
+            outDir: out,
+            name: 'flow',
+            onLog: () => {},
+            feedbackLoop: async ({ jmxPath: patchedJmxPath }) => {
+                const patched = fs.readFileSync(patchedJmxPath, 'utf8');
+                assert.match(patched, /JSONPostProcessor\.referenceNames">sessionToken/);
+                assert.match(patched, /\$\{sessionToken\}/);
+                return { success: true, finalJmxPath: patchedJmxPath, samples: [] };
+            },
+        });
+
+        assert.strictEqual(repair.success, true);
+        assert.strictEqual(repair.successfulFixes.length, 2);
+        assert.ok(fs.existsSync(path.join(out, 'flow_correlation_hypotheses.json')));
+    } finally {
+        await closeServer(server);
+    }
+});
+
 test('LLM patcher: unknown kind is recorded as skipped (no silent drop)', () => {
     const xml = `<x/>`;
     const r = applyLlmPatches(xml, [{ kind: 'rewriteGroovyScript', script: 'whatever' }]);
@@ -1650,4 +2606,34 @@ test('OAuth rewire: only fires for /authorize URLs with OAuth2 hallmarks (client
 </hashTree></jmeterTestPlan>`;
     const r = rewireClientMintedOauthVars(xml);
     assert.deepStrictEqual(r.rewired, [], 'safety: must not rewire on /authorize without OAuth2 query hallmarks');
+});
+
+test('generate: volatile OAuth values are ignored instead of forced into correlations', () => {
+    const state = 'recordedState1234567890';
+    const nonce = 'recordedNonce1234567890';
+    const code = 'recordedCode1234567890';
+    const { entries, pages } = parse(har([
+        entry('GET', `https://login.example.com/authorize?response_type=code&client_id=abc&redirect_uri=https%3A%2F%2Fapp.test%2Fcb&state=${state}&nonce=${nonce}`, {
+            query: [
+                { name: 'response_type', value: 'code' },
+                { name: 'client_id', value: 'abc' },
+                { name: 'redirect_uri', value: 'https://app.test/cb' },
+                { name: 'state', value: state },
+                { name: 'nonce', value: nonce },
+            ],
+        }),
+        entry('GET', `https://app.test/callback?code=${code}&state=${state}`, {
+            query: [
+                { name: 'code', value: code },
+                { name: 'state', value: state },
+            ],
+        }),
+    ]));
+
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'oauth-volatile-ignore');
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+
+    assert.doesNotMatch(xml, /RegexExtractor\.refname">(state|nonce|code)</);
+    assert.ok(gen.reasoning.some(r => r.phase === 'oauth-volatile-ignore'));
 });

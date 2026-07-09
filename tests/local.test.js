@@ -1024,6 +1024,61 @@ test('business guard: never protects operator-disabled samplers or proven duplic
     assert.ok(!g2.protectedNames.has('SC01_T02_/s/interceptor/authorize/-017'), 'duplicate hop is not protected');
 });
 
+test('fold safety: Check 2 blocks folding a producer / load-bearing navigation; Check 1 marks uncertain', () => {
+    const { assessFoldSafety } = require('../src/fold-safety');
+    const mk = (method, url, status, { location, setCookie, body, reqCookie } = {}) => ({
+        request: { method, url, headers: reqCookie ? [{ name: 'Cookie', value: reqCookie }] : [] },
+        response: {
+            status,
+            headers: [
+                ...(location ? [{ name: 'Location', value: location }] : []),
+                ...(setCookie ? [{ name: 'Set-Cookie', value: setCookie }] : []),
+            ],
+            content: { text: body || '' },
+        },
+    });
+    const entries = [
+        // 0: produces a token in its body that 1 consumes → UNSAFE (Check 2a)
+        mk('GET', 'https://a.test/page', 200, { body: '{"csrf":"TOKZZ9988"}' }),
+        mk('POST', 'https://a.test/act?csrf=TOKZZ9988', 200, {}),
+        // 2: unique navigation → 3's URL, nothing else re-establishes → UNSAFE (2b)
+        mk('GET', 'https://a.test/go', 302, { location: 'https://a.test/landing' }),
+        mk('GET', 'https://a.test/landing', 200, {}),
+        // 4: pure sink — consumes 0's token, produces nothing → UNCERTAIN (Check 1)
+        mk('GET', 'https://a.test/log?csrf=TOKZZ9988', 204, {}),
+        // 5: truly useless — no produce, no consume, no nav → SAFE
+        mk('GET', 'https://a.test/beacon', 204, {}),
+    ];
+    const { byIndex } = assessFoldSafety(entries, {});
+    assert.strictEqual(byIndex[0].verdict, 'unsafe', 'produces a downstream-consumed value');
+    assert.ok(byIndex[0].checks.producesDownstreamValue >= 1);
+    assert.strictEqual(byIndex[2].verdict, 'unsafe', 'load-bearing navigation');
+    assert.ok(byIndex[2].checks.loadBearingNavigation);
+    assert.strictEqual(byIndex[4].verdict, 'uncertain', 'consumes upstream but produces nothing');
+    assert.strictEqual(byIndex[5].verdict, 'safe', 'no produce/consume/nav — freely foldable');
+});
+
+test('fold safety: a duplicate redirect hop is safe despite navigating (parent reproduces it)', () => {
+    const { assessFoldSafety } = require('../src/fold-safety');
+    const hop = (method, url, status, location, setCookie) => ({
+        request: { method, url, headers: [] },
+        response: { status, headers: [
+            ...(location ? [{ name: 'Location', value: location }] : []),
+            ...(setCookie ? [{ name: 'Set-Cookie', value: setCookie }] : []),
+        ], content: { text: '' } },
+    });
+    const entries = [
+        hop('POST', 'https://a.test/s/interceptor/', 302, '/s/interceptor/authorize/?g=AAA'),
+        hop('GET', 'https://a.test/s/interceptor/authorize/?g=AAA', 302, 'https://a.test/redirect/', 'SESS=x; Path=/'),
+        hop('GET', 'https://a.test/redirect/', 200, null),
+    ];
+    // Index 1 is the proven duplicate hop; parent (0) reproduces the nav, and
+    // its Set-Cookie is captured natively → SAFE even though it 302s + sets a cookie.
+    const { byIndex } = assessFoldSafety(entries, { foldingIndexes: new Set([1]), duplicateHopIndexes: new Set([1]) });
+    assert.strictEqual(byIndex[1].verdict, 'safe', 'duplicate hop is foldable');
+    assert.ok(!byIndex[1].checks.loadBearingNavigation, 'navigation is reproduced by the parent');
+});
+
 test('AI provider label prefers OpenAI over Gemini when both are configured', () => {
     assert.strictEqual(runnerInternal.llmProviderLabel({ OPENAI_API_KEY: 'openai-key', GOOGLE_API_KEY: 'google-key' }), 'OpenAI');
     assert.strictEqual(runnerInternal.llmProviderLabel({ GOOGLE_API_KEY: 'google-key' }), 'Gemini');

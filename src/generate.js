@@ -37,6 +37,7 @@ const playbooks = require('./playbooks');
 const scenario = require('./scenario');
 const outcomeProbe = require('./outcome-probe');
 const redirectHops = require('./redirect-hops');
+const foldSafetyModule = require('./fold-safety');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
 const peNaming = require('./pe-naming');
@@ -354,6 +355,25 @@ function isGraphqlOperationDocument(candidate) {
     if (String(candidate.name || '').toLowerCase() !== 'query') return false;
     const value = String(candidate.value || '').trim();
     return /^(query|mutation|subscription)\b/i.test(value) && /[{]/.test(value);
+}
+
+/**
+ * Map a rendered sampler back to its flat-entry index. Sampler testnames carry
+ * the recorded step number (…-NNN or "Step NN - …"); fall back to method+path.
+ */
+function flatIndexForSampler(flat, sampler) {
+    const step = Number((String(sampler.name || '').match(/(?:Step\s+0*(\d+)\b|-(\d+)$)/) || [])
+        .slice(1).find(Boolean));
+    if (Number.isFinite(step) && step >= 1 && flat[step - 1]) return step - 1;
+    const method = String(sampler.method || '').toUpperCase();
+    const path = String(sampler.path || '').split('?')[0];
+    for (let i = 0; i < flat.length; i++) {
+        const e = flat[i];
+        let ep = '';
+        try { ep = new URL(e.request.url).pathname; } catch { /* skip */ }
+        if (ep === path && (!method || String(e.request.method || 'GET').toUpperCase() === method)) return i;
+    }
+    return -1;
 }
 
 /** Sampler order → {name, path, position, openEnd} map built from the XML. */
@@ -781,6 +801,30 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         protectedCalls: runCfg.protectedCalls,
     });
 
+    // FOLD-SAFETY GATE — the evidence every heuristic disable must clear.
+    // Answers the two senior-engineer questions from the recording alone:
+    //   (2) does this request GENERATE a value a later request consumes, or
+    //       NAVIGATE to a page the next request depends on?  → UNSAFE to fold
+    //   (1) does an UPSTREAM request feed a value INTO this one?  → UNCERTAIN;
+    //       don't fold on a hunch, let the live probe decide.
+    // Proven duplicate hops are exempt from the navigation/cookie checks
+    // because the parent's followed chain reproduces them. Operator-explicit
+    // disables never consult this gate (their tier is absolute).
+    const dupHops = redirectHops.detectDuplicateRedirectHops(flat);
+    const dupHopIndexSet = new Set(dupHops.indexes);
+    const foldSafety = foldSafetyModule.assessFoldSafety(flat, {
+        foldingIndexes: dupHopIndexSet,
+        duplicateHopIndexes: dupHopIndexSet,
+    });
+    const foldSafetyVetoes = [];
+    // Maps a live sampler (from the rendered XML) back to its flat-entry index
+    // so a pattern match can consult the fold-safety verdict.
+    const foldVerdictForSampler = (sampler) => {
+        const idx = flatIndexForSampler(flat, sampler);
+        if (idx < 0) return null;
+        return foldSafety.byIndex[idx] || null;
+    };
+
     // TIER 1 — OPERATOR disables (config / steering / golden / playbook).
     // The operator's explicit instruction is ABSOLUTE against heuristics: the
     // live LOGI failure was this exact inversion — "/s/interceptor/authorize/"
@@ -823,7 +867,22 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     const defaultPatterns = (runCfg && runCfg.disableDefaultNoise === false) ? [] : DEFAULT_DISABLE_PATTERNS;
     if (defaultPatterns.length) {
         const dis = disableSamplersByPattern(xml, defaultPatterns, {
-            protect: sampler => shouldProtectDisableTarget(sampler, runCfg, disableValueFlow),
+            protect: sampler => {
+                if (shouldProtectDisableTarget(sampler, runCfg, disableValueFlow)) return true;
+                // The fold-safety gate: a default noise pattern is a strong
+                // prior, but it may NOT fold a request the recording proves is
+                // load-bearing (Check 2 — generates a downstream-consumed value
+                // or a navigation the next request needs). Check 1 alone
+                // (merely consuming an upstream cookie, which nearly every
+                // request does) does NOT override a known-noise pattern; that
+                // caution is for the live fold-probe on self-initiated folds.
+                const v = foldVerdictForSampler(sampler);
+                if (v && v.verdict === 'unsafe') {
+                    foldSafetyVetoes.push({ sampler: sampler.name || sampler.path, verdict: v.verdict, reason: v.reasons[0] });
+                    return true;
+                }
+                return false;
+            },
         });
         xml = dis.xml; disabledCount += dis.disabled;
         if (dis.disabled) note('disable-calls',
@@ -835,6 +894,10 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             `kept enabled: ${dis.skippedProtected.slice(0, 8).join(', ')}`,
             `default patterns are priors; evidence outranks them`);
     }
+    if (foldSafetyVetoes.length) note('fold-safety',
+        `${foldSafetyVetoes.length} heuristic fold(s) blocked by recording evidence`,
+        foldSafetyVetoes.slice(0, 6).map(v => `${v.sampler} [${v.verdict}]: ${v.reason}`).join('; '),
+        `a request that generates a downstream-consumed value or a load-bearing navigation is never folded on a pattern hunch`);
 
     // TIER 2 — EVIDENCE: duplicate redirect hops. The recording proves these
     // samplers re-execute a hop the parent's followed redirect chain already
@@ -843,16 +906,24 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // failure class). Safe to fold BY CONSTRUCTION — the hop still runs
     // inside the parent. Outranks "session-like path" priors; yields only to
     // an explicit operator protect.
-    const dupHops = redirectHops.detectDuplicateRedirectHops(flat);
     let duplicateHopLabels = [];
     if (dupHops.indexes.length) {
         const samplerIndex = indexSamplersForGenerate(xml);
         let folded = 0;
+        const keptForSafety = [];
         for (const idx of dupHops.indexes) {
             const s = samplerIndex[idx];
             if (!s) continue;
             const hay = `${s.name} ${s.path || ''}`;
             if (matchesConfiguredPattern(hay, runCfg.protectedCalls)) continue; // operator protect wins
+            // Even a proven hop is kept if it UNIQUELY generates a downstream
+            // value (non-cookie; cookies are captured natively while following
+            // the parent). Check 2 outranks the hop heuristic.
+            const v = foldSafety.byIndex[idx];
+            if (v && v.checks.producesDownstreamValue > 0) {
+                keptForSafety.push(s.name);
+                continue;
+            }
             const flipped = flipEnabledAtPosition(xml, s);
             if (flipped.changed) { xml = flipped.xml; folded++; }
         }
@@ -860,6 +931,10 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             `${folded} sampler(s) are recorded redirect hops the parent chain already executes`,
             dupHops.indexes.slice(0, 6).map(i => `entry ${i} ← ${dupHops.byIndex[i].via}`).join('; '),
             `folded (evidence tier): replaying a followed hop out of band re-fires single-use tokens and trips the session`);
+        if (keptForSafety.length) note('duplicate-redirect-hops-kept',
+            `${keptForSafety.length} redirect hop(s) kept enabled — they uniquely generate a downstream-consumed value`,
+            keptForSafety.slice(0, 6).join(', '),
+            `fold-safety Check 2 outranks the duplicate-hop heuristic`);
         disabledCount += folded;
     }
 
@@ -1050,6 +1125,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         playbookDisables: pbResult.addedDisables,
         playbookProtects: pbResult.addedProtects || [],
         duplicateHopLabels,
+        foldSafety: foldSafety.byIndex,
         effectiveLlmFlowNotes: runCfg.llmFlowNotes || [],
         scenario: scenarioPlan,
         uploadFiles: uploadPlan,
@@ -1079,6 +1155,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             graphqlCsrfHeaderRepairs: gqlCsrf.substitutions,
             formCorrelations: formCorr.wired.length,
             duplicateHops: duplicateHopLabels.length,
+            foldSafetyVetoes: foldSafetyVetoes.length,
             goldenApplied,
             outcomeProbe: probe ? { probeLabel: probe.probeLabel, injected: probeInjected } : null,
             loadProfile: loadProfileApplied,

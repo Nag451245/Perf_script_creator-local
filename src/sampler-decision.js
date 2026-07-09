@@ -4,7 +4,9 @@ const valueFlowDecisions = require('./value-flow-decisions');
 
 const AUTH_SESSION_RE = /(?:login|auth|oauth|oidc|saml|sso|callback|token|session|csrf|authorize)/i;
 const FOLDABLE_PLUMBING_RE = /(?:\/oauth\/token|\/authorize(?:\/resume)?|\/jwt\/v2\/create-cookie|\/saml|\/oidc|\/login|domainreliability|ohttp|safebrowsing|favicon|analytics|telemetry|_next\/static)/i;
-const BUSINESS_PATH_RE = /(?:\/api\/|\/graphql|\/batch|\/print|\/upload|\/save|\/create|\/update|\/delete|\/edoc|\/patient|\/case|\/tasks?)/i;
+// Universal business VERBS only — app-specific nouns belong in playbook
+// protectedCalls (see post-run-adjudicator.js for the rationale).
+const BUSINESS_PATH_RE = /(?:\/api\/|\/graphql|\/batch|\/print|\/upload|\/download|\/export|\/save|\/create|\/update|\/delete|\/submit|\/tasks?)/i;
 const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
 
 function classifySamplerDecisions({ entries = [], failures = [], valueFlow = null, guard = null } = {}) {

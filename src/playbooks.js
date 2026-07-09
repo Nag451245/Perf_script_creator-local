@@ -87,7 +87,9 @@ function applyPlaybooks({ entries = [], fingerprintSignals = [], runCfg = {}, di
     const applied = [];
     const merged = { ...runCfg, oauth: { ...(runCfg.oauth || {}) } };
     const existingDisables = new Set((runCfg.disableCalls || []).map(String));
+    const existingProtects = new Set((runCfg.protectedCalls || []).map(String));
     const addedDisables = [];
+    const addedProtects = [];
     const notes = [...(runCfg.llmFlowNotes || [])];
 
     for (const pb of playbooks) {
@@ -95,6 +97,12 @@ function applyPlaybooks({ entries = [], fingerprintSignals = [], runCfg = {}, di
         if (!hits.length) continue;
         for (const d of pb.disableCalls || []) {
             if (!existingDisables.has(d)) { existingDisables.add(d); addedDisables.push(d); }
+        }
+        // App-specific business nouns: the guard and adjudicator protect
+        // these from disabling — playbooks carry them so generic code never
+        // has to know one app's endpoint names.
+        for (const p of pb.protectedCalls || []) {
+            if (!existingProtects.has(p)) { existingProtects.add(p); addedProtects.push(p); }
         }
         for (const [k, v] of Object.entries(pb.oauth || {})) {
             if (merged.oauth[k] === undefined) merged.oauth[k] = v;
@@ -105,10 +113,11 @@ function applyPlaybooks({ entries = [], fingerprintSignals = [], runCfg = {}, di
         applied.push({ id: pb.id, evidence: hits, expectations: pb.expectations || [] });
     }
 
-    if (!applied.length) return { runCfg, applied: [], addedDisables: [] };
+    if (!applied.length) return { runCfg, applied: [], addedDisables: [], addedProtects: [] };
     merged.disableCalls = [...existingDisables];
+    merged.protectedCalls = [...existingProtects];
     merged.llmFlowNotes = notes;
-    return { runCfg: merged, applied, addedDisables };
+    return { runCfg: merged, applied, addedDisables, addedProtects };
 }
 
 module.exports = { loadPlaybooks, applyPlaybooks, _internal: { buildEvidence, matchPlaybook } };

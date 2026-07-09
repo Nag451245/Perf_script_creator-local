@@ -942,6 +942,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         goldenDisables, goldenApplied,
         playbooksApplied: pbResult.applied,
         playbookDisables: pbResult.addedDisables,
+        playbookProtects: pbResult.addedProtects || [],
         effectiveLlmFlowNotes: runCfg.llmFlowNotes || [],
         scenario: scenarioPlan,
         uploadFiles: uploadPlan,

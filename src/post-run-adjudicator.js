@@ -3,7 +3,10 @@
 const peNaming = require('./pe-naming');
 
 const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
-const BUSINESS_PATH_RE = /(?:\/api\/|\/graphql|\/batch|\/print|\/upload|\/save|\/create|\/update|\/delete|\/edoc|\/patient|\/case|\/tasks?|\/scheduler\/index\/data)/i;
+// Universal business VERBS only. App-specific nouns (/patient, /edoc,
+// /scheduler/index/data, ...) live in playbooks as protectedCalls — baked-in
+// app paths are how one flow's rules silently misjudge the next app's.
+const BUSINESS_PATH_RE = /(?:\/api\/|\/graphql|\/batch|\/print|\/upload|\/download|\/export|\/save|\/create|\/update|\/delete|\/submit|\/tasks?)/i;
 const SESSION_PATH_RE = /(?:login|auth|oauth|oidc|saml|sso|callback|token|session|csrf|authorize|jwt\/v2\/create-cookie|iam)/i;
 const SESSION_MATERIAL_RE = /(?:sess|session|token|csrf|xsrf|auth|iam|idem|sso|jwt|access|refresh|PHPSESSID)/i;
 const INTERCEPTOR_AUTHORIZE_RE = /\/s\/interceptor\/authorize\/?(?:\?|$)/i;
@@ -121,7 +124,9 @@ function classifyOne({ entry, index, label, row, flow, attemptedDisable, guard, 
 
     if (attemptedDisable && !foldableRedirectHop && (protectedByGuard || consumedOutputCount > 0 || businessRequest || sessionMaterial)) {
         return buildDecision('blocked_disable', 'protect', {
-            entry, index, label, row, flow, reason: protectedByGuard ? 'business guard protected this sampler' : 'disable would remove required producer/business sampler',
+            entry, index, label, row, flow,
+            tier: protectedByGuard ? 'guard' : 'evidence',
+            reason: protectedByGuard ? 'business guard protected this sampler' : 'disable would remove required producer/business sampler',
         });
     }
 
@@ -153,7 +158,9 @@ function classifyOne({ entry, index, label, row, flow, attemptedDisable, guard, 
 
     if (protectedByGuard || businessRequest) {
         return buildDecision('business_request', 'protect', {
-            entry, index, label, row, flow, reason: protectedByGuard ? 'business guard protected this sampler' : 'business request must not be disabled',
+            entry, index, label, row, flow,
+            tier: protectedByGuard ? 'guard' : 'prior',
+            reason: protectedByGuard ? 'business guard protected this sampler' : 'business request must not be disabled',
         });
     }
 
@@ -165,37 +172,47 @@ function classifyOne({ entry, index, label, row, flow, attemptedDisable, guard, 
 
     if (safeNoise && consumedOutputCount === 0 && failed) {
         return buildDecision('safe_browser_plumbing', 'disable', {
-            entry, index, label, row, flow, reason: 'browser or third-party noise with no downstream consumer',
+            entry, index, label, row, flow, tier: 'prior', reason: 'browser or third-party noise with no downstream consumer',
         });
     }
 
     if (failed && consumedOutputCount === 0 && isDeadPlumbingPath(path, hay)) {
         return buildDecision('dead_plumbing', 'disable', {
-            entry, index, label, row, flow, reason: 'failing plumbing sampler has no downstream consumed output',
+            entry, index, label, row, flow, tier: 'prior', reason: 'failing plumbing sampler has no downstream consumed output',
         });
     }
 
     if (sessionLike && failed) {
         return buildDecision('session_producer', 'protect', {
-            entry, index, label, row, flow, reason: 'auth/session-like sampler is not safe to fold without stronger proof',
+            entry, index, label, row, flow, tier: 'prior', reason: 'auth/session-like sampler is not safe to fold without stronger proof',
         });
     }
 
     if (failed) {
         return buildDecision('unknown', 'review', {
-            entry, index, label, row, flow, reason: 'insufficient evidence for automatic action',
+            entry, index, label, row, flow, tier: 'review', reason: 'insufficient evidence for automatic action',
         });
     }
 
     return null;
 }
 
-function buildDecision(category, action, { entry, index, label, row, flow, reason }) {
+/**
+ * Evidence tiers, highest first — every decision declares its basis so a
+ * human (and the replanner) can see WHY a sampler was judged:
+ *   guard    — operator config, steering, golden script (via the guard)
+ *   evidence — observed facts: consumption links, session material, root cause
+ *   prior    — pattern knowledge (regexes/playbooks); may only act when no
+ *              higher-tier evidence contradicts it
+ *   review   — insufficient basis for automatic action
+ */
+function buildDecision(category, action, { entry, index, label, row, flow, reason, tier = 'evidence' }) {
     return {
         index,
         samplerLabel: label,
         category,
         action,
+        tier,
         reason,
         method: methodOf(entry),
         url: entry.request && entry.request.url || '',

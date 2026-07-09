@@ -1337,6 +1337,11 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     if (Array.isArray(gen.playbookDisables) && gen.playbookDisables.length) {
         enrichedRunCfg.disableCalls = [...(enrichedRunCfg.disableCalls || []), ...gen.playbookDisables];
     }
+    // App-specific business nouns from playbooks: the guard protects them so
+    // no generic regex ever has to know one app's endpoint names.
+    if (Array.isArray(gen.playbookProtects) && gen.playbookProtects.length) {
+        enrichedRunCfg.protectedCalls = [...(enrichedRunCfg.protectedCalls || []), ...gen.playbookProtects];
+    }
     if (Array.isArray(gen.playbooksApplied) && gen.playbooksApplied.length) {
         enrichedRunCfg.llmFlowNotes = gen.effectiveLlmFlowNotes;
         onLog(`playbooks: ${gen.playbooksApplied.map(p => p.id).join(', ')}`);

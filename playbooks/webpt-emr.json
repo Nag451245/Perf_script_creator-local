@@ -1,0 +1,18 @@
+{
+  "id": "webpt-emr",
+  "description": "WebPT EMR application nouns. These used to be baked into the generic business-path regex; they are WebPT-specific and belong here so other apps are never judged by them.",
+  "match": {
+    "hostsAny": ["webpt.com"]
+  },
+  "protectedCalls": [
+    "/patient/",
+    "/edoc",
+    "/case/",
+    "/scheduler/index/data",
+    "/user/iam/save"
+  ],
+  "llmFlowNotes": [
+    "WebPT EMR: /patient/, /edoc, /case/, /scheduler/index/data and /user/iam/save are business-critical endpoints — never disable them to make a run green."
+  ],
+  "expectations": ["WebPT business nouns protected via playbook, not generic code"]
+}

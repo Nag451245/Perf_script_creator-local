@@ -914,6 +914,50 @@ test('run flags: iterations honor the new max of 6', () => {
     assert.ok(flagsForRunRequest({ mode: 'agent', iterations: 9 }).join(' ').includes('--iterations 6'), 'above max clamps to 6');
 });
 
+test('playbooks: protectedCalls carry app-specific business nouns (de-WebPT the regexes)', () => {
+    const { applyPlaybooks } = require('../src/playbooks');
+    const entries = [
+        { request: { method: 'GET', url: 'https://stgapp.webpt.com/patient/display/getnewpatients', headers: [] }, response: { status: 200, content: { text: '' } } },
+    ];
+    const out = applyPlaybooks({ entries, fingerprintSignals: [], runCfg: {} });
+    assert.ok(out.applied.some(p => p.id === 'webpt-emr'), 'webpt playbook matched by host');
+    assert.ok(out.addedProtects.includes('/patient/'), 'app noun protected via playbook');
+    assert.ok(out.runCfg.protectedCalls.includes('/scheduler/index/data'));
+    // A non-WebPT app never sees those nouns.
+    const other = applyPlaybooks({ entries: [{ request: { method: 'GET', url: 'https://other.example.com/patient/1', headers: [] }, response: { status: 200, content: { text: '' } } }], fingerprintSignals: [], runCfg: {} });
+    assert.ok(!other.applied.some(p => p.id === 'webpt-emr'));
+    // And the generic regex no longer contains app nouns: a mutating request
+    // to an app-specific noun is NOT business by prior alone...
+    const { _internal: adjInternal } = require('../src/post-run-adjudicator');
+    const dec = adjInternal.classifyOne({
+        entry: { request: { method: 'POST', url: 'https://other.example.com/edoc/upload-meta', headers: [] }, response: { status: 200, headers: [], content: { text: '' } } },
+        index: 3, label: 'Step 04 - POST /edoc/upload-meta', row: {}, flow: { consumedOutputCount: 0 },
+        attemptedDisable: null, guard: null, rootCauseIndex: null, authWall: false, failure: null,
+    });
+    // /edoc alone no longer triggers business_request — but /upload (universal verb) does here.
+    assert.ok(!dec || dec.category !== 'unknown', 'universal verb still protects');
+});
+
+test('adjudicator: every decision declares its evidence tier', () => {
+    const { adjudicateRequests } = require('../src/post-run-adjudicator');
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/sdk/evalx/ctx', headers: [] }, response: { status: 404, headers: [], content: { text: '' } } },
+        { request: { method: 'POST', url: 'https://app.test/api/orders/create', headers: [] }, response: { status: 200, headers: [], content: { text: '' } } },
+    ];
+    const evidence = { rows: [
+        { entryIndex: 0, success: false, observedStatus: 404, label: 'Step 01 - GET /sdk/evalx/ctx' },
+        { entryIndex: 1, success: false, observedStatus: 422, label: 'Step 02 - POST /api/orders/create' },
+    ] };
+    const out = adjudicateRequests({ entries, evidence });
+    const noise = out.bySampler['Step 01 - GET /sdk/evalx/ctx'];
+    const business = out.bySampler['Step 02 - POST /api/orders/create'];
+    assert.strictEqual(noise.action, 'disable');
+    assert.strictEqual(noise.tier, 'prior', 'regex-led disable declares itself a prior');
+    assert.strictEqual(business.action, 'protect');
+    assert.strictEqual(business.tier, 'prior', 'business-verb protection without guard is a prior');
+    assert.ok(Object.values(out.byIndex).every(d => ['guard', 'evidence', 'prior', 'review'].includes(d.tier)), 'all decisions carry a valid tier');
+});
+
 test('AI provider label prefers OpenAI over Gemini when both are configured', () => {
     assert.strictEqual(runnerInternal.llmProviderLabel({ OPENAI_API_KEY: 'openai-key', GOOGLE_API_KEY: 'google-key' }), 'OpenAI');
     assert.strictEqual(runnerInternal.llmProviderLabel({ GOOGLE_API_KEY: 'google-key' }), 'Gemini');

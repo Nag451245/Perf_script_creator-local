@@ -181,6 +181,15 @@ async function processUnit(unit) {
     // below needs it for config-driven disableCalls / oauth gate / loadProfile.
     const genOpts = { dualHarHints: notes, secondaryEntries, runCfg: CONFIG.run || {} };
 
+    // Human-fixed working script for this flow (input/<flow>__golden.jmx):
+    // its proven extractors / enable judgments are merged into generation.
+    if (unit.golden) {
+        try {
+            genOpts.goldenXml = fs.readFileSync(unit.golden, 'utf8');
+            rec(`golden script attached: ${path.basename(unit.golden)} — proven fixes will be merged`);
+        } catch (e) { rec(`golden script unreadable (${e.message}) — ignored`); }
+    }
+
     // Pre-flight: replay the recording against the target with our Node-only
     // fast-replay engine BEFORE booting JMeter. Catches the obvious "doesn't even
     // respond / wrong host" class in <1s. Runs automatically in --run mode (and

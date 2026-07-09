@@ -1,0 +1,10 @@
+{
+  "_comment": "Synthetic login+create-task flow. Pins the agent's JUDGMENT: form-input correlation fires, the Next.js playbook disables build-data, the outcome probe lands on the echoing read, and no orphan variables ship.",
+  "stats": {
+    "samplers": { "min": 4, "max": 6 },
+    "formCorrelations": 1,
+    "orphans": 0,
+    "parameterized": { "min": 1 },
+    "outcomeProbe.injected": 1
+  }
+}

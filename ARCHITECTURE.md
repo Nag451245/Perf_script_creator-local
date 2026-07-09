@@ -132,6 +132,35 @@ The goal is 80%-grunt-work → 20%-review, fully auditable — not zero-human.
   `--agent` run a bounded headless loop; OpenAI/Gemini is optional and key-gated).
 
 ## Update log (built since the phase notes above)
+- **Golden-script learner** (`src/golden-diff.js`) — drop a human-fixed
+  WORKING script into `input/` as `<flow>__golden.jmx`: its proven extractors
+  are copied verbatim, its enable/disable judgments mirrored (guard treats
+  them as operator decisions), its literal→`${var}` substitutions re-applied.
+  Trusted but verified — the merged script still runs the full loop.
+- **Stack playbooks** (`src/playbooks.js` + `playbooks/*.json`) — senior
+  priors as DATA, matched by recording evidence (fingerprint/hosts/paths),
+  merged with precedence config > playbook > defaults. Starter set: Auth0
+  Universal Login, Dynatrace RUM, Next.js build-data, LaunchDarkly, SAML
+  auto-POST.
+- **Blocked-state report** (`src/blockers.js`) — a not-GREEN run now ends
+  with PRECISE human asks (`_blockers.md`): credentials, MFA account, env
+  health check, second recording, signing secrets — instead of "needs
+  attention".
+- **Scenario designer** (`src/scenario.js`, `run.scenario`) — Little's Law
+  from transactions/hour + recorded session length to threads / ramp /
+  pacing (native Precise Throughput Timer) / CSV pool size, math shown in
+  `<flow>_scenario.md`. Explicit `run.loadProfile` still wins.
+- **Outcome probe** (`src/outcome-probe.js`) — finds the recorded echo pair
+  (business mutation submits V → later read's response contains V) and
+  asserts it, so "every request 200s but nothing was created" can no longer
+  be GREEN.
+- **Fingerprint-keyed lessons** — verified lessons now carry the stack
+  fingerprint; same-stack experience ranks first when matching, so lessons
+  transfer across apps built on the same stack.
+- **Eval harness** (`npm run eval`, `eval-corpus/`) — outcome-level
+  regression corpus for the agent's judgment (sampler counts, wirings,
+  probes, zero orphans). Synthetic fixtures are committed; real recordings
+  stay local in gitignored `eval-corpus/local-*` dirs.
 - **Form hidden-input correlation** (`correlateFormHiddenInputs` in
   `src/transforms.js`) — the class the manually-fixed Tasking script solved by
   hand: a page body carries `<input type="hidden" name=X value=V>` (IdP login

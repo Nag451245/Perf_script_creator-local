@@ -10,3 +10,5 @@ perfscript.config.json
 **/_baseline_diff.json
 memory/verified-lessons.json
 .perfscript-state/
+# real customer recordings never enter git — only synthetic eval fixtures do
+eval-corpus/local-*/

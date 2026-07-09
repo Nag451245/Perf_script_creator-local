@@ -130,9 +130,10 @@ function normalizeSegment(segment, index) {
     return index === 0 ? s.toLowerCase() : ':segment';
 }
 
-function findMatchingLessons({ storePath = defaultStorePath(), failures = [], minConfidence = 0.85 } = {}) {
+function findMatchingLessons({ storePath = defaultStorePath(), failures = [], minConfidence = 0.85, stackFingerprint = [] } = {}) {
     const lessons = loadLessons(storePath).filter(l => Number(l.confidence || 0) >= minConfidence);
     const failureList = normalizeFailures(failures);
+    const currentStacks = new Set((stackFingerprint || []).map(s => String(s && s.stack || s)));
     const matches = [];
     for (const failure of failureList) {
         const failurePattern = normalizePattern(failure.samplerName || failure.label || failure.name || failure.url || '');
@@ -142,21 +143,26 @@ function findMatchingLessons({ storePath = defaultStorePath(), failures = [], mi
             const fix = adaptFixForFailure(lesson.fix, failure);
             const gate = validateLlmPatches([fix]);
             if (!gate.accepted.length) continue;
+            const stackOverlap = (lesson.stackFingerprint || []).filter(s => currentStacks.has(s)).length;
             matches.push({
                 lessonId: lesson.id,
                 confidence: lesson.confidence,
                 flowName: lesson.flowName,
                 symptom: lesson.symptom,
                 contextPattern: lesson.contextPattern,
+                stackOverlap,
                 fix: gate.accepted[0],
                 failure,
             });
         }
     }
-    return dedupeMatches(matches);
+    // Same-stack experience first: an Auth0+GraphQL lesson outranks a generic
+    // one when this recording fingerprints as Auth0+GraphQL.
+    return dedupeMatches(matches).sort((a, b) =>
+        (b.stackOverlap - a.stackOverlap) || (Number(b.confidence) - Number(a.confidence)));
 }
 
-function learnFromRun({ storePath = defaultStorePath(), flowName = '', sourceRun = '', appHost = '', result = {}, fixes = [] } = {}) {
+function learnFromRun({ storePath = defaultStorePath(), flowName = '', sourceRun = '', appHost = '', result = {}, fixes = [], stackFingerprint = [] } = {}) {
     if (!result || result.success !== true) return { learned: [], skipped: [{ reason: 'run_not_green' }] };
     const safeFixes = sanitizeFixes(fixes);
     if (!safeFixes.length) return { learned: [], skipped: [{ reason: 'no_safe_fixes' }] };
@@ -165,7 +171,7 @@ function learnFromRun({ storePath = defaultStorePath(), flowName = '', sourceRun
     const bySignature = new Map(existing.map(lesson => [lesson.signature, lesson]));
     const learned = [];
     for (const fix of safeFixes) {
-        const lesson = buildLesson({ flowName, sourceRun, appHost, result, fix });
+        const lesson = buildLesson({ flowName, sourceRun, appHost, result, fix, stackFingerprint });
         if (!lesson) continue;
         const current = bySignature.get(lesson.signature);
         if (current) {
@@ -212,7 +218,7 @@ function importLessons({ storePath = defaultStorePath(), importPath } = {}) {
     return { importPath, storePath, imported, total: bySignature.size };
 }
 
-function buildLesson({ flowName, sourceRun, appHost, result, fix }) {
+function buildLesson({ flowName, sourceRun, appHost, result, fix, stackFingerprint = [] }) {
     const contextPattern = {
         samplerPattern: normalizePattern(fix.sampler || '*'),
         fixKind: fix.kind,
@@ -226,6 +232,9 @@ function buildLesson({ flowName, sourceRun, appHost, result, fix }) {
         lastVerifiedAt: now,
         sourceRun: redactSensitive(sourceRun),
         appHostHash: appHost ? sha256(String(appHost)).slice(0, 16) : null,
+        // Experience compounds across APPS with the same stack, not just the
+        // same host: an Auth0+GraphQL lesson helps the next Auth0 customer.
+        stackFingerprint: (stackFingerprint || []).map(s => String(s && s.stack || s)).filter(Boolean).slice(0, 8),
         flowName: redactSensitive(flowName || 'unknown'),
         symptom: {
             failureCategory: fix.kind,
@@ -256,6 +265,9 @@ function sanitizeLesson(raw) {
         lastVerifiedAt: raw.lastVerifiedAt || raw.createdAt || new Date().toISOString(),
         sourceRun: redactSensitive(raw.sourceRun || ''),
         appHostHash: raw.appHostHash ? String(raw.appHostHash).replace(/[^a-f0-9]/ig, '').slice(0, 32) : null,
+        stackFingerprint: Array.isArray(raw.stackFingerprint)
+            ? raw.stackFingerprint.map(s => String(s).slice(0, 60)).slice(0, 8)
+            : [],
         flowName: redactSensitive(raw.flowName || 'unknown'),
         symptom: redactSensitive(raw.symptom || {}),
         contextPattern,

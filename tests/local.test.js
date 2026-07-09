@@ -28,6 +28,7 @@ const businessGuard = require('../src/business-guard');
 const { escalateToLlm, _internal: runnerInternal } = require('../src/runner');
 const learningStore = require('../src/learning-store');
 const { groupInputs } = require('../src/ingest');
+const goldenDiff = require('../src/golden-diff');
 const { knownDefinedVars, planExtractor, _internal: extractorsInternal } = require('../src/extractors');
 const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun, rewireClientMintedOauthVars, repairAuth0LoginStateExtractors, correlateFormHiddenInputs } = require('../src/transforms');
 const { scrubRecordingXml } = require('../src/scrubber');
@@ -393,6 +394,226 @@ test('assertion miner: auto-submit bridge pages get no mined assertions', () => 
     const bridge = '<html><body onload="document.forms[0].submit()"><form method="POST" action="https://sso.test/authorization/"><input type="hidden" name="token" value="abc123def456"/></form></body></html>';
     assert.strictEqual(_internal.isAutoSubmitBridgePage(bridge), true);
     assert.strictEqual(_internal.isAutoSubmitBridgePage('<html><h1>Dashboard</h1><form method="POST"><input type="text" name="q"/></form></html>'), false);
+});
+
+test('golden ingest: <flow>__golden.jmx pairs with its unit and is never a standalone input', () => {
+    const files = [
+        path.join('input', 'createtask__run1.jmx'),
+        path.join('input', 'createtask__run2.jmx'),
+        path.join('input', 'createtask__golden.jmx'),
+        path.join('input', 'other.har'),
+    ];
+    const units = groupInputs(files);
+    const dual = units.find(u => u.kind === 'dual-jmx');
+    assert.ok(dual, 'dual-jmx unit exists');
+    assert.strictEqual(path.basename(dual.golden || ''), 'createtask__golden.jmx');
+    assert.ok(!units.some(u => /golden/i.test(path.basename(u.primary))), 'golden is not its own unit');
+    const har = units.find(u => u.kind === 'har');
+    assert.ok(har && !har.golden, 'unrelated unit gets no golden');
+});
+
+test('golden diff: proven extractors copied verbatim, enable judgments mirrored, literals -> ${var}', () => {
+    const goldenXml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /login" enabled="true">
+    <stringProp name="HTTPSampler.path">/login</stringProp>
+  </HTTPSamplerProxy><hashTree>
+    <HtmlExtractor guiclass="HtmlExtractorGui" testclass="HtmlExtractor" testname="Extract state (CSS)" enabled="true">
+      <stringProp name="HtmlExtractor.refname">state</stringProp>
+      <stringProp name="HtmlExtractor.expr">input[name=&quot;state&quot;]</stringProp>
+      <stringProp name="HtmlExtractor.attribute">value</stringProp>
+    </HtmlExtractor><hashTree/>
+  </hashTree>
+  <HTTPSamplerProxy testname="Step 02 - POST /login" enabled="true">
+    <stringProp name="HTTPSampler.path">/login?state=\${state}</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 04 - GET /telemetry" enabled="false">
+    <stringProp name="HTTPSampler.path">/telemetry</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 05 - GET /callback" enabled="true">
+    <stringProp name="HTTPSampler.path">/callback</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const generatedXml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /login" enabled="true">
+    <stringProp name="HTTPSampler.path">/login</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - POST /login" enabled="true">
+    <stringProp name="HTTPSampler.path">/login?state=STALELITERAL123</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 03 - GET /beacon" enabled="true">
+    <stringProp name="HTTPSampler.path">/beacon</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 04 - GET /telemetry" enabled="true">
+    <stringProp name="HTTPSampler.path">/telemetry</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 05 - GET /callback" enabled="false">
+    <stringProp name="HTTPSampler.path">/callback</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+
+    const deltas = goldenDiff.diffGoldenAgainstGenerated({ goldenXml, generatedXml });
+    assert.strictEqual(deltas.extractorsToAdd.length, 1);
+    assert.strictEqual(deltas.extractorsToAdd[0].refname, 'state');
+    assert.deepStrictEqual(deltas.toDisable.map(d => d.sampler).sort(), [
+        'Step 03 - GET /beacon',   // absent in golden => senior deleted it
+        'Step 04 - GET /telemetry',
+    ]);
+    assert.deepStrictEqual(deltas.toEnable.map(d => d.sampler), ['Step 05 - GET /callback']);
+    assert.strictEqual(deltas.substitutions.length, 1);
+    assert.strictEqual(deltas.substitutions[0].literal, 'STALELITERAL123');
+
+    const res = goldenDiff.applyGoldenDeltas(generatedXml, deltas);
+    assert.strictEqual(res.applied.extractors, 1);
+    assert.strictEqual(res.applied.disabled, 2);
+    assert.strictEqual(res.applied.enabled, 1);
+    assert.strictEqual(res.applied.substitutions, 1);
+    assert.match(res.xml, /HtmlExtractor[^>]*testname="Extract state \(CSS\)"/);
+    assert.match(res.xml, /\/login\?state=\$\{state\}/);
+    assert.match(res.xml, /testname="Step 03 - GET \/beacon" enabled="false"/);
+    assert.match(res.xml, /testname="Step 04 - GET \/telemetry" enabled="false"/);
+    assert.match(res.xml, /testname="Step 05 - GET \/callback" enabled="true"/);
+});
+
+test('playbooks: matched by recording evidence, explicit config keeps precedence', () => {
+    const { applyPlaybooks } = require('../src/playbooks');
+    const entries = [
+        { request: { method: 'GET', url: 'https://stglogin.example.auth0.com/u/login/identifier?state=x', headers: [] }, response: { status: 200, content: { text: '' } } },
+        { request: { method: 'GET', url: 'https://app.test/_next/data/abc123/tasks.json', headers: [] }, response: { status: 200, content: { text: '' } } },
+    ];
+    const out = applyPlaybooks({ entries, fingerprintSignals: [], runCfg: { oauth: { dropBareStateNonce: false }, disableCalls: ['/_next/data/'] } });
+    const ids = out.applied.map(p => p.id).sort();
+    assert.deepStrictEqual(ids, ['auth0-universal-login', 'nextjs-build-data']);
+    // Explicit config wins: operator said false, the auth0 playbook must not flip it.
+    assert.strictEqual(out.runCfg.oauth.dropBareStateNonce, false);
+    // Already-configured disable is not duplicated.
+    assert.strictEqual(out.runCfg.disableCalls.filter(d => d === '/_next/data/').length, 1);
+    assert.deepStrictEqual(out.addedDisables, [], 'no new disables: auth0 has none, nextjs already configured');
+    assert.ok(out.runCfg.llmFlowNotes.some(n => /Universal Login/i.test(n)), 'playbook notes merged');
+    // A recording with no matching evidence applies nothing.
+    const none = applyPlaybooks({ entries: [{ request: { method: 'GET', url: 'https://plain.example.com/home', headers: [] }, response: { status: 200, content: { text: '' } } }], fingerprintSignals: [], runCfg: {} });
+    assert.deepStrictEqual(none.applied, []);
+});
+
+test('blockers: terminal failures translate to precise human asks', () => {
+    const { deriveBlockers } = require('../src/blockers');
+    const blockers = deriveBlockers({
+        result: {
+            success: false,
+            samples: [
+                { label: 'Step 08 - POST /u/login/identifier', success: false, responseCode: '401' },
+                { label: 'Step 18 - GET /redirect/', success: false, responseCode: '500' },
+            ],
+        },
+        runCfg: { credentials: { username: '' } },
+        entries: [{ request: { method: 'POST', url: 'https://idp.test/mfa/challenge', postData: { text: 'otp=123456' } } }],
+        hasSecondRecording: false,
+        ghostsRefused: 2,
+    });
+    const ids = blockers.map(b => b.id).sort();
+    assert.deepStrictEqual(ids, ['credentials', 'environment', 'mfa', 'second-recording', 'signing-secret']);
+    const creds = blockers.find(b => b.id === 'credentials');
+    assert.match(creds.ask, /run\.credentials/);
+    // A green run yields no blockers.
+    assert.deepStrictEqual(deriveBlockers({ result: { success: true, samples: [] } }), []);
+});
+
+test('scenario designer: Little\'s Law from objective to threads/pacing/data pool', () => {
+    const { designScenario, insertPacingTimers } = require('../src/scenario');
+    const entries = [
+        { startedDateTime: '2026-01-01T10:00:00.000Z', request: { url: 'https://a/b' } },
+        { startedDateTime: '2026-01-01T10:00:30.000Z', request: { url: 'https://a/c' } },
+    ];
+    const s = designScenario({ entries, runCfg: { scenario: { transactionsPerHour: 600, durationMin: 60 } } });
+    assert.strictEqual(s.threads, 5, 'ceil(600 × 30s / 3600) = 5');
+    assert.strictEqual(Math.round(s.pacingSeconds), 30, '5 × 3600 / 600 = 30s per iteration');
+    assert.strictEqual(s.uniqueRows, 660, '600 iterations + 10% headroom');
+    assert.strictEqual(s.loadProfile.users, 5);
+    assert.ok(s.mathLines.some(l => /Little/i.test(l)), 'the math is shown');
+    const xml = '<ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="TG" enabled="true"><stringProp name="ThreadGroup.num_threads">1</stringProp></ThreadGroup>\n<hashTree>\n</hashTree>';
+    const pt = insertPacingTimers(xml, s.pacing);
+    assert.strictEqual(pt.inserted, 1);
+    assert.match(pt.xml, /PreciseThroughputTimer/);
+    // No scenario config → no plan; explicit loadProfile is never touched here.
+    assert.strictEqual(designScenario({ entries, runCfg: {} }), null);
+});
+
+test('outcome probe: recorded echo pair found and asserted on the echoing sampler', () => {
+    const { planOutcomeProbe, injectOutcomeProbe } = require('../src/outcome-probe');
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/home' }, response: { content: { text: '<html>home</html>' } } },
+        { request: { method: 'POST', url: 'https://app.test/api/tasks', postData: { text: '{"title":"Probe Task Omega 7"}' } }, response: { content: { text: '{"id":1}' } } },
+        { request: { method: 'GET', url: 'https://app.test/api/tasks' }, response: { content: { text: '{"tasks":[{"title":"Probe Task Omega 7"}]}' } } },
+    ];
+    const probe = planOutcomeProbe({ entries, flowName: 'createtask', params: [], runCfg: {} });
+    assert.ok(probe, 'probe pair found');
+    assert.strictEqual(probe.mutatingIndex, 1);
+    assert.strictEqual(probe.probeIndex, 2);
+    assert.strictEqual(probe.text, 'Probe Task Omega 7');
+    const xml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /home" enabled="true"><stringProp name="HTTPSampler.path">/home</stringProp></HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - POST /api/tasks" enabled="true"><stringProp name="HTTPSampler.path">/api/tasks</stringProp></HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 03 - GET /api/tasks" enabled="true"><stringProp name="HTTPSampler.path">/api/tasks</stringProp></HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const out = injectOutcomeProbe(xml, probe);
+    assert.strictEqual(out.injected, 1);
+    assert.match(out.xml, /OUTCOME PROBE[\s\S]*Probe Task Omega 7/);
+    // The assertion landed under the PROBE sampler (step 3), not the mutation.
+    const idx = out.xml.indexOf('OUTCOME PROBE');
+    assert.ok(idx > out.xml.indexOf('Step 03'), 'assertion sits after the probe sampler');
+});
+
+test('learning store: lessons carry the stack fingerprint and same-stack matches rank first', () => {
+    const out = tmp();
+    const storePath = path.join(out, 'lessons.json');
+    const result = { success: true };
+    learningStore.learnFromRun({
+        storePath, flowName: 'flowA', sourceRun: out, appHost: 'https://a.test', result,
+        fixes: [{ kind: 'setSamplerEnabled', sampler: 'Step 09 - GET /noise', enabled: false }],
+        stackFingerprint: [{ stack: 'OAuth/OIDC' }, { stack: 'GraphQL/API gateway' }],
+    });
+    const saved = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+    const lesson = (saved.lessons || saved)[0];
+    assert.deepStrictEqual(lesson.stackFingerprint, ['OAuth/OIDC', 'GraphQL/API gateway']);
+    const matches = learningStore.findMatchingLessons({
+        storePath,
+        failures: [{ samplerName: 'Step 09 - GET /noise' }],
+        minConfidence: 0,
+        stackFingerprint: [{ stack: 'OAuth/OIDC' }],
+    });
+    assert.strictEqual(matches.length, 1);
+    assert.strictEqual(matches[0].stackOverlap, 1);
+});
+
+test('final green gate: drift on a passing run is a review flag, not a failure', () => {
+    const { evaluateFinalGreenGate } = require('../src/final-green-gate');
+    const drift = [{ index: 0, sampler: 'GET https://a/', issues: [{ kind: 'lengthDriftPct', pct: 45 }] }];
+    const passing = evaluateFinalGreenGate({ result: { success: true }, baselineDiff: { drift } });
+    assert.strictEqual(passing.ok, true, 'GREEN-with-drift, not RED');
+    assert.strictEqual(passing.warnings.length, 1);
+    assert.match(passing.reason, /review flags/i);
+    const failing = evaluateFinalGreenGate({ result: { success: false }, baselineDiff: { drift } });
+    assert.strictEqual(failing.ok, false, 'drift stays blocking evidence on a failing run');
+    assert.ok(failing.categories.includes('baseline_drift'));
+});
+
+test('baseline diff: recorded 3xx replaying as 2xx is redirect folding, not drift', () => {
+    const { diffRunAgainstRecording } = require('../src/verifier');
+    const out = tmp();
+    fs.mkdirSync(path.join(out, 'iteration_1'), { recursive: true });
+    fs.writeFileSync(path.join(out, 'iteration_1', 'results.jtl'), `<?xml version="1.0"?>
+<testResults version="1.2">
+<httpSample t="10" lb="Step 01 - GET /" rc="200" s="true"/>
+<httpSample t="10" lb="Step 02 - GET /page" rc="404" s="false"/>
+</testResults>`);
+    const flatEntries = [
+        { request: { url: 'https://a.test/', method: 'GET' }, response: { status: 302, content: { text: '' } } },
+        { request: { url: 'https://a.test/page', method: 'GET' }, response: { status: 200, content: { text: 'hello world page' } } },
+    ];
+    const diff = diffRunAgainstRecording({ outDir: out, flatEntries });
+    assert.strictEqual(diff.folded.length, 1, '302→200 folded');
+    assert.strictEqual(diff.folded[0].recorded, 302);
+    assert.strictEqual(diff.drift.length, 1, '200→404 is REAL drift');
+    assert.strictEqual(diff.drift[0].issues[0].kind, 'statusDiff');
 });
 
 test('AI provider label prefers OpenAI over Gemini when both are configured', () => {
@@ -1027,9 +1248,16 @@ test('status analysis: recording-first status semantics explain 2xx, 3xx, 4xx, a
     assert.strictEqual(changedSuccess.category, 'success_code_drift');
     assert.match(changedSuccess.repairHint, /recording expected 202/i);
 
-    const redirectLost = statusAnalysis.classifyStatusTransition(302, 200);
-    assert.strictEqual(redirectLost.category, 'redirect_flow_drift');
-    assert.strictEqual(redirectLost.recordedFamily, '3xx');
+    // Recorded 302 replaying as 200 is JMeter's redirect FOLDING, not drift —
+    // a passing flow must never be failed over it (live run verify7 evidence).
+    const redirectFolded = statusAnalysis.classifyStatusTransition(302, 200);
+    assert.strictEqual(redirectFolded.category, 'redirect_folded_by_replay');
+    assert.strictEqual(redirectFolded.folded, true);
+    assert.strictEqual(redirectFolded.relevance, 'informational');
+    // A redirect that replays as an ERROR is still real drift.
+    const redirectBroken = statusAnalysis.classifyStatusTransition(302, 404);
+    assert.strictEqual(redirectBroken.category, 'redirect_flow_drift');
+    assert.ok(!redirectBroken.folded);
 
     assert.strictEqual(statusAnalysis.classifyStatusTransition(200, 401).category, 'auth_or_session_correlation_failed');
     assert.strictEqual(statusAnalysis.classifyStatusTransition(200, 422).category, 'request_payload_or_header_failed');
@@ -1043,7 +1271,7 @@ test('status analysis: traces root cause to earliest upstream recording drift be
         entry('GET', 'https://app.test/me', { status: 200, body: '{"user":true}' }),
     ];
     const samples = [
-        { label: 'Step 01 - GET /auth', code: '200', success: true, isTransaction: false },
+        { label: 'Step 01 - GET /auth', code: '404', success: false, isTransaction: false },
         { label: 'Step 02 - GET /callback', code: '200', success: true, isTransaction: false },
         { label: 'Step 03 - GET /me', code: '401', success: false, isTransaction: false },
     ];
@@ -1054,6 +1282,18 @@ test('status analysis: traces root cause to earliest upstream recording drift be
     assert.strictEqual(root.rootCause.category, 'redirect_flow_drift');
     assert.strictEqual(root.failing.category, 'auth_or_session_correlation_failed');
     assert.match(root.summary, /earliest upstream divergence/i);
+
+    // A 302→200 fold upstream of a failure is NOT the root cause.
+    const foldedSamples = [
+        { label: 'Step 01 - GET /auth', code: '200', success: true, isTransaction: false },
+        { label: 'Step 02 - GET /callback', code: '200', success: true, isTransaction: false },
+        { label: 'Step 03 - GET /me', code: '401', success: false, isTransaction: false },
+    ];
+    const root2 = statusAnalysis.traceStatusRootCause({ entries, samples: foldedSamples, failingIndex: 2 });
+    assert.strictEqual(root2.rootCauseIndex, 2, 'the 401 itself is the earliest real divergence');
+    // And a fully-passing folded run yields no root cause at all.
+    const cleanSamples = foldedSamples.map(s => ({ ...s, code: s.label.includes('Step 03') ? '200' : s.code, success: true }));
+    assert.strictEqual(statusAnalysis.traceStatusRootCause({ entries, samples: cleanSamples }), null);
 });
 
 test('failure classifier: uses status root cause evidence when available', () => {
@@ -1163,7 +1403,11 @@ test('final green gate: rejects status drift, semantic drift, and failed busines
         businessVerification: { ok: false, reason: 'protected sampler missing' },
     });
     assert.strictEqual(rejected.ok, false);
-    assert.deepStrictEqual(rejected.categories, ['baseline_drift', 'semantic_drift', 'business_verification_failed']);
+    // Baseline drift on a PASSING run is a review warning (GREEN-with-drift);
+    // semantic drift and business verification stay hard blockers.
+    assert.deepStrictEqual(rejected.categories, ['semantic_drift', 'business_verification_failed']);
+    assert.strictEqual(rejected.warnings.length, 1);
+    assert.strictEqual(rejected.warnings[0].category, 'baseline_drift');
 });
 
 test('request diff: identifies stale request values and redirect header drift', () => {

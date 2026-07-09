@@ -1,0 +1,12 @@
+{
+  "id": "launchdarkly-flags",
+  "description": "LaunchDarkly feature-flag evaluation calls embed the recorded user context (base64 in the URL) — user-specific, cacheable, and irrelevant to business-flow correctness.",
+  "match": {
+    "pathsAny": ["/sdk/evalx/"]
+  },
+  "disableCalls": ["/sdk/evalx/"],
+  "llmFlowNotes": [
+    "LaunchDarkly /sdk/evalx/ calls carry the recorded user's context in the URL; they are feature-flag lookups, safe to disable. /sdk/goals and /events/diagnostic are lightweight and may stay enabled."
+  ],
+  "expectations": ["/sdk/evalx flag-evaluation samplers disabled"]
+}

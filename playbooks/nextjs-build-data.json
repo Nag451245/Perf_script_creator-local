@@ -1,0 +1,12 @@
+{
+  "id": "nextjs-build-data",
+  "description": "Next.js /_next/data/<buildId>/*.json routes embed the deployment's build id in the URL — they 404 the moment the app is redeployed and carry no business state.",
+  "match": {
+    "pathsAny": ["/_next/data/"]
+  },
+  "disableCalls": ["/_next/data/"],
+  "llmFlowNotes": [
+    "Next.js /_next/data/<buildId>/*.json requests are build-artifact fetches: a 404 there means the build id changed, not that the flow is broken. They are safe to disable."
+  ],
+  "expectations": ["/_next/data build-id routes disabled"]
+}

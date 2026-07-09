@@ -73,6 +73,18 @@ function groupInputs(files) {
     const units = [];
     const consumed = new Set();
 
+    // 0) Golden scripts: foo__golden.jmx is a human-fixed WORKING script for
+    //    flow "foo" — never a standalone input. Consumed here, attached to
+    //    the matching unit below so the pipeline can learn from it.
+    const goldenByStem = new Map();
+    const goldenRe = /^(.+?)[_]{1,2}golden\.jmx$/i;
+    for (const f of files) {
+        const m = path.basename(f).match(goldenRe);
+        if (!m) continue;
+        goldenByStem.set(m[1].toLowerCase(), f);
+        consumed.add(f);
+    }
+
     // 1) Dual-HAR pairs: foo__run1.har + foo__run2.har (or _run1 / _run2).
     const harPairRe = /^(.+?)[_]{1,2}run([12])\.har$/i;
     const harPairs = new Map();
@@ -134,6 +146,17 @@ function groupInputs(files) {
         if (consumed.has(f) || !HAR_RE.test(f)) continue;
         units.push({ name: baseName(f), kind: 'har', primary: f });
         consumed.add(f);
+    }
+
+    // Attach goldens to their units by stem (exact stem, else the unit whose
+    // stem is a prefix — "createtask__golden.jmx" pairs with unit "createtask").
+    if (goldenByStem.size) {
+        for (const u of units) {
+            const stem = String(u.name || '').toLowerCase();
+            const golden = goldenByStem.get(stem) ||
+                [...goldenByStem.entries()].find(([g]) => stem.startsWith(g) || g.startsWith(stem))?.[1];
+            if (golden) u.golden = golden;
+        }
     }
 
     return units;

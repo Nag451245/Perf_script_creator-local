@@ -1,0 +1,14 @@
+{
+  "id": "saml-auto-post",
+  "description": "SAML SSO with auto-submitting POST forms: SAMLResponse/RelayState travel via hidden inputs on bridge pages that scripts submit on load.",
+  "match": {
+    "signalsAny": ["saml"]
+  },
+  "llmFlowNotes": [
+    "SAML auto-POST bridge detected: SAMLResponse and RelayState must be CSS-extracted from the bridge page's hidden inputs (input[name=\"SAMLResponse\"]) and posted to the ACS URL. Never assert on bridge-page text; never replay a recorded SAMLResponse — it is signed and time-boxed."
+  ],
+  "expectations": [
+    "SAMLResponse/RelayState extracted from bridge hidden inputs",
+    "no text assertions on auto-submit bridge pages"
+  ]
+}

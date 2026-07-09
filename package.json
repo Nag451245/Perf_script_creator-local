@@ -12,6 +12,7 @@
     "agent": "node index.js --agent",
     "agent:watch": "node index.js --agent --watch",
     "test": "node --test",
+    "eval": "node scripts/eval.js",
     "prepare": "git config core.hooksPath githooks 2>/dev/null || true"
   },
   "engines": { "node": ">=18.0.0" }

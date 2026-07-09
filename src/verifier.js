@@ -65,6 +65,7 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
     // Pair JTL samples to recording entries in document order, only using
     // entries the engine kept (filtered) -- those are the ones JMeter ran.
     const drift = [];
+    const folded = [];
     const recBy = (flatEntries || []).map(e => ({
         url: e.request?.url || '',
         method: (e.request?.method || 'GET').toUpperCase(),
@@ -81,6 +82,15 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
         const jBodyLen = Number(j.response?.content?.size || (j.response?.content?.text || '').length || 0);
         const jShape = safeJsonShape(j.response?.content?.text || '');
         const issues = [];
+        // Recorded 3xx that replays 2xx is not drift: the recording stored the
+        // RAW redirect hop while JMeter (follow_redirects) reports the
+        // post-redirect landing. Comparing the redirect stub's body length or
+        // JSON shape against the landing page is equally meaningless — report
+        // the sampler as folded and move on.
+        if (r.status >= 300 && r.status < 400 && jStatus >= 200 && jStatus < 300) {
+            folded.push({ index: i, sampler: `${r.method} ${r.url}`, recorded: r.status, observed: jStatus });
+            continue;
+        }
         if (r.status && jStatus && r.status !== jStatus) {
             const status = statusAnalysis.classifyStatusTransition(r.status, jStatus);
             issues.push({
@@ -108,7 +118,7 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
             isTransaction: false,
         })),
     });
-    return { jtlPath, samplesCompared: compareLen, drift, rootCause };
+    return { jtlPath, samplesCompared: compareLen, drift, folded, rootCause };
 }
 
 /**

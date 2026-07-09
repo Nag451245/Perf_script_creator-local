@@ -7,6 +7,7 @@ function evaluateFinalGreenGate({
     businessVerification = null,
 } = {}) {
     const failures = [];
+    const warnings = [];
 
     if (result.success === false) {
         failures.push({
@@ -15,12 +16,20 @@ function evaluateFinalGreenGate({
         });
     }
 
+    // Baseline drift on a run where every sampler PASSED is a review flag,
+    // not a failure: live dynamic pages legitimately differ in size from a
+    // days-old recording, and assertions + the business guard + the outcome
+    // probe already vouch for correctness. Blocking here made GREEN
+    // unreachable for perfect scripts. Drift stays blocking evidence when
+    // the run itself failed.
     if (baselineDiff && Array.isArray(baselineDiff.drift) && baselineDiff.drift.length > 0) {
-        failures.push({
+        const driftFinding = {
             category: 'baseline_drift',
             reason: `${baselineDiff.drift.length} sampler(s) differed from the recording.`,
             details: baselineDiff.drift,
-        });
+        };
+        if (result.success === false) failures.push(driftFinding);
+        else warnings.push(driftFinding);
     }
 
     if (semanticDiff && Array.isArray(semanticDiff.issues) && semanticDiff.issues.length > 0) {
@@ -43,7 +52,12 @@ function evaluateFinalGreenGate({
         ok: failures.length === 0,
         categories: unique(failures.map(f => f.category)),
         failures,
-        reason: failures.length ? failures.map(f => f.reason).join(' | ') : 'All green gates passed.',
+        warnings,
+        reason: failures.length
+            ? failures.map(f => f.reason).join(' | ')
+            : (warnings.length
+                ? `GREEN with review flags: ${warnings.map(w => w.reason).join(' | ')}`
+                : 'All green gates passed.'),
     };
 }
 

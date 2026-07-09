@@ -46,6 +46,22 @@ function classifyStatusTransition(recordedCode, observedCode) {
         };
     }
 
+    // Recorded 3xx replaying as 2xx is not divergence: the recording stored
+    // the RAW redirect hop; JMeter (follow_redirects) reports the landing.
+    if (recordedFamily === '3xx' && observedFamily === '2xx') {
+        return {
+            recorded,
+            observed,
+            recordedFamily,
+            observedFamily,
+            matchesRecording: false,
+            folded: true,
+            category: 'redirect_folded_by_replay',
+            relevance: 'informational',
+            repairHint: 'JMeter followed the recorded redirect; the 2xx landing is the expected replay shape — nothing to repair.',
+        };
+    }
+
     let category = 'status_drift';
     let repairHint = `Recording expected ${recorded || 'unknown'} but replay observed ${observed || 'unknown'}. Compare this sampler with the recording before judging downstream failures.`;
     if (recordedFamily === '2xx' && observedFamily === '2xx') {
@@ -99,7 +115,7 @@ function traceStatusRootCause({ entries = [], samples = [], failingIndex = null 
         const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
         if (!recorded || !observed) continue;
         const transition = classifyStatusTransition(recorded, observed);
-        if (!transition.matchesRecording) {
+        if (!transition.matchesRecording && !transition.folded) {
             divergences.push({
                 index: i,
                 sampler: samplerLabel(entry, i),
@@ -138,7 +154,9 @@ function firstStatusDivergenceIndex(entries, samples) {
     for (let i = 0; i < compareLen; i++) {
         const recorded = Number(entries[i] && entries[i].response && entries[i].response.status || 0);
         const observed = Number(samples[i] && (samples[i].responseCode || samples[i].code || samples[i].status) || 0);
-        if (recorded && observed && recorded !== observed) return i;
+        if (!recorded || !observed || recorded === observed) continue;
+        if (classifyStatusTransition(recorded, observed).folded) continue; // redirect folding, not divergence
+        return i;
     }
     return -1;
 }

@@ -1,0 +1,12 @@
+{
+  "id": "dynatrace-rum",
+  "description": "Dynatrace Real User Monitoring beacons (/bf? and /rb_bf) — pure telemetry, never part of the business flow, and their payloads embed session-unique values that can never replay.",
+  "match": {
+    "pathsAny": ["/bf?type=", "/rb_bf", "dtcookie"]
+  },
+  "disableCalls": ["/bf?", "/rb_bf"],
+  "llmFlowNotes": [
+    "Dynatrace RUM beacons (/bf?, /rb_bf) are monitoring telemetry: never try to correlate or repair them; they are safe to disable."
+  ],
+  "expectations": ["Dynatrace beacon samplers disabled"]
+}

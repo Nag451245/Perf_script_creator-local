@@ -1,0 +1,18 @@
+{
+  "id": "auth0-universal-login",
+  "description": "Auth0 Universal Login (hosted /u/login/* pages). The fresh login state lives in a hidden form input on the login page, NOT in the /authorize query; single-use plumbing hops must be folded, not replayed.",
+  "match": {
+    "hostsAny": ["auth0.com"],
+    "pathsAny": ["/u/login/identifier", "/u/login/password"]
+  },
+  "oauth": { "dropBareStateNonce": true },
+  "llmFlowNotes": [
+    "Auth0 Universal Login detected: the fresh login state is a hidden input (input[name=\"state\"]) on the login page body — CSS-extract it there and thread it through every /u/login/* request (query, body, Referer). The /authorize query state/nonce are RP-side values that replay fine as recorded literals.",
+    "Do not replay /authorize/resume or /oauth/token as standalone samplers — they carry single-use codes and are auto-followed inside redirect chains."
+  ],
+  "expectations": [
+    "login state CSS-extracted from hidden input on the login page",
+    "auto-submit bridge pages get no text assertions",
+    "/authorize/resume and /oauth/token folded into redirect chains"
+  ]
+}

@@ -33,6 +33,9 @@ const { rewriteHost } = require('./host-rewrite');
 const { sanitizeJavaUnsafeJmx } = require('./java-safe');
 const volatileProtocol = require('./volatile-protocol');
 const seniorPe = require('./senior-pe');
+const playbooks = require('./playbooks');
+const scenario = require('./scenario');
+const outcomeProbe = require('./outcome-probe');
 const {
     wrapPollingInWhileController,
     injectGhostSynthesizers,
@@ -234,11 +237,45 @@ function observedVolatileAuthProtocolNames(entries) {
 }
 
 function generate(entriesRaw, pages, outDir, name, opts = {}) {
-    const { dataRows = 10, runCfg = {}, dualHarHints = {} } = opts;
+    const { dataRows = 10, dualHarHints = {} } = opts;
+    let runCfg = opts.runCfg || {};
     fs.mkdirSync(outDir, { recursive: true });
     const reasoning = [];
     const note = (phase, hypothesis, evidence, action) =>
         reasoning.push({ phase, hypothesis, evidence, action, at: new Date().toISOString() });
+
+    // Stack playbooks: a senior's priors, selected by recording evidence
+    // (fingerprint signals + hosts + paths) BEFORE any decision reads runCfg.
+    // Explicit config always wins; playbooks only add disables/notes and fill
+    // unset oauth flags.
+    const fingerprint = seniorPe._internal.fingerprintStack(entriesRaw);
+    const pbResult = playbooks.applyPlaybooks({
+        entries: entriesRaw,
+        fingerprintSignals: fingerprint.signals || [],
+        runCfg,
+        dir: opts.playbookDir,
+    });
+    runCfg = pbResult.runCfg;
+    if (pbResult.applied.length) {
+        note('playbooks',
+            `${pbResult.applied.length} stack playbook(s) matched this recording`,
+            pbResult.applied.map(p => `${p.id} (${p.evidence.slice(0, 3).join(', ')})`).join('; '),
+            `merged priors: +${pbResult.addedDisables.length} disable pattern(s), notes appended — explicit config keeps precedence`);
+    }
+
+    // Scenario design: business objective (run.scenario) → Little's Law math
+    // → threads / ramp / pacing / data-pool size. Explicit run.loadProfile
+    // still wins; the scenario fills what the operator left unset.
+    const scenarioPlan = scenario.designScenario({ entries: entriesRaw, runCfg });
+    if (scenarioPlan) {
+        if (!runCfg.loadProfile) runCfg = { ...runCfg, loadProfile: scenarioPlan.loadProfile };
+        note('scenario',
+            `objective: ${scenarioPlan.objective.transactionsPerHour}/hour for ${scenarioPlan.objective.durationMin}min`,
+            `recorded session R=${scenarioPlan.sessionSeconds.toFixed(1)}s ⇒ Little's Law threads=${scenarioPlan.threads}, ` +
+            `pacing=${scenarioPlan.pacingSeconds ? scenarioPlan.pacingSeconds.toFixed(1) + 's' : 'unpaced'}, ` +
+            `data pool=${scenarioPlan.uniqueRows} rows`,
+            `derived loadProfile ${runCfg.loadProfile === scenarioPlan.loadProfile ? 'applied' : 'NOT applied (explicit run.loadProfile wins)'} — see _scenario.md for the math`);
+    }
 
     // 1. Filter noise (background auth, static assets, analytics, tunnels).
     const filter = new FilterEngine();
@@ -307,7 +344,8 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     if (candidates.length) {
         csvFile = `${name}_data.csv`;
         fs.writeFileSync(path.join(outDir, csvFile),
-            synthesizeCsv(candidates.map(c => ({ name: c.name, sample: c.value })), dataRows));
+            synthesizeCsv(candidates.map(c => ({ name: c.name, sample: c.value })),
+                Math.max(dataRows, (scenarioPlan && scenarioPlan.uniqueRows) || 0)));
         fs.writeFileSync(path.join(outDir, `${name}_parameters.json`), JSON.stringify(candidates, null, 2));
         params = candidates.map(c => ({
             variableName: c.name, name: c.name,
@@ -466,6 +504,21 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         `mined HTML titles / JSON status keys / page headings from recording`,
         `injected ResponseAssertion (substring, OR) per sampler`);
 
+    // Outcome probe: the recording shows some later read ECHOES the value the
+    // business mutation submitted. Assert that echo so "every request 200s
+    // but the task was never created" can no longer be GREEN.
+    const probe = outcomeProbe.planOutcomeProbe({ entries: flat, flowName: name, params, runCfg });
+    let probeInjected = 0;
+    if (probe) {
+        const pi = outcomeProbe.injectOutcomeProbe(xml, probe);
+        xml = pi.xml;
+        probeInjected = pi.injected;
+        if (pi.injected) note('outcome-probe',
+            `the business result must be VISIBLE, not just accepted`,
+            `recorded: "${probe.mutatingLabel}" submitted a distinctive value that later appears in "${probe.probeLabel}"`,
+            `asserted ${probe.isVariable ? 'the runtime ' + probe.text : 'the submitted value'} in that response — a run that creates nothing can no longer be GREEN`);
+    }
+
     const pacingInj = injectGaussianTimers(xml, flat, pages);
     xml = pacingInj.xml;
     if (pacingInj.injected) note('pacing',
@@ -504,6 +557,37 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             `${dis.disabled} browser/OIDC/noise sampler(s) disabled`,
             `matched: ${dis.hits.slice(0, 8).join(', ')}`,
             `set enabled=false so JMeter skips non-business / un-replayable plumbing`);
+    }
+
+    // Golden-script learning: a human-fixed WORKING script for this flow was
+    // supplied (input/<flow>__golden.jmx). Merge its proven extractors,
+    // enable/disable judgments, and literal→${var} substitutions. Runs after
+    // the pattern disables (golden judgments win) and before dead-extractor
+    // repair (which then heals anything a golden disable strands).
+    let goldenApplied = null;
+    let goldenDisables = [];
+    if (opts.goldenXml) {
+        try {
+            const goldenDiff = require('./golden-diff');
+            const deltas = goldenDiff.diffGoldenAgainstGenerated({ goldenXml: opts.goldenXml, generatedXml: xml });
+            const res = goldenDiff.applyGoldenDeltas(xml, deltas);
+            xml = res.xml;
+            goldenApplied = { ...res.applied, notes: deltas.notes };
+            goldenDisables = (deltas.toDisable || []).map(d => d.sampler);
+            fs.writeFileSync(path.join(outDir, `${name}_golden_deltas.json`),
+                JSON.stringify({ deltas, applied: res.applied }, null, 2));
+            if (res.applied.extractors + res.applied.disabled + res.applied.enabled + res.applied.substitutions > 0) {
+                note('golden',
+                    `human-fixed working script supplied for this flow`,
+                    `diffed model-level: ${deltas.extractorsToAdd.length} proven extractor(s) missing, ` +
+                    `${deltas.toDisable.length} disposable / ${deltas.toEnable.length} must-stay-enabled sampler(s), ` +
+                    `${deltas.substitutions.length} substitution(s)`,
+                    `merged verbatim: +${res.applied.extractors} extractor(s), ${res.applied.disabled} disabled, ` +
+                    `${res.applied.enabled} re-enabled, ${res.applied.substitutions} literal(s) -> \${var}`);
+            }
+        } catch (e) {
+            note('golden', 'golden merge skipped (non-fatal)', e.message, 'generated script shipped without golden deltas');
+        }
     }
 
     // Extractors stranded on now-disabled samplers can never run; their
@@ -551,6 +635,22 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // (Unsupported class file major version 69). The generated .jmx must be
     // runnable when a user opens it directly in JMeter, not only through --run.
     const allowJsr223 = runCfg.allowJsr223 === true;
+    // Scenario pacing: pin the iteration rate to the objective with a native
+    // Precise Throughput Timer (survives the java-safe strip).
+    if (scenarioPlan && scenarioPlan.pacing) {
+        const pt = scenario.insertPacingTimers(xml, scenarioPlan.pacing);
+        if (pt.inserted) {
+            xml = pt.xml;
+            note('scenario-pacing',
+                `pin the rate to ${scenarioPlan.objective.transactionsPerHour}/hour`,
+                `without pacing, achieved load drifts with response times`,
+                `inserted pacing anchor + PreciseThroughputTimer into ${pt.inserted} thread group(s)`);
+        }
+    }
+    if (scenarioPlan) {
+        fs.writeFileSync(path.join(outDir, `${name}_scenario.md`), scenario.renderScenarioMarkdown(name, scenarioPlan));
+    }
+
     const javaSafe = allowJsr223 ? { changed: false, removed: [] } : sanitizeJavaUnsafeJmx(xml);
     if (javaSafe.changed) {
         xml = javaSafe.xml;
@@ -570,7 +670,12 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     }
 
     // Re-validate after our edits so reported stats reflect what we ship.
+    // The engine validator's look-back misses CSV/UDV-supplied variables, so
+    // filter those out the same way the repair path does — stats.orphans must
+    // mean "actually undefined at runtime", not "validator couldn't see it".
     vr = dryRunValidator.validate(xml, corrs);
+    const finalDefined = knownDefinedVars(xml, params.map(p => p.variableName || p.name));
+    vr = { ...vr, orphanReferences: (vr.orphanReferences || []).filter(o => !finalDefined.has(o.variable)) };
 
     const jmxPath = path.join(outDir, `${name}.jmx`);
     fs.writeFileSync(jmxPath, xml);
@@ -614,6 +719,11 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     return {
         jmxPath, flat, csvFile, candidates, ghosts, polling, correlations: corrs,
         plannedExtractors, reasoning, dualHarHints, loadProfile: loadProfileApplied, seniorPeDebrief,
+        goldenDisables, goldenApplied,
+        playbooksApplied: pbResult.applied,
+        playbookDisables: pbResult.addedDisables,
+        effectiveLlmFlowNotes: runCfg.llmFlowNotes || [],
+        scenario: scenarioPlan,
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
             correlations: corrs.length, parameterized: params.length,
@@ -633,6 +743,8 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             bodyCorrelations: bodyCorrelated,
             graphqlCsrfHeaderRepairs: gqlCsrf.substitutions,
             formCorrelations: formCorr.wired.length,
+            goldenApplied,
+            outcomeProbe: probe ? { probeLabel: probe.probeLabel, injected: probeInjected } : null,
             loadProfile: loadProfileApplied,
         },
     };

@@ -28,6 +28,7 @@ const fastRepairLoop = require('./fast-repair-loop');
 const correlationHypotheses = require('./correlation-hypotheses');
 const statusAnalysis = require('./status-analysis');
 const finalGreenGate = require('./final-green-gate');
+const blockersModule = require('./blockers');
 const { runFeedbackLoop } = require(path.join(ENGINE_ROOT, 'src/execution/feedbackLoop'));
 const autoPatcher = require(path.join(ENGINE_ROOT, 'src/execution/autoPatcher'));
 const aiService = require(path.join(ENGINE_ROOT, 'src/services/ai-service'));
@@ -584,6 +585,7 @@ async function tryMemoryPatchRound({ result, jmxPath, config, gen, outDir, name,
             storePath: learning.storePath,
             failures: result,
             minConfidence: learning.autoApplyMinConfidence,
+            stackFingerprint: (gen.seniorPeDebrief && gen.seniorPeDebrief.stackFingerprint && gen.seniorPeDebrief.stackFingerprint.signals) || [],
         })
         : [];
 
@@ -979,6 +981,23 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     onLog(`generated ${path.basename(gen.jmxPath)} — ${gen.stats.samplers} samplers, ` +
         `${gen.stats.correlations} correlations, ${gen.stats.parameterized} parameterized`);
 
+    // Golden judgments are operator decisions: the business guard must not
+    // protect (or fail the verdict over) samplers a human's working script
+    // deliberately disables.
+    if (Array.isArray(gen.goldenDisables) && gen.goldenDisables.length) {
+        enrichedRunCfg.disableCalls = [...(enrichedRunCfg.disableCalls || []), ...gen.goldenDisables];
+        onLog(`golden: adopted ${gen.goldenDisables.length} disable judgment(s) from the working script`);
+    }
+    // Playbook priors likewise: their disables are deliberate, and their flow
+    // notes must reach AI escalation.
+    if (Array.isArray(gen.playbookDisables) && gen.playbookDisables.length) {
+        enrichedRunCfg.disableCalls = [...(enrichedRunCfg.disableCalls || []), ...gen.playbookDisables];
+    }
+    if (Array.isArray(gen.playbooksApplied) && gen.playbooksApplied.length) {
+        enrichedRunCfg.llmFlowNotes = gen.effectiveLlmFlowNotes;
+        onLog(`playbooks: ${gen.playbooksApplied.map(p => p.id).join(', ')}`);
+    }
+
     // 2. Stage data files next to the JMX so CSV Data Sets resolve.
     for (const src of (runCfg.dataFiles || [])) {
         try { fs.copyFileSync(src, path.join(outDir, path.basename(src))); onLog(`staged data file ${path.basename(src)}`); }
@@ -1223,6 +1242,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
             appHost: targetBaseUrl,
             result: finalResult,
             fixes: fixSource,
+            stackFingerprint: (gen.seniorPeDebrief && gen.seniorPeDebrief.stackFingerprint && gen.seniorPeDebrief.stackFingerprint.signals) || [],
         });
         fs.writeFileSync(
             path.join(outDir, `${name}_learned_lessons.json`),
@@ -1231,6 +1251,27 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         if (learnedLessons.learned.length) {
             onLog(`learning memory: saved ${learnedLessons.learned.length} verified lesson(s)`);
         }
+    }
+
+    // Blocked-state report: when the verdict is not GREEN, translate the
+    // terminal evidence into PRECISE human asks instead of "needs attention".
+    let humanBlockers = [];
+    if (!finalResult.success) {
+        try {
+            humanBlockers = blockersModule.deriveBlockers({
+                result: finalResult,
+                runCfg: enrichedRunCfg,
+                entries: gen.flat,
+                hasSecondRecording: !!(genOpts.secondaryEntries && genOpts.secondaryEntries.length),
+                ghostsRefused: (gen.stats && gen.stats.ghostsRefused) || 0,
+            });
+            if (humanBlockers.length) {
+                fs.writeFileSync(path.join(outDir, `${name}_blockers.json`), JSON.stringify(humanBlockers, null, 2));
+                fs.writeFileSync(path.join(outDir, `${name}_blockers.md`), blockersModule.renderBlockersMarkdown(name, humanBlockers));
+                onLog(`BLOCKED — ${humanBlockers.length} precise ask(s) for a human:`);
+                for (const b of humanBlockers) onLog(`  · ${b.ask}`);
+            }
+        } catch (e) { onLog(`blocker analysis skipped: ${e.message}`); }
     }
 
     // 5c. JMeter HTML dashboard. Best-effort; uses the stable JTL when present
@@ -1245,7 +1286,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     } catch (e) { onLog(`dashboard skipped: ${e.message}`); }
 
     return {
-        ok: true, result: finalResult, jmxPath: finalJmxPath,
+        ok: true, result: finalResult, jmxPath: finalJmxPath, humanBlockers,
         stats: gen.stats, baselineDiff, finalGreenGate: finalResult.finalGreenGate || null,
         memoryMatches: llmPatch && llmPatch.memory ? llmPatch.memory.matches || [] : [],
         learnedLessons,

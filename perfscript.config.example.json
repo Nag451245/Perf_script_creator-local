@@ -75,6 +75,14 @@
     "_llmFlowNotes_comment": "Flow-specific guidance appended to the AI escalation prompt (which endpoints are plumbing for THIS app, etc). Keep app names/paths here, not in code.",
     "llmFlowNotes": [],
 
+    "_scenario_comment": "Business objective -> load model (Little's Law). Give transactionsPerHour OR concurrentUsers; the designer derives threads, ramp, pacing (Precise Throughput Timer) and CSV pool size, with the math in <flow>_scenario.md. Explicit loadProfile below still wins.",
+    "scenario": {
+      "transactionsPerHour": 500,
+      "durationMin": 60,
+      "rampUpPercent": 10,
+      "pacing": true
+    },
+
     "_loadProfile_comment": "Optional load shape. Honored at both generate-only and --run. holdSec forces infinite loops + scheduler (whichever finishes first wins — don't combine finite loops with a duration). Omit any field to keep the engine default.",
     "loadProfile": {
       "users": 10,

@@ -7,15 +7,19 @@ const AUTH_PATH_RE = /\/(?:authorize(?:\/resume)?|iam\/callback|redirect|authori
 function analyzeFailureForensics({
     entries = [],
     samples = [],
+    evidence = null,
     baselineDiff = null,
     responseEvidence = [],
 } = {}) {
-    const normalized = normalizeSamples(samples);
-    const divergences = buildDivergenceLedger(entries, normalized, baselineDiff);
+    const normalized = evidence && Array.isArray(evidence.rows)
+        ? normalizeEvidence(evidence)
+        : { entries, samples: normalizeSamples(samples) };
+    const divergences = buildDivergenceLedger(normalized.entries, normalized.samples, baselineDiff);
     const rootCause = divergences[0] || null;
-    const redirects = buildRedirectLedger(entries, normalized, rootCause);
-    const authSession = buildAuthSessionProof(entries, normalized, rootCause);
-    const graphql = buildGraphqlEvidence(entries, normalized, rootCause, responseEvidence);
+    const redirects = buildRedirectLedger(normalized.entries, normalized.samples, rootCause);
+    const authSession = buildAuthSessionProof(normalized.entries, normalized.samples, rootCause);
+    const graphql = buildGraphqlEvidence(normalized.entries, normalized.samples, rootCause, responseEvidence);
+    const bodyComparison = summarizeBodyComparison(evidence);
     const recommendedAction = recommendAction({ rootCause, redirects, authSession, graphql });
 
     return {
@@ -25,11 +29,42 @@ function analyzeFailureForensics({
         authSession,
         redirects,
         graphql,
+        bodyComparison,
         recommendedAction,
         baseline: baselineDiff ? {
             samplesCompared: baselineDiff.samplesCompared || 0,
             driftCount: Array.isArray(baselineDiff.drift) ? baselineDiff.drift.length : 0,
         } : null,
+    };
+}
+
+function normalizeEvidence(evidence) {
+    return {
+        entries: (evidence.rows || []).map(row => row.entry || {}),
+        samples: (evidence.rows || []).filter(row => !row.isTransaction).map(row => ({
+            ...(row.sample || {}),
+            label: row.label,
+            status: Number(row.observedStatus || 0),
+            responseCode: row.observedStatus,
+            code: row.observedStatus,
+            success: row.success,
+            body: row.observedBody,
+            responseBody: row.observedBody,
+            finalUrl: row.finalUrl,
+            urls: row.subUrls,
+        })),
+    };
+}
+
+function summarizeBodyComparison(evidence) {
+    if (!evidence || !Array.isArray(evidence.rows)) {
+        return { ran: false, reason: 'run evidence unavailable' };
+    }
+    const comparable = evidence.rows.filter(row => !row.isTransaction && row.recordedBodyLength > 0 && row.observedBodyLength > 0);
+    return {
+        ran: comparable.length > 0,
+        compared: comparable.length,
+        reason: comparable.length ? '' : 'no recorded and observed response bodies were available for comparison',
     };
 }
 
@@ -40,7 +75,8 @@ function buildDivergenceLedger(entries, samples) {
         const recordedStatus = Number(entry.response && entry.response.status || 0);
         const observedStatus = Number(sample.status || 0);
         if (!recordedStatus || !observedStatus) continue;
-        const transition = statusAnalysis.classifyStatusTransition(recordedStatus, observedStatus);
+        const transition = statusAnalysis.classifySampleReplay(entry, sample);
+        if (!transition) continue;
         if (transition.matchesRecording || transition.folded) continue;
         out.push({
             index: entryIndex,
@@ -52,6 +88,7 @@ function buildDivergenceLedger(entries, samples) {
             category: transition.category,
             relevance: transition.relevance,
             repairHint: transition.repairHint,
+            observedFinalUrl: transition.observedFinalUrl,
             recordedBodyLength: bodyLength(entry.response && entry.response.content && entry.response.content.text),
             observedBodyLength: bodyLength(sample.body),
         });

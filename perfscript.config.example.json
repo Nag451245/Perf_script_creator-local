@@ -80,6 +80,9 @@
     "_allowJsr223_comment": "Default false. Leave JSR223/Groovy helpers stripped for Java-safe JMXs. Set true only when you deliberately need generated Groovy helpers and have a compatible JMeter/Java runtime.",
     "allowJsr223": false,
 
+    "_mineAssertions_comment": "Default false. Generic page-text assertions are opt-in because titles/headings drift and can make otherwise valid load scripts red. Business outcome probe and protected business checks still run by default.",
+    "mineAssertions": false,
+
     "_protectedCalls_comment": "Optional business-critical samplers matched by testname/path substring. Protected calls must execute and cannot be disabled by repair.",
     "protectedCalls": [],
 

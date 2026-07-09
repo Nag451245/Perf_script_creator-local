@@ -23,6 +23,8 @@ const blueprintContext = require('./blueprint-context');
 const blueprintAgent = require('./blueprint-agent');
 const { classifyFirstFailure } = require('./failure-classifier');
 const valueFlowDecisions = require('./value-flow-decisions');
+const samplerDecision = require('./sampler-decision');
+const runEvidence = require('./run-evidence');
 const responseEvidence = require('./response-evidence');
 const fastRepairLoop = require('./fast-repair-loop');
 const correlationHypotheses = require('./correlation-hypotheses');
@@ -454,10 +456,47 @@ function recoverSamplesFromJtl(result, stableJtl, outDir, onLog) {
     return result;
 }
 
-function applyStatusRootCauseToResult(result = {}, entries = []) {
+function buildAttemptRunEvidence({ entries = [], stableJtl = '', outDir = '', onLog = () => {} } = {}) {
+    try {
+        const jtlPath = stableJtl && fs.existsSync(stableJtl) ? stableJtl : findLastJtl(outDir);
+        if (!jtlPath) return null;
+        return runEvidence.buildRunEvidence({ entries, jtlPath });
+    } catch (e) {
+        onLog(`run evidence skipped: ${e.message}`);
+        return null;
+    }
+}
+
+function baselineDiffArtifact(diff) {
+    if (!diff || !diff.evidence) return diff;
+    return {
+        ...diff,
+        evidence: {
+            jtlPath: diff.evidence.jtlPath,
+            samples: (diff.evidence.samples || []).length,
+            rows: (diff.evidence.rows || []).map(row => ({
+                entryIndex: row.entryIndex,
+                sampleIndex: row.sampleIndex,
+                label: row.label,
+                recordedStatus: row.recordedStatus,
+                observedStatus: row.observedStatus,
+                recordedUrl: row.recordedUrl,
+                finalUrl: row.finalUrl,
+                subUrls: row.subUrls,
+                recordedBodyLength: row.recordedBodyLength,
+                observedBodyLength: row.observedBodyLength,
+                assertionFailure: row.assertionFailure,
+                success: row.success,
+            })),
+        },
+    };
+}
+
+function applyStatusRootCauseToResult(result = {}, entries = [], evidence = null) {
     const statusRootCause = statusAnalysis.traceStatusRootCause({
         entries,
         samples: result.samples || [],
+        evidence,
     });
     result.statusRootCause = statusRootCause;
     if (statusRootCause) {
@@ -470,10 +509,11 @@ function applyStatusRootCauseToResult(result = {}, entries = []) {
     return result;
 }
 
-function attachFailureForensics({ result = {}, entries = [], outDir, name, blueprintCtx = null, onLog = () => {} } = {}) {
+function attachFailureForensics({ result = {}, entries = [], evidence = null, outDir, name, blueprintCtx = null, onLog = () => {} } = {}) {
     const analysis = failureForensics.analyzeFailureForensics({
         entries,
         samples: result.samples || [],
+        evidence,
     });
     result.failureForensics = analysis;
     if (blueprintCtx && blueprintCtx.validation) blueprintCtx.validation.failureForensics = analysis;
@@ -1076,6 +1116,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     const targetBaseUrl = (enrichedRunCfg.targetBaseUrlOverride || '').trim() || deriveBaseUrl(gen.flat);
     if (!targetBaseUrl) return { ok: false, error: 'No target base URL could be determined (set run.targetBaseUrlOverride).' };
     enrichedRunCfg.targetBaseUrl = targetBaseUrl;
+    let finalRunCfg = enrichedRunCfg;
     const credentials = (runCfg.credentials && runCfg.credentials.username) ? runCfg.credentials : undefined;
 
     onLog(`target=${targetBaseUrl} · credentials=${credentials ? 'yes' : 'no'} · jmeter=${jmeterBinPath} · maxIter=${maxIterations}`);
@@ -1132,11 +1173,16 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         entries: gen.flat,
         protectedCalls: enrichedRunCfg.protectedCalls,
     });
+    const samplerDecisions = samplerDecision.classifySamplerDecisions({
+        entries: gen.flat,
+        valueFlow,
+    });
+    let currentSamplerDecisions = samplerDecisions;
     const strictGuard = businessGuard.buildBusinessGuard({
         xml: guardXml,
         flowName: name,
         runCfg: enrichedRunCfg,
-        valueFlowDecisions: valueFlow,
+        valueFlowDecisions: samplerDecisions,
     });
     const blockedDisables = [];
     if (strictGuard.enabled) {
@@ -1158,7 +1204,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         protectedSamplers: strictGuard.protectedSamplers,
     };
     blueprintCtx.seniorPe = gen.seniorPeDebrief || null;
-    blueprintCtx.lineage.disableDecisions = valueFlow;
+    blueprintCtx.lineage.disableDecisions = samplerDecisions;
     let blueprintEvidence = null;
     if (agent.enabled) {
         try {
@@ -1206,6 +1252,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
 
     let finalJmxPath = result.finalJmxPath || gen.jmxPath;
     recoverSamplesFromJtl(result, stableJtl, outDir, onLog);
+    let currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
     let verified = applyBusinessVerification(result, finalJmxPath, strictGuard, blockedDisables);
     let finalResult = verified.result;
     if (!verified.evaluation.ok) {
@@ -1213,12 +1260,12 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     } else if (strictGuard.enabled) {
         onLog(`strict business guard: ${verified.evaluation.reason}`);
     }
-    applyStatusRootCauseToResult(finalResult, gen.flat);
+    applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence);
     if (finalResult.statusRootCause) {
         blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
         onLog(`status root cause: ${finalResult.statusRootCause.summary}`);
     }
-    attachFailureForensics({ result: finalResult, entries: gen.flat, outDir, name, blueprintCtx, onLog });
+    attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
     refreshBlueprintFirstFailure(blueprintCtx, finalResult);
     try {
         blueprintCtx.seniorPeAnalysis = seniorPeAnalysis.analyzeSeniorPeFailure({
@@ -1261,13 +1308,14 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         });
         finalJmxPath = llm.jmxPath;
         recoverSamplesFromJtl(llm.result, stableJtl, outDir, onLog);
+        currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
         verified = applyBusinessVerification(llm.result, finalJmxPath, strictGuard, blockedDisables);
         finalResult = verified.result;
-        applyStatusRootCauseToResult(finalResult, gen.flat);
+        applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence);
         if (finalResult.statusRootCause) {
             blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
         }
-        attachFailureForensics({ result: finalResult, entries: gen.flat, outDir, name, blueprintCtx, onLog });
+        attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
         if (!verified.evaluation.ok) {
             onLog(`strict business guard after AI escalation: NOT GREEN — ${verified.evaluation.reason}`);
         }
@@ -1285,8 +1333,8 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         for (let attempt = 1; attempt <= agent.maxReplans && !finalResult.success; attempt++) {
             const strategy = replanner.proposeReplan({
                 result: finalResult,
-                runCfg: enrichedRunCfg,
-                valueFlow,
+                runCfg: finalRunCfg,
+                valueFlow: samplerDecisions,
                 classification: (blueprintCtx && blueprintCtx.loop && blueprintCtx.loop.firstFailure) || null,
                 seniorPeAnalysis: blueprintCtx && blueprintCtx.seniorPeAnalysis || null,
                 tried: triedStrategies,
@@ -1295,7 +1343,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
             triedStrategies.push(strategy.id);
             onLog(`REPLAN ${attempt}/${agent.maxReplans}: ${strategy.id} — ${strategy.reason}`);
             try {
-                const replanCfg = { ...enrichedRunCfg, ...strategy.runCfgPatch };
+                const replanCfg = { ...finalRunCfg, ...strategy.runCfgPatch };
                 const replanDir = path.join(outDir, `replan_${attempt}`);
                 const gen2 = generate(entries, pages, replanDir, name, { ...genOpts, runCfg: replanCfg });
                 try {
@@ -1304,14 +1352,27 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 } catch { /* keep unstripped */ }
                 applyJavaSafeGuard({ jmxPath: gen2.jmxPath, outDir: replanDir, name, label: `replan_${attempt}`, enabled: agent.javaSafeMode, onLog });
                 try { fs.rmSync(stableJtl, { force: true }); } catch { /* locked */ }
-                const result2 = await runFeedbackLoop({ ...config, jmxPath: gen2.jmxPath, maxIterations: reverifyIterationBudget(config) }, gen2.flat);
-                recoverSamplesFromJtl(result2, stableJtl, outDir, onLog);
-                const guard2 = businessGuard.buildBusinessGuard({
-                    xml: fs.readFileSync(result2.finalJmxPath || gen2.jmxPath, 'utf8'),
-                    flowName: name, runCfg: replanCfg, valueFlowDecisions: valueFlow,
+                const valueFlow2 = valueFlowDecisions.classifySamplerDisableDecisions({
+                    entries: gen2.flat,
+                    protectedCalls: replanCfg.protectedCalls,
                 });
-                const verified2 = applyBusinessVerification(result2, result2.finalJmxPath || gen2.jmxPath, guard2, blockedDisables);
-                applyStatusRootCauseToResult(verified2.result, gen2.flat);
+                const samplerDecisions2 = samplerDecision.classifySamplerDecisions({ entries: gen2.flat, valueFlow: valueFlow2 });
+                const guard2 = businessGuard.buildBusinessGuard({
+                    xml: fs.readFileSync(gen2.jmxPath, 'utf8'),
+                    flowName: name,
+                    runCfg: replanCfg,
+                    valueFlowDecisions: samplerDecisions2,
+                });
+                const replanBlockedDisables = [];
+                const result2 = await runFeedbackLoop(
+                    { ...config, jmxPath: gen2.jmxPath, maxIterations: reverifyIterationBudget(config) },
+                    gen2.flat,
+                    { applyPatch: guardedApplyPatch({ guard: guard2, blockedDisables: replanBlockedDisables, onLog }) }
+                );
+                recoverSamplesFromJtl(result2, stableJtl, outDir, onLog);
+                const evidence2 = buildAttemptRunEvidence({ entries: gen2.flat, stableJtl, outDir, onLog });
+                const verified2 = applyBusinessVerification(result2, result2.finalJmxPath || gen2.jmxPath, guard2, replanBlockedDisables);
+                applyStatusRootCauseToResult(verified2.result, gen2.flat, evidence2);
                 const success = !!verified2.result.success;
                 replans.push({ attempt, strategy: strategy.id, reason: strategy.reason, evidence: strategy.evidence, success });
                 if (blueprintCtx) blueprintCtx.loop.attempts.push({ phase: 'replan', strategy: strategy.id, reason: strategy.reason, success });
@@ -1319,7 +1380,9 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                     onLog(`REPLAN ${strategy.id} SUCCEEDED — adopting the regenerated script as final`);
                     finalResult = verified2.result;
                     finalJmxPath = verified2.result.finalJmxPath || gen2.jmxPath;
-                    Object.assign(enrichedRunCfg, strategy.runCfgPatch);
+                    currentEvidence = evidence2;
+                    finalRunCfg = replanCfg;
+                    currentSamplerDecisions = samplerDecisions2;
                     Object.assign(gen, gen2);
                 } else {
                     const stillFailing = (verified2.result.samples || []).filter(s => !s.isTransaction && s.success === false).length;
@@ -1342,20 +1405,26 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     //     Run before learning so false-green drift never becomes a verified lesson.
     let baselineDiff = null;
     try {
-        baselineDiff = diffRunAgainstRecording({ outDir, flatEntries: gen.flat });
+        baselineDiff = diffRunAgainstRecording({
+            outDir,
+            flatEntries: gen.flat,
+            jtlPath: stableJtl && fs.existsSync(stableJtl) ? stableJtl : null,
+        });
         if (baselineDiff.drift.length) {
-            fs.writeFileSync(path.join(outDir, `${name}_baseline_diff.json`), JSON.stringify(baselineDiff, null, 2));
+            fs.writeFileSync(path.join(outDir, `${name}_baseline_diff.json`), JSON.stringify(baselineDiffArtifact(baselineDiff), null, 2));
             onLog(`baseline drift detected on ${baselineDiff.drift.length}/${baselineDiff.samplesCompared} sampler(s) — see _baseline_diff.json`);
         } else if (baselineDiff.samplesCompared > 0) {
             onLog(`baseline diff clean (${baselineDiff.samplesCompared} sampler(s) match recording)`);
         }
     } catch (e) { onLog(`baseline diff skipped: ${e.message}`); }
+    if (baselineDiff && baselineDiff.evidence) currentEvidence = baselineDiff.evidence;
 
     const finalGate = finalGreenGate.evaluateFinalGreenGate({
         result: finalResult,
         baselineDiff,
         semanticDiff: finalResult.semanticDiff || null,
         businessVerification: finalResult.businessVerification || null,
+        evidence: currentEvidence,
     });
     finalResult.finalGreenGate = finalGate;
     fs.writeFileSync(path.join(outDir, `${name}_final_green_gate.json`), JSON.stringify(finalGate, null, 2));
@@ -1395,7 +1464,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         try {
             humanBlockers = blockersModule.deriveBlockers({
                 result: finalResult,
-                runCfg: enrichedRunCfg,
+                runCfg: finalRunCfg,
                 entries: gen.flat,
                 hasSecondRecording: !!(genOpts.secondaryEntries && genOpts.secondaryEntries.length),
                 ghostsRefused: (gen.stats && gen.stats.ghostsRefused) || 0,
@@ -1413,14 +1482,14 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // 5c. JMeter HTML dashboard. Best-effort and opt-in; `jmeter -g` can hang
     //     on large/XML JTLs and should never block the agent's final verdict.
     try {
-        const dashboardEnabled = enrichedRunCfg.dashboard && enrichedRunCfg.dashboard.enabled === true;
+        const dashboardEnabled = finalRunCfg.dashboard && finalRunCfg.dashboard.enabled === true;
         const jtlForDash = dashboardEnabled
             ? (fs.existsSync(stableJtl) ? stableJtl : (baselineDiff && baselineDiff.jtlPath) || null)
             : null;
         if (!dashboardEnabled) {
             onLog('dashboard skipped: disabled by default; set run.dashboard.enabled=true to generate JMeter HTML dashboard');
         } else if (jtlForDash) {
-            const timeoutMs = Number(enrichedRunCfg.dashboard && enrichedRunCfg.dashboard.timeoutMs) || 30_000;
+            const timeoutMs = Number(finalRunCfg.dashboard && finalRunCfg.dashboard.timeoutMs) || 30_000;
             const dash = await generateHtmlDashboard({ jmeterBinPath, jtlPath: jtlForDash, outDir, onLog, timeoutMs });
             if (!dash.ok) onLog(`dashboard not generated: ${dash.error}`);
         }
@@ -1438,6 +1507,8 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         loadProfile: gen.loadProfile || null,
         llmPatch,
         businessVerification: finalResult.businessVerification || null,
+        disableDecisions: currentSamplerDecisions,
+        failureForensics: finalResult.failureForensics || null,
     };
 }
 

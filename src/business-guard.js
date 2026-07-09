@@ -5,15 +5,15 @@ const THIRD_PARTY_NOISE = /gstatic|google|beacon|domainreliability|analytics|dyn
 const NOISE_PATH = /\/(?:ohttp_gateway|domainreliability\/upload|favicon\.ico|robots\.txt)|\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff2?)(?:\?|$)/i;
 const REDIRECT_PLUMBING_PATH = /\/(?:s\/interceptor|interceptor|authorize\/resume|iam\/callback|oauth\/token|user\/iam\/authorize|logout|v2\/logout)(?:\/|\?|$)/i;
 const AUTH_OR_SESSION_PATH = /\/(?:u\/login|user\/login|jwt\/v2\/create-cookie|authorization|user\/iam\/save|scheduler\/index\/data)/i;
+const JWT_CREATE_COOKIE_PATH = /\/jwt\/v2\/create-cookie(?:\/|\?|$)/i;
 const MUTATING_METHOD = /^(POST|PUT|PATCH|DELETE)$/i;
 
 function buildBusinessGuard({ xml, flowName = '', runCfg = {}, valueFlowDecisions = null } = {}) {
     const samplers = indexSamplers(xml || '');
     const goalTerms = goalTermsFor(flowName, runCfg);
-    // Operator override: anything explicitly listed in run.disableCalls was
-    // DELIBERATELY disabled (per-flow config) — the heuristics must not
-    // protect it, or an intentional disable fails the whole verdict.
-    const operatorDisables = Array.isArray(runCfg.disableCalls) ? runCfg.disableCalls.filter(Boolean) : [];
+    const operatorDisables = runCfg.allowUnsafeDisableProtected === true && Array.isArray(runCfg.disableCalls)
+        ? runCfg.disableCalls.filter(Boolean)
+        : [];
     const protectedSamplers = samplers
         .filter(s => isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions) && !matchesAnyConfigured(s, operatorDisables))
         .map(s => ({
@@ -126,6 +126,7 @@ function isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions = null) {
     if (matchesAnyConfigured(s, runCfg.protectedCalls)) return true;
     const valueFlow = valueFlowDecisionFor(s, valueFlowDecisions);
     if (valueFlow && valueFlow.consumedOutputCount > 0) return true;
+    if (JWT_CREATE_COOKIE_PATH.test(s.path || '') && matchesAnyConfigured(s, runCfg.disableCalls)) return false;
     if (valueFlow && valueFlow.consumedOutputCount === 0 && !MUTATING_METHOD.test(s.method || '')) return false;
     if (goalTerms.length && goalTerms.every(term => hay.toLowerCase().includes(term))) return true;
     if (/\bcreate\b|\/tasks\b|task/i.test(hay) && MUTATING_METHOD.test(s.method || '')) return true;

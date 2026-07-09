@@ -37,6 +37,7 @@ const playbooks = require('./playbooks');
 const scenario = require('./scenario');
 const outcomeProbe = require('./outcome-probe');
 const uploadFiles = require('./upload-files');
+const valueFlowDecisions = require('./value-flow-decisions');
 const {
     wrapPollingInWhileController,
     injectGhostSynthesizers,
@@ -324,7 +325,8 @@ const DEFAULT_DISABLE_PATTERNS = [
     '/v2/logout',
 ];
 
-const AUTH_SESSION_DISABLE_PROTECT_RE = /\/(?:u\/login(?:\/|\?|$)|user\/login(?:\/|\?|$)|authorization(?:\/|\?|$)|user\/iam\/save(?:\/|\?|$)|jwt\/v2\/create-cookie(?:\/|\?|$)|s\/interceptor\/authorize(?:\/|\?|$)|iam\/callback(?:\/|\?|$))/i;
+const AUTH_SESSION_DISABLE_PROTECT_RE = /\/(?:u\/login(?:\/|\?|$)|user\/login(?:\/|\?|$)|authorization(?:\/|\?|$)|user\/iam\/save(?:\/|\?|$)|jwt\/v2\/create-cookie(?:\/|\?|$)|iam\/callback(?:\/|\?|$))/i;
+const JWT_CREATE_COOKIE_RE = /\/jwt\/v2\/create-cookie(?:\/|\?|$)/i;
 const AUTH_HOST_RE = /(?:^|[.-])(?:login|auth|sso|iam)(?:[.-]|$)|webpt|stage|stg/i;
 const SAFE_DISABLE_NOISE_RE = /ohttp|safebrowsing|domainreliability|beacon|gstatic|launchdarkly|\/sdk\/evalx|\/avatar\/|\/_next\/data\//i;
 const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
@@ -352,11 +354,14 @@ function isGraphqlOperationDocument(candidate) {
     return /^(query|mutation|subscription)\b/i.test(value) && /[{]/.test(value);
 }
 
-function shouldProtectDisableTarget(sampler = {}, runCfg = {}) {
+function shouldProtectDisableTarget(sampler = {}, runCfg = {}, valueFlow = null) {
     if (runCfg.allowUnsafeDisableProtected === true) return false;
     const hay = `${sampler.name || ''} ${sampler.domain || ''}${sampler.path || ''}`;
     if (SAFE_DISABLE_NOISE_RE.test(hay)) return false;
     if (matchesConfiguredPattern(hay, runCfg.protectedCalls)) return true;
+    const flow = valueFlowForSampler(sampler, valueFlow);
+    if (flow && flow.consumedOutputCount > 0) return true;
+    if (JWT_CREATE_COOKIE_RE.test(sampler.path || '') && matchesConfiguredPattern(hay, runCfg.disableCalls)) return false;
     if (AUTH_SESSION_DISABLE_PROTECT_RE.test(sampler.path || '')) return true;
     if (MUTATING_METHOD_RE.test(sampler.method || methodFromSamplerName(sampler.name)) && /^\/?$/.test(String(sampler.path || '/'))) return true;
     if (MUTATING_METHOD_RE.test(sampler.method || methodFromSamplerName(sampler.name)) && AUTH_HOST_RE.test(sampler.domain || '')) return true;
@@ -366,6 +371,11 @@ function shouldProtectDisableTarget(sampler = {}, runCfg = {}) {
 
 function matchesConfiguredPattern(hay, patterns) {
     return Array.isArray(patterns) && patterns.some(p => p && String(hay || '').includes(String(p)));
+}
+
+function valueFlowForSampler(sampler, valueFlow) {
+    if (!sampler || !valueFlow || !valueFlow.bySampler) return null;
+    return valueFlow.bySampler[sampler.name] || null;
 }
 
 function methodFromSamplerName(name) {
@@ -675,20 +685,21 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         formCorr.wired.map(w => `${w.input} produced by "${w.producerSampler}" (recorded page body carries the hidden input; later requests consume it)`).join('; '),
         `emitted CSS extractor per producer + substituted \${var} at ${formCorr.wired.reduce((n, w) => n + w.substitutions, 0)} consumer field(s)`);
 
-    // runCfg.mineAssertions === false is the replanner's "assertion relief"
-    // strategy: regenerate without mined text assertions to separate "text
-    // drifted" from "flow broken" (outcome probe + business guard remain).
-    const assertInj = runCfg.mineAssertions === false
-        ? { xml, injected: 0 }
-        : injectAssertionsFromMined(xml, flat, corrs.map(c => c.value).filter(Boolean));
+    // Generic mined page-text assertions are opt-in. They catch false-200 pages,
+    // but they also overfit titles/headings such as "WebPT Dashboard" and made
+    // previously valid scripts red after routine copy/layout changes. Business
+    // outcome probe + strict business guard remain enabled by default.
+    const assertInj = runCfg.mineAssertions === true
+        ? injectAssertionsFromMined(xml, flat, corrs.map(c => c.value).filter(Boolean))
+        : { xml, injected: 0 };
     xml = assertInj.xml;
     if (assertInj.injected) note('assertions',
         `${assertInj.injected} sampler(s) had stable response text to assert on`,
         `mined HTML titles / JSON status keys / page headings from recording`,
         `injected ResponseAssertion (substring, OR) per sampler`);
-    if (runCfg.mineAssertions === false) note('assertions',
-        'mined text assertions disabled for this attempt',
-        'replan strategy: separate assertion strictness from real flow breakage',
+    if (runCfg.mineAssertions !== true) note('assertions',
+        'mined text assertions disabled by default',
+        'separate brittle page text from real flow breakage',
         'no mined ResponseAssertions injected (outcome probe and business guard still verify)');
 
     // Outcome probe: the recording shows some later read ECHOES the value the
@@ -738,8 +749,12 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         ...((runCfg && runCfg.disableCalls) || []),
     ];
     if (disablePatterns.length) {
+        const disableValueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
+            entries: flat,
+            protectedCalls: runCfg.protectedCalls,
+        });
         const dis = disableSamplersByPattern(xml, disablePatterns, {
-            protect: sampler => shouldProtectDisableTarget(sampler, runCfg),
+            protect: sampler => shouldProtectDisableTarget(sampler, runCfg, disableValueFlow),
         });
         xml = dis.xml; disabledCount = dis.disabled;
         if (dis.disabled) note('disable-calls',

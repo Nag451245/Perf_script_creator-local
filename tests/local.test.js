@@ -59,6 +59,8 @@ const replanner = require('../src/replanner');
 const domainKnowledge = require('../src/domain-knowledge');
 const uploadFiles = require('../src/upload-files');
 const runProgress = require('../src/run-progress');
+const runEvidence = require('../src/run-evidence');
+const samplerDecision = require('../src/sampler-decision');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
 function listenLocal(server) {
@@ -204,11 +206,33 @@ test('HTML report: renders verified learning matches and learned lessons', () =>
         },
     });
     const html = fs.readFileSync(reportPath, 'utf8');
-    assert.match(html, /Verified learning store/);
+    assert.match(html, /Verified fix memory/);
     assert.match(html, /vls_abc/);
     assert.match(html, /vls_def/);
     assert.match(html, /learn_memory_matches\.json/);
     assert.match(html, /learn_learned_lessons\.json/);
+});
+
+test('HTML report: renders friendly decision labels for core flow samplers', () => {
+    const out = tmp();
+    const reportPath = writeHtmlReport(out, 'decisions', {
+        mode: 'agent',
+        verdict: 'GREEN',
+        stats: {},
+        samples: [{ label: 'Step 01 - POST /edoc/temporal-file/save', success: true, isTransaction: false, code: '200' }],
+        disableDecisions: {
+            bySampler: {
+                'Step 01 - POST /edoc/temporal-file/save': {
+                    samplerLabel: 'Step 01 - POST /edoc/temporal-file/save',
+                    decision: 'must_fix',
+                },
+            },
+        },
+    });
+    const html = fs.readFileSync(reportPath, 'utf8');
+
+    assert.match(html, /Core flow/);
+    assert.doesNotMatch(html, /must_fix/);
 });
 
 test('LLM escalation: clean no-op without a Gemini key', async () => {
@@ -2571,6 +2595,26 @@ test('value-flow decisions: failing sampler with no consumed output is disposabl
     assert.strictEqual(decisions.byIndex[0].consumedOutputCount, 0);
 });
 
+test('sampler decision: explicit evidence separates foldable plumbing from must-fix producers', () => {
+    const entries = [
+        entry('GET', 'https://app.test/oauth/token', { status: 302 }),
+        entry('GET', 'https://app.test/bootstrap', { body: '{"session":"abc123SESSION"}' }),
+        entry('GET', 'https://app.test/api', { reqHeaders: [{ name: 'X-Session', value: 'abc123SESSION' }] }),
+        entry('POST', 'https://app.test/edoc/temporal-file/save'),
+    ];
+    const failures = [
+        { index: 0, samplerLabel: 'Step 01 - GET /oauth/token', responseCode: '200' },
+        { index: 1, samplerLabel: 'Step 02 - GET /bootstrap', responseCode: '200' },
+        { index: 3, samplerLabel: 'Step 04 - POST /edoc/temporal-file/save', responseCode: '500' },
+    ];
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({ entries, failures });
+    const decisions = samplerDecision.classifySamplerDecisions({ entries, failures, valueFlow });
+
+    assert.strictEqual(decisions.byIndex[0].decision, 'foldable_plumbing');
+    assert.strictEqual(decisions.byIndex[1].decision, 'must_fix');
+    assert.strictEqual(decisions.byIndex[3].decision, 'must_fix');
+});
+
 test('business guard: value-flow evidence overrides heuristic protection for unconsumed plumbing', () => {
     const xml = `<jmeterTestPlan><hashTree>
       <HTTPSamplerProxy testname="Step 01 - GET /tasks.json" enabled="true">
@@ -2598,6 +2642,27 @@ test('business guard: value-flow evidence overrides heuristic protection for unc
         valueFlowDecisions: valueFlow,
     });
     assert.strictEqual(explicit.protectedNames.has('Step 01 - GET /tasks.json'), true);
+});
+
+test('business guard: configured unconsumed jwt create-cookie is foldable plumbing', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /jwt/v2/create-cookie" enabled="false">
+        <stringProp name="HTTPSampler.domain">stgemr.webpt.com</stringProp>
+        <stringProp name="HTTPSampler.path">/jwt/v2/create-cookie</stringProp>
+        <stringProp name="HTTPSampler.method">GET</stringProp>
+      </HTTPSamplerProxy>
+    </hashTree></jmeterTestPlan>`;
+    const entries = [entry('GET', 'https://stgemr.webpt.com/jwt/v2/create-cookie')];
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({ entries });
+
+    const guard = businessGuard.buildBusinessGuard({
+        xml,
+        flowName: 'logi',
+        runCfg: { disableCalls: ['/jwt/v2/create-cookie'] },
+        valueFlowDecisions: valueFlow,
+    });
+
+    assert.strictEqual(guard.protectedNames.has('Step 01 - GET /jwt/v2/create-cookie'), false);
 });
 
 test('response evidence: captures scrubbed failing body for LLM prompt', async () => {
@@ -2712,9 +2777,34 @@ test('generate: disableCalls cannot remove protected auth/session producers with
     assert.strictEqual(samplerEnabledForPath(xml, '/u/login/identifier'), true);
     assert.strictEqual(samplerEnabledForPath(xml, '/u/login/password'), true);
     assert.strictEqual(samplerEnabledForPath(xml, '/authorization/'), true);
-    assert.strictEqual(samplerEnabledForPath(xml, '/s/interceptor/authorize/'), true);
-    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), true);
+    assert.strictEqual(samplerEnabledForPath(xml, '/s/interceptor/authorize/'), false,
+        'configured interceptor authorize hop is redirect plumbing and must actually be disabled');
+    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), false,
+        'configured jwt create-cookie with no downstream consumer is browser plumbing and should fold');
     assert.strictEqual(samplerEnabledForPath(xml, '/sdk/evalx'), false);
+});
+
+test('generate: jwt create-cookie stays enabled when its cookie is consumed downstream', () => {
+    const jwt = entry('GET', 'https://stgemr.webpt.com/jwt/v2/create-cookie');
+    jwt.response.headers = [
+        { name: 'Content-Type', value: 'application/json' },
+        { name: 'Set-Cookie', value: 'LOGI_SESS=abc123session; Path=/; HttpOnly' },
+    ];
+    const { entries, pages } = parse(har([
+        jwt,
+        entry('GET', 'https://stgemr.webpt.com/dashboard', {
+            reqHeaders: [{ name: 'Cookie', value: 'LOGI_SESS=abc123session' }],
+        }),
+    ]));
+
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'jwt-consumed', {
+        runCfg: { disableCalls: ['/jwt/v2/create-cookie'] },
+    });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+
+    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), true,
+        'jwt create-cookie is protected when it produces a live downstream cookie');
 });
 
 function samplerEnabledForPath(xml, pathPart) {
@@ -3203,6 +3293,23 @@ test('assertion miner: emits ResponseAssertion when recording has stable text', 
     assert.match(out.xml, /<ResponseAssertion/);
 });
 
+test('generate: mined text assertions are opt-in, not default', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/dashboard', { body: '{"status":"OK","message":"Welcome back"}' }),
+    ]));
+    const outDefault = tmp();
+    const genDefault = generate(entries, pages, outDefault, 'assertions-default');
+    const xmlDefault = fs.readFileSync(genDefault.jmxPath, 'utf8');
+    assert.doesNotMatch(xmlDefault, /Stable text present/);
+
+    const outOptIn = tmp();
+    const genOptIn = generate(entries, pages, outOptIn, 'assertions-opt-in', {
+        runCfg: { mineAssertions: true },
+    });
+    const xmlOptIn = fs.readFileSync(genOptIn.jmxPath, 'utf8');
+    assert.match(xmlOptIn, /Stable text present/);
+});
+
 test('Gaussian timers: derives mean+stdev from per-page HAR gaps', () => {
     const fakeXml = `<TransactionController testname="Login"></TransactionController>\n<hashTree>\n</hashTree>`;
     const entries = [
@@ -3348,6 +3455,192 @@ test('verifier fast JTL summary preserves assertion failure messages for HTTP 20
     assert.strictEqual(samples[0].code, '200');
     assert.match(samples[0].failureMessage, /Ghost Tools/);
     assert.match(samples[0].responseMessage, /assertion/i);
+});
+
+test('verifier fast JTL summary preserves landed URL when redirect children are folded', () => {
+    const dir = tmp();
+    const jtl = path.join(dir, 'results.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 13 - GET /dashboard.php" rc="200" rm="OK" s="true">
+    <httpSample lb="Step 13 - GET /dashboard.php-0" rc="302" rm="Found" s="true">
+      <java.net.URL>https://app.test/dashboard.php</java.net.URL>
+    </httpSample>
+    <httpSample lb="Step 13 - GET /dashboard.php-1" rc="200" rm="OK" s="true">
+      <java.net.URL>https://auth.test/login</java.net.URL>
+    </httpSample>
+    <java.net.URL>https://auth.test/login</java.net.URL>
+  </httpSample>
+</testResults>`);
+
+    const samples = summarizeJtlFast(jtl);
+
+    assert.strictEqual(samples.length, 1);
+    assert.strictEqual(samples[0].label, 'Step 13 - GET /dashboard.php');
+    assert.strictEqual(samples[0].finalUrl, 'https://auth.test/login');
+    assert.deepStrictEqual(samples[0].urls, [
+        'https://app.test/dashboard.php',
+        'https://auth.test/login',
+        'https://auth.test/login',
+    ]);
+});
+
+test('baseline diff compares responseData from folded redirect children', () => {
+    const out = tmp();
+    const iter = path.join(out, 'iteration_1');
+    fs.mkdirSync(iter, { recursive: true });
+    fs.writeFileSync(path.join(iter, 'results.jtl'), `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /dashboard.php" rc="200" rm="OK" s="true">
+    <httpSample lb="Step 01 - GET /dashboard.php-0" rc="302" rm="Found" s="true">
+      <responseData class="java.lang.String"></responseData>
+      <java.net.URL>https://app.test/dashboard.php</java.net.URL>
+    </httpSample>
+    <httpSample lb="Step 01 - GET /dashboard.php-1" rc="200" rm="OK" s="true">
+      <responseData class="java.lang.String">&lt;html&gt;&lt;title&gt;Login&lt;/title&gt;&lt;form&gt;Password&lt;/form&gt;&lt;/html&gt;</responseData>
+      <java.net.URL>https://auth.test/login</java.net.URL>
+    </httpSample>
+    <java.net.URL>https://auth.test/login</java.net.URL>
+  </httpSample>
+</testResults>`);
+    const recordedBody = '<html><title>Dashboard</title><main>' + 'DALLINGA '.repeat(80) + '</main></html>';
+    const flatEntries = [
+        entry('GET', 'https://app.test/dashboard.php', { status: 200, body: recordedBody }),
+    ];
+
+    const diff = diffRunAgainstRecording({ outDir: out, flatEntries, thresholdPct: 10 });
+
+    assert.strictEqual(diff.samplesCompared, 1);
+    assert.ok(diff.drift.some(d => d.index === 0 && d.issues.some(i => i.kind === 'lengthDriftPct')));
+});
+
+test('baseline diff uses explicit current JTL instead of stale iteration folders', () => {
+    const out = tmp();
+    const stale = path.join(out, 'iteration_9');
+    fs.mkdirSync(stale, { recursive: true });
+    fs.writeFileSync(path.join(stale, 'results.jtl'), `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /dashboard.php" rc="200" rm="OK" s="true">
+    <java.net.URL>https://auth.test/login</java.net.URL>
+    <responseData class="java.lang.String">&lt;html&gt;Login&lt;/html&gt;</responseData>
+  </httpSample>
+</testResults>`);
+    const currentJtl = path.join(out, 'final.jtl');
+    fs.writeFileSync(currentJtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /dashboard.php" rc="200" rm="OK" s="true">
+    <java.net.URL>https://app.test/dashboard.php</java.net.URL>
+    <responseData class="java.lang.String">&lt;html&gt;Dashboard&lt;/html&gt;</responseData>
+  </httpSample>
+</testResults>`);
+    const flatEntries = [
+        entry('GET', 'https://app.test/dashboard.php', { status: 200, body: '<html>Dashboard</html>' }),
+    ];
+
+    const diff = diffRunAgainstRecording({ outDir: out, flatEntries, jtlPath: currentJtl, thresholdPct: 10 });
+
+    assert.strictEqual(diff.jtlPath, currentJtl);
+    assert.strictEqual(diff.rootCause, null);
+});
+
+test('run evidence: aligns recording with JTL and preserves observed body and final URL', () => {
+    const dir = tmp();
+    const jtl = path.join(dir, 'results.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /dashboard.php" rc="200" rm="OK" s="true">
+    <httpSample lb="Step 01 - GET /dashboard.php-0" rc="302" rm="Found" s="true">
+      <java.net.URL>https://app.test/dashboard.php</java.net.URL>
+    </httpSample>
+    <httpSample lb="Step 01 - GET /dashboard.php-1" rc="200" rm="OK" s="true">
+      <responseData class="java.lang.String">&lt;html&gt;&lt;title&gt;Login&lt;/title&gt;&lt;/html&gt;</responseData>
+      <java.net.URL>https://auth.test/login</java.net.URL>
+    </httpSample>
+    <java.net.URL>https://auth.test/login</java.net.URL>
+  </httpSample>
+</testResults>`);
+    const evidence = runEvidence.buildRunEvidence({
+        entries: [entry('GET', 'https://app.test/dashboard.php', { body: '<html><title>Dashboard</title></html>' })],
+        jtlPath: jtl,
+    });
+
+    assert.strictEqual(evidence.rows.length, 1);
+    assert.strictEqual(evidence.rows[0].entryIndex, 0);
+    assert.strictEqual(evidence.rows[0].recordedUrl, 'https://app.test/dashboard.php');
+    assert.strictEqual(evidence.rows[0].finalUrl, 'https://auth.test/login');
+    assert.match(evidence.rows[0].observedBody, /Login/);
+    assert.match(evidence.rows[0].recordedBody, /Dashboard/);
+});
+
+test('status analysis treats 200 auth-host landing as upstream auth bounce', () => {
+    const entries = [
+        entry('GET', 'https://app.test/dashboard.php', { status: 200, body: '<html><title>App Dashboard</title></html>' }),
+        entry('GET', 'https://app.test/patientChart.php?ID=123', { status: 200, body: '<html>DALLINGA</html>' }),
+    ];
+    const samples = [
+        {
+            label: 'Step 01 - GET /dashboard.php',
+            responseCode: '200',
+            code: '200',
+            success: true,
+            finalUrl: 'https://auth.test/login',
+        },
+        {
+            label: 'Step 02 - GET /patientChart.php',
+            responseCode: '200',
+            code: '200',
+            success: false,
+            failureMessage: 'Business outcome missing',
+            finalUrl: 'https://auth.test/login',
+        },
+    ];
+
+    const trace = statusAnalysis.traceStatusRootCause({ entries, samples });
+
+    assert.strictEqual(trace.rootCauseIndex, 0);
+    assert.strictEqual(trace.rootCause.category, 'auth_redirect_bounce');
+    assert.match(trace.summary, /earliest upstream divergence/);
+    assert.match(trace.rootCause.repairHint, /auth/i);
+});
+
+test('failure forensics recommends auth repair for 200 auth-host bounce', () => {
+    const entries = [
+        entry('GET', 'https://app.test/dashboard.php', { status: 200, body: '<html><title>Dashboard</title></html>' }),
+    ];
+    const samples = [
+        {
+            label: 'Step 01 - GET /dashboard.php',
+            responseCode: '200',
+            code: '200',
+            success: true,
+            finalUrl: 'https://auth.test/login',
+        },
+    ];
+
+    const analysis = failureForensics.analyzeFailureForensics({ entries, samples });
+
+    assert.strictEqual(analysis.rootCause.category, 'auth_redirect_bounce');
+    assert.strictEqual(analysis.recommendedAction.id, 'repair-auth-session-correlation');
+});
+
+test('batch print contract: upstream auth bounce beats downstream outcome casualty', () => {
+    const entries = [
+        entry('GET', 'https://app.test/dashboard.php', { status: 200, body: '<html>Dashboard</html>' }),
+        entry('POST', 'https://app.test/patient/display/getpatients', { status: 200, body: '{"data":[{"PatientID":14493348,"LastName":"DALLINGA"}]}' }),
+        entry('GET', 'https://app.test/patientChart.php?ID=14493348', { status: 200, body: '<html>DALLINGA CaseID=18630204</html>' }),
+    ];
+    const samples = [
+        { label: 'Step 01 - GET /dashboard.php', code: '200', responseCode: '200', success: true, finalUrl: 'https://auth.test/login', responseBody: '<html>Login</html>' },
+        { label: 'Step 02 - POST /patient/display/getpatients', code: '200', responseCode: '200', success: true, finalUrl: 'https://app.test/patient/display/getpatients', responseBody: '{"data":[]}' },
+        { label: 'Step 03 - GET /patientChart.php', code: '200', responseCode: '200', success: false, finalUrl: 'https://auth.test/login', responseBody: '<html>Login</html>', failureMessage: 'Business outcome missing' },
+    ];
+
+    const root = statusAnalysis.traceStatusRootCause({ entries, samples });
+    const analysis = failureForensics.analyzeFailureForensics({ entries, samples });
+
+    assert.strictEqual(root.rootCauseIndex, 0);
+    assert.strictEqual(root.rootCause.category, 'auth_redirect_bounce');
+    assert.strictEqual(analysis.recommendedAction.id, 'repair-auth-session-correlation');
 });
 
 /* ─────────── Fix-pass tests (dual-JMX, load profile, cookie domain, patcher) ─────────── */

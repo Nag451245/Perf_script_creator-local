@@ -72,9 +72,10 @@ function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classificat
     // 2. Fold-disposables strategy: value-flow analysis marked failing
     //    samplers as disposable plumbing (nothing downstream consumes their
     //    output) → regenerate with them disabled from the start.
-    const disposable = valueFlow && Array.isArray(valueFlow.byIndex)
-        ? valueFlow.byIndex.filter(d => d.decision === 'disposable_plumbing' && d.failed).map(d => d.sampler)
-        : [];
+    const disposable = decisionRows(valueFlow)
+        .filter(d => ['foldable_plumbing', 'disposable_plumbing'].includes(d.decision) && (d.failed || d.responseCode || d.sourceDecision))
+        .map(d => d.samplerLabel || d.sampler)
+        .filter(Boolean);
     if (disposable.length) {
         strategies.push({
             id: 'fold-disposable-plumbing',
@@ -89,7 +90,7 @@ function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classificat
     //    without mined assertions so the NEXT run separates "text drifted"
     //    from "flow broken". (Outcome probe and guard still stand watch.)
     const allSoft = failing.every(s => /^(2|3)\d\d$/.test(String(s.responseCode || s.code || '')));
-    if (allSoft && runCfg.mineAssertions !== false) {
+    if (allSoft && runCfg.mineAssertions === true) {
         strategies.push({
             id: 'assertion-relief',
             reason: 'every failing sampler returned 2xx/3xx — likely mined-assertion strictness, not flow breakage; regenerate without mined assertions to isolate it (outcome probe + business guard remain)',
@@ -99,6 +100,13 @@ function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classificat
     }
 
     return strategies.find(s => !tried.includes(s.id)) || null;
+}
+
+function decisionRows(valueFlow) {
+    if (!valueFlow || !valueFlow.byIndex) return [];
+    return Array.isArray(valueFlow.byIndex)
+        ? valueFlow.byIndex.filter(Boolean)
+        : Object.values(valueFlow.byIndex).filter(Boolean);
 }
 
 function nativeManagerPatch(analysis) {
@@ -122,4 +130,4 @@ function nativeManagerPatch(analysis) {
     };
 }
 
-module.exports = { proposeReplan, _internal: { nativeManagerPatch } };
+module.exports = { proposeReplan, _internal: { nativeManagerPatch, decisionRows } };

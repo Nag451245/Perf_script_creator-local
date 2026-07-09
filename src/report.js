@@ -46,9 +46,9 @@ const ARTIFACTS = [
     ['_correlation_fast_repair.json', 'Verified correlation fast-replay proof'],
     ['_correlation_patches.json', 'Verified correlation JMX patch application'],
     ['_fast_repair_rounds.json', 'Fast-replay repair hypothesis rounds'],
-    ['_memory_matches.json', 'Verified learning memory matches'],
+    ['_memory_matches.json', 'Verified fix memory matches'],
     ['_memory_patches.json', 'Verified learning memory patches'],
-    ['_learned_lessons.json', 'Lessons saved after green verification'],
+    ['_learned_lessons.json', 'Verified fix memory saved after green verification'],
     ['_reasoning.md', 'Reasoning trace'],
     ['_reasoning.json', 'Reasoning trace (structured)'],
     ['_report.json', 'Raw report (JSON)'],
@@ -76,12 +76,13 @@ function stepLabel(index) {
 function writeHtmlReport(outDir, name, data = {}) {
     const {
         mode = 'generate', verdict = 'generated', stats = {}, samples = [],
-        baselineDiff = null, memoryMatches = [], learnedLessons = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [], businessVerification = null,
+        baselineDiff = null, memoryMatches = [], learnedLessons = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [], businessVerification = null, disableDecisions = null,
     } = data;
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
     const failures = reqs.filter(s => s.success === false);
     const failureForensics = data.failureForensics || readJsonIfExists(path.join(outDir, `${name}_failure_forensics.json`));
+    const decisionBySampler = buildDecisionMap(disableDecisions || data.samplerDecisions || (data.lineage && data.lineage.disableDecisions));
 
     const verdictClass = verdict === 'GREEN' ? 'ok' : (verdict === 'generated' ? 'neutral' : 'bad');
 
@@ -103,8 +104,9 @@ function writeHtmlReport(outDir, name, data = {}) {
             <td>${s.success ? '✓' : '✗'}</td>
             <td>${esc(s.label || s.name || '')}</td>
             <td>${esc(firstPresent(s.responseCode, s.code, s.rc, ''))}</td>
+            <td>${esc(decisionForSampler(decisionBySampler, s.label || s.name))}</td>
             <td>${esc(firstPresent(s.responseMessage, s.message, s.failureMessage, ''))}</td>
-        </tr>`).join('') : `<tr><td colspan="4" class="muted">No request results (generate-only, or run did not execute).</td></tr>`;
+        </tr>`).join('') : `<tr><td colspan="5" class="muted">No request results (generate-only, or run did not execute).</td></tr>`;
 
     const businessSection = businessVerification ? `<h2>Business verification</h2>
       <p><span class="badge ${businessVerification.ok ? 'ok' : 'bad'}">${businessVerification.ok ? 'PASSED' : 'NOT VERIFIED'}</span></p>
@@ -225,13 +227,16 @@ function writeHtmlReport(outDir, name, data = {}) {
         const missingCookies = failureForensics.authSession && failureForensics.authSession.missingSessionCookies || [];
         const interactiveAuthWall = !!(failureForensics.redirects && failureForensics.redirects.interactiveAuthWall);
         const downstreamGraphql = failureForensics.graphql && failureForensics.graphql.downstreamSymptoms || [];
+        const downstreamDivergences = (failureForensics.divergences || []).filter(d => Number(d.index) > Number(root.index));
+        const bodyComparison = failureForensics.bodyComparison || {};
         const action = failureForensics.recommendedAction && failureForensics.recommendedAction.id || 'review';
         failureForensicsSection = `<h2>Failure forensics</h2>
-            <p>First divergence: <b>${esc(root.sampler || '')}</b> recorded ${esc(root.recordedStatus ?? root.expected ?? '')}, observed ${esc(root.observedStatus ?? root.observed ?? '')}.</p>
+            <p>Earliest upstream failure: <b>${esc(root.sampler || '')}</b> recorded ${esc(root.recordedStatus ?? root.expected ?? '')}, observed ${esc(root.observedStatus ?? root.observed ?? '')}.</p>
             <ul>
                 <li>Session-cookie proof: ${missingCookies.length ? esc(`missing ${missingCookies.join(', ')}`) : 'no missing session cookie proven'}</li>
                 <li>Redirect/auth wall proof: ${interactiveAuthWall ? 'interactive auth redirect wall detected' : 'not detected'}</li>
-                <li>Downstream symptoms: ${esc(downstreamGraphql.length)} GraphQL/API auth symptom(s)</li>
+                <li>Downstream casualties: ${esc(downstreamDivergences.length)} later divergence(s), ${esc(downstreamGraphql.length)} GraphQL/API auth symptom(s)</li>
+                <li>Body comparison: ${bodyComparison.ran ? esc(`${bodyComparison.compared || 0} sampler(s) compared`) : esc(`not run: ${bodyComparison.reason || 'no body evidence'}`)}</li>
                 <li>Recommended action: <code>${esc(action)}</code></li>
             </ul>
             <p class="muted">Full evidence: <a href="${esc(name)}_failure_forensics.json">JSON</a> · <a href="${esc(name)}_failure_forensics.md">Markdown</a></p>`;
@@ -242,13 +247,17 @@ function writeHtmlReport(outDir, name, data = {}) {
         ? memoryMatches.slice(0, 25).map(m => `<tr><td>${esc(m.lessonId)}</td><td>${esc(m.confidence)}</td><td>${esc(m.contextPattern && m.contextPattern.samplerPattern)}</td><td><code>${esc(m.fix && m.fix.kind)}</code></td></tr>`).join('')
         : '';
     const learned = learnedLessons && Array.isArray(learnedLessons.learned) ? learnedLessons.learned : [];
-    if (matchRows || learned.length) {
+    if (matchRows || learned.length || learnedLessons) {
         const learnedRows = learned.slice(0, 25).map(l => `<tr><td>${esc(l.id)}</td><td>${esc(l.confidence)}</td><td>${esc(l.contextPattern && l.contextPattern.samplerPattern)}</td><td><code>${esc(l.fix && l.fix.kind)}</code></td></tr>`).join('');
-        learningSection = `<h2>Verified learning store</h2>
-            ${matchRows ? `<p class="muted">Previously verified, redacted lessons considered before AI escalation.</p>
+        const emptyMessage = !learnedRows && learnedLessons
+            ? `<p class="muted">No new verified fix memory was saved for this run. Failed runs do not create learning entries.</p>`
+            : '';
+        learningSection = `<h2>Verified fix memory</h2>
+            ${matchRows ? `<p class="muted">Previously verified, redacted fixes considered before AI escalation.</p>
             <table><thead><tr><th>Lesson</th><th>Confidence</th><th>Pattern</th><th>Fix</th></tr></thead><tbody>${matchRows}</tbody></table>` : ''}
-            ${learnedRows ? `<p class="muted">New lessons saved only after this run verified green.</p>
-            <table><thead><tr><th>Lesson</th><th>Confidence</th><th>Pattern</th><th>Fix</th></tr></thead><tbody>${learnedRows}</tbody></table>` : ''}`;
+            ${learnedRows ? `<p class="muted">New verified fixes saved only after this run verified green.</p>
+            <table><thead><tr><th>Lesson</th><th>Confidence</th><th>Pattern</th><th>Fix</th></tr></thead><tbody>${learnedRows}</tbody></table>` : ''}
+            ${emptyMessage}`;
     }
 
     const html = `<!doctype html>
@@ -289,7 +298,7 @@ function writeHtmlReport(outDir, name, data = {}) {
   ${businessSection}
 
   <h2>Request results</h2>
-  <table><thead><tr><th></th><th>Sampler</th><th>Code</th><th>Message</th></tr></thead>
+  <table><thead><tr><th></th><th>Sampler</th><th>Code</th><th>Decision</th><th>Message</th></tr></thead>
   <tbody>${reqRows}</tbody></table>
 
   ${failures.length ? `<h2>Failures (${failures.length})</h2><ul>${failures.map(f => `<li><b>${esc(f.label || f.name)}</b> — ${esc(f.responseCode || '')} ${esc(f.responseMessage || f.failureMessage || '')}</li>`).join('')}</ul>` : ''}
@@ -328,6 +337,39 @@ function renderBusinessSamplerList(protectedSamplers) {
         renderGroup('Required dependency samplers', dependencies);
 }
 
+function buildDecisionMap(disableDecisions) {
+    const map = new Map();
+    if (!disableDecisions) return map;
+    const rows = disableDecisions.bySampler
+        ? Object.values(disableDecisions.bySampler)
+        : (Array.isArray(disableDecisions.byIndex) ? disableDecisions.byIndex : Object.values(disableDecisions.byIndex || {}));
+    for (const row of rows.filter(Boolean)) {
+        const label = row.samplerLabel || row.sampler || row.label;
+        if (label) map.set(String(label).trim(), row.decision || row.sourceDecision || '');
+    }
+    return map;
+}
+
+function decisionForSampler(decisionBySampler, label) {
+    return decisionLabel(decisionBySampler.get(String(label || '').trim()));
+}
+
+function decisionLabel(decision) {
+    switch (decision) {
+        case 'must_fix':
+            return 'Core flow';
+        case 'foldable_plumbing':
+        case 'disposable_plumbing':
+            return 'Safe to fold';
+        case 'unsafe_to_disable':
+            return 'Protected';
+        case 'unknown':
+            return 'Unclassified';
+        default:
+            return decision || '';
+    }
+}
+
 function readJsonIfExists(file) {
     try {
         if (!fs.existsSync(file)) return null;
@@ -337,4 +379,4 @@ function readJsonIfExists(file) {
     }
 }
 
-module.exports = { writeHtmlReport };
+module.exports = { writeHtmlReport, _internal: { buildDecisionMap, decisionForSampler, decisionLabel } };

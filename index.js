@@ -293,6 +293,8 @@ async function processUnit(unit) {
                     loadProfile: (out.stats && out.stats.loadProfile) || null,
                     reasoning: out.reasoning || [],
                     businessVerification: out.businessVerification || null,
+                    disableDecisions: out.disableDecisions || null,
+                    failureForensics: out.failureForensics || null,
                 });
                 rec(`open ${name}_report.html for a summary`);
                 if (out.result.success) archiveGreenRun({ outDir, name, rec });

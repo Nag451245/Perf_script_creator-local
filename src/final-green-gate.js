@@ -1,10 +1,13 @@
 'use strict';
 
+const statusAnalysis = require('./status-analysis');
+
 function evaluateFinalGreenGate({
     result = {},
     baselineDiff = null,
     semanticDiff = null,
     businessVerification = null,
+    evidence = null,
 } = {}) {
     const failures = [];
     const warnings = [];
@@ -48,6 +51,16 @@ function evaluateFinalGreenGate({
         });
     }
 
+    const evidenceGate = evaluateEvidenceGate(evidence);
+    if (evidenceGate.failures.length) {
+        failures.push({
+            category: 'recording_evidence_drift',
+            reason: evidenceGate.failures[0].reason,
+            details: evidenceGate.failures,
+        });
+    }
+    if (evidenceGate.warnings.length) warnings.push(...evidenceGate.warnings);
+
     return {
         ok: failures.length === 0,
         categories: unique(failures.map(f => f.category)),
@@ -61,8 +74,46 @@ function evaluateFinalGreenGate({
     };
 }
 
+function evaluateEvidenceGate(evidence) {
+    const failures = [];
+    const warnings = [];
+    if (!evidence || !Array.isArray(evidence.rows)) return { failures, warnings };
+    let bodyComparable = 0;
+    for (const row of evidence.rows || []) {
+        if (row.isTransaction) continue;
+        if (row.recordedBodyLength > 0 && row.observedBodyLength > 0) bodyComparable++;
+        const transition = statusAnalysis.classifySampleReplay(row.entry || {}, {
+            ...(row.sample || {}),
+            label: row.label,
+            code: row.observedStatus,
+            responseCode: row.observedStatus,
+            status: row.observedStatus,
+            body: row.observedBody,
+            responseBody: row.observedBody,
+            finalUrl: row.finalUrl,
+        });
+        if (!transition || transition.matchesRecording || transition.folded) continue;
+        if (/auth|session|login|redirect/i.test(`${transition.category || ''} ${transition.relevance || ''}`)) {
+            failures.push({
+                index: row.entryIndex,
+                sampler: row.label,
+                reason: `${row.label} diverged from recording: ${transition.category}`,
+                transition,
+            });
+            break;
+        }
+    }
+    if (!bodyComparable) {
+        warnings.push({
+            category: 'body_compare_unavailable',
+            reason: 'No recorded and observed response bodies were available for recording comparison.',
+        });
+    }
+    return { failures, warnings };
+}
+
 function unique(values) {
     return [...new Set(values.filter(Boolean))];
 }
 
-module.exports = { evaluateFinalGreenGate };
+module.exports = { evaluateFinalGreenGate, _internal: { evaluateEvidenceGate } };

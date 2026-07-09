@@ -182,6 +182,9 @@ to set things without command-line flags:
 - `run.allowJsr223` — default `false`; keep generated JMX Java-safe by stripping
   Groovy helpers. Set `true` only when you intentionally need JSR223 and have a
   compatible JMeter/Java runtime.
+- `run.mineAssertions` — default `false`; generic page-text assertions are
+  opt-in because titles/headings can drift. Business outcome probes and protected
+  sampler checks still run by default.
 - `run.protectedCalls` / `run.disableCalls` — per-flow business samplers to
   protect or intentional noise/plumbing to disable. `disableCalls` will not
   remove login/session/business producers unless `run.allowUnsafeDisableProtected`

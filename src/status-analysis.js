@@ -1,7 +1,5 @@
 'use strict';
 
-const { _internal: { samplerLabel } } = require('./value-flow-decisions');
-
 function statusFamily(code) {
     const n = Number(code);
     if (!Number.isFinite(n) || n <= 0) return 'unknown';
@@ -99,9 +97,88 @@ function classifyStatusTransition(recordedCode, observedCode) {
     };
 }
 
-function traceStatusRootCause({ entries = [], samples = [], failingIndex = null } = {}) {
-    const normalized = normalizeSamples(samples);
-    const pairs = alignEntrySamplePairs(entries, normalized);
+function classifySampleReplay(entry = {}, sample = {}) {
+    const recorded = Number(entry && entry.response && entry.response.status || 0);
+    const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
+    if (!recorded || !observed) return null;
+    const authBounce = classifyAuthBounce(entry, sample, recorded, observed);
+    const loginBodyBounce = classifyLoginBodyBounce(entry, sample, recorded, observed);
+    return authBounce || loginBodyBounce || classifyStatusTransition(recorded, observed);
+}
+
+function classifyAuthBounce(entry, sample, recorded, observed) {
+    const finalUrl = String(sample.finalUrl || sample.url || '').trim();
+    if (!finalUrl) return null;
+    const recordedUrl = String(entry && entry.request && entry.request.url || '').trim();
+    const recordedParsed = parseUrl(recordedUrl);
+    const observedParsed = parseUrl(finalUrl);
+    if (!recordedParsed || !observedParsed) return null;
+    if (recordedParsed.host === observedParsed.host) return null;
+    if (!isAuthLikeHost(observedParsed.host)) return null;
+    if (isAuthLikeHost(recordedParsed.host)) return null;
+
+    return {
+        recorded,
+        observed,
+        recordedFamily: statusFamily(recorded),
+        observedFamily: statusFamily(observed),
+        matchesRecording: false,
+        category: 'auth_redirect_bounce',
+        relevance: 'authentication_required_or_session_missing',
+        observedFinalUrl: finalUrl,
+        recordedUrl,
+        repairHint: `Replay returned ${observed} but landed on auth host ${observedParsed.host} instead of the recorded app host ${recordedParsed.host}; repair auth/session cookies or redirect state before downstream samplers.`,
+    };
+}
+
+function parseUrl(value) {
+    try {
+        const url = new URL(value);
+        return { host: url.host.toLowerCase(), pathname: url.pathname || '/' };
+    } catch {
+        return null;
+    }
+}
+
+function isAuthLikeHost(host) {
+    return /auth|login|sso|idp|okta|ping|iam/i.test(String(host || ''));
+}
+
+function classifyLoginBodyBounce(entry, sample, recorded, observed) {
+    if (recorded < 200 || recorded >= 300 || observed < 200 || observed >= 300) return null;
+    const recordedBody = bodyOf(entry && entry.response && entry.response.content && entry.response.content.text);
+    const observedBody = bodyOf(sample && (sample.responseBody || sample.body));
+    if (!observedBody || !isLoginLikeBody(observedBody)) return null;
+    if (isLoginLikeBody(recordedBody)) return null;
+    return {
+        recorded,
+        observed,
+        recordedFamily: statusFamily(recorded),
+        observedFamily: statusFamily(observed),
+        matchesRecording: false,
+        category: 'auth_login_body_bounce',
+        relevance: 'authentication_required_or_session_missing',
+        observedFinalUrl: sample.finalUrl || sample.url || '',
+        recordedUrl: entry && entry.request && entry.request.url || '',
+        repairHint: `Replay returned ${observed} with a login/auth page body while the recording had application content; repair auth/session correlation before treating downstream samplers as root cause.`,
+    };
+}
+
+function isLoginLikeBody(body) {
+    const text = String(body || '').toLowerCase();
+    if (!text) return false;
+    return /<form\b[^>]*(login|password|username|email)?/.test(text) ||
+        /\b(sign in|log in|login|password|username|sso|single sign-on|authenticate)\b/.test(text);
+}
+
+function bodyOf(value) {
+    return String(value || '');
+}
+
+function traceStatusRootCause({ entries = [], samples = [], evidence = null, failingIndex = null } = {}) {
+    const pairs = evidence && Array.isArray(evidence.rows)
+        ? pairsFromEvidence(evidence)
+        : alignEntrySamplePairs(entries, normalizeSamples(samples));
     const explicitFailIndex = failingIndex == null
         ? null
         : (Number.isFinite(Number(failingIndex)) ? Number(failingIndex) : null);
@@ -112,7 +189,8 @@ function traceStatusRootCause({ entries = [], samples = [], failingIndex = null 
         const recorded = Number(entry && entry.response && entry.response.status || 0);
         const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
         if (!recorded || !observed) continue;
-        const transition = classifyStatusTransition(recorded, observed);
+        const transition = classifySampleReplay(entry, sample);
+        if (!transition) continue;
         if (!transition.matchesRecording && !transition.folded) {
             divergences.push({
                 index: entryIndex,
@@ -154,11 +232,34 @@ function firstStatusDivergenceIndex(entries, samples) {
     for (const { entry, sample, entryIndex } of alignEntrySamplePairs(entries, normalizeSamples(samples))) {
         const recorded = Number(entry && entry.response && entry.response.status || 0);
         const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
-        if (!recorded || !observed || recorded === observed) continue;
-        if (classifyStatusTransition(recorded, observed).folded) continue; // redirect folding, not divergence
+        if (!recorded || !observed) continue;
+        const transition = classifySampleReplay(entry, sample);
+        if (!transition || transition.matchesRecording || transition.folded) continue; // redirect folding, not divergence
         return entryIndex;
     }
     return -1;
+}
+
+function pairsFromEvidence(evidence) {
+    return (evidence.rows || [])
+        .filter(row => !row.isTransaction)
+        .map(row => ({
+            entry: row.entry || {},
+            sample: {
+                ...(row.sample || {}),
+                label: row.label,
+                code: row.observedStatus,
+                responseCode: row.observedStatus,
+                status: row.observedStatus,
+                success: row.success,
+                body: row.observedBody,
+                responseBody: row.observedBody,
+                finalUrl: row.finalUrl,
+                urls: row.subUrls,
+            },
+            entryIndex: row.entryIndex,
+            sampleIndex: row.sampleIndex,
+        }));
 }
 
 function isBadStatus(sample) {
@@ -168,6 +269,14 @@ function isBadStatus(sample) {
 
 function sampleByLabel(samples, label) {
     return samples.find(s => String(s.label || s.name || '').trim() === label);
+}
+
+function samplerLabel(entry, index) {
+    const method = String(entry && entry.request && entry.request.method || 'GET').toUpperCase();
+    let path = '/';
+    try { path = new URL(entry.request && entry.request.url || '').pathname || '/'; }
+    catch { path = String(entry && entry.request && entry.request.url || '/').split('?')[0] || '/'; }
+    return `Step ${String(index + 1).padStart(2, '0')} - ${method} ${path}`;
 }
 
 function alignEntrySamplePairs(entries, samples) {
@@ -213,6 +322,7 @@ module.exports = {
     statusFamily,
     statusRelevance,
     classifyStatusTransition,
+    classifySampleReplay,
     traceStatusRootCause,
-    _internal: { firstStatusDivergenceIndex, alignEntrySamplePairs },
+    _internal: { firstStatusDivergenceIndex, alignEntrySamplePairs, pairsFromEvidence, isLoginLikeBody },
 };

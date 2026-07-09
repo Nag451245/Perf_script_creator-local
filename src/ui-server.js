@@ -131,6 +131,7 @@ function normalizeRunRequest(url, body = {}) {
         iterations: body.iterations,
         retryFailed: body.retryFailed,
         geminiPro: !!body.geminiPro,
+        pair: !!body.pair,
     };
 }
 

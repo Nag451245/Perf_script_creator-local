@@ -26,9 +26,11 @@ function flagsForRunRequest(request = {}) {
     pushPositiveIntFlag(flags, '--iterations', request.iterations, { max: 6 });
     pushPositiveIntFlag(flags, '--retry-failed', request.retryFailed);
     if (request.geminiPro) flags.push('--gemini-pro');
-    for (const input of normalizeList(request.selectedInputs)) {
+    const inputs = normalizeList(request.selectedInputs);
+    for (const input of inputs) {
         flags.push('--input', input);
     }
+    if (request.pair && inputs.length === 2) flags.push('--pair');
     return flags;
 }
 

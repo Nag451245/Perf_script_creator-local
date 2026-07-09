@@ -1079,6 +1079,46 @@ test('fold safety: a duplicate redirect hop is safe despite navigating (parent r
     assert.ok(!byIndex[1].checks.loadBearingNavigation, 'navigation is reproduced by the parent');
 });
 
+test('dual-recording pairing: two single JMX units merge into a dual-jmx variance unit', () => {
+    const { mergeUnitsAsDual } = require('../src/ingest');
+    const a = { name: 'LOGI_0004User', kind: 'jmx', primary: '/in/LOGI_0004User.jmx', secondary: '/in/LOGI_0004User.xml' };
+    const b = { name: 'LOGI_0006User', kind: 'jmx', primary: '/in/LOGI_0006User.jmx', secondary: '/in/LOGI_0006User.xml' };
+    const dual = mergeUnitsAsDual(a, b);
+    assert.strictEqual(dual.kind, 'dual-jmx');
+    assert.strictEqual(dual.primary, '/in/LOGI_0004User.jmx');
+    assert.strictEqual(dual.secondary, '/in/LOGI_0006User.jmx');
+    assert.deepStrictEqual(dual.sidecars, { primary: '/in/LOGI_0004User.xml', secondary: '/in/LOGI_0006User.xml' });
+    // Two HARs → dual-har.
+    const har = mergeUnitsAsDual({ name: 'A', primary: '/in/a.har' }, { name: 'B', primary: '/in/b.har' });
+    assert.strictEqual(har.kind, 'dual-har');
+    // Mixed types are refused.
+    assert.throws(() => mergeUnitsAsDual({ primary: '/in/a.har' }, { primary: '/in/b.jmx' }), /same type/);
+});
+
+test('run flags: --pair is emitted only when exactly two inputs are selected', () => {
+    const { flagsForRunRequest } = require('../src/ui-run-mode');
+    const two = flagsForRunRequest({ mode: 'agent', selectedInputs: ['a', 'b'], pair: true }).join(' ');
+    assert.ok(two.includes('--pair'), 'two selected + pair → --pair');
+    const one = flagsForRunRequest({ mode: 'agent', selectedInputs: ['a'], pair: true }).join(' ');
+    assert.ok(!one.includes('--pair'), 'one selected → no --pair even if requested');
+    const none = flagsForRunRequest({ mode: 'agent', selectedInputs: ['a', 'b'], pair: false }).join(' ');
+    assert.ok(!none.includes('--pair'), 'pair off → no --pair');
+});
+
+test('flow understanding: summarizes flow, auth style, host, and playbook up front', () => {
+    const { summarizeFlow } = require('../src/flow-understanding');
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/login'),
+        entry('POST', 'https://app.test/api/tasks/create', { reqHeaders: [{ name: 'Content-Type', value: 'application/json' }] }),
+    ]));
+    const out = summarizeFlow({ entries, pages, runCfg: { testObjective: 'release cert' } });
+    assert.ok(out.lines.some(l => /Flow understanding/.test(l)));
+    assert.ok(out.lines.some(l => /Business flow:/.test(l)));
+    assert.ok(out.lines.some(l => /Application host\(s\): app\.test/.test(l)));
+    assert.ok(out.lines.some(l => /Stated objective: release cert/.test(l)));
+    assert.strictEqual(out.summary.hosts.primary, 'app.test');
+});
+
 test('AI provider label prefers OpenAI over Gemini when both are configured', () => {
     assert.strictEqual(runnerInternal.llmProviderLabel({ OPENAI_API_KEY: 'openai-key', GOOGLE_API_KEY: 'google-key' }), 'OpenAI');
     assert.strictEqual(runnerInternal.llmProviderLabel({ GOOGLE_API_KEY: 'google-key' }), 'Gemini');

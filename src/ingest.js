@@ -900,4 +900,31 @@ function compareAndAnnotate(har1, har2, secondaryPath, notes, okKey, errKey) {
     }
 }
 
-module.exports = { groupInputs, loadUnit, analyzeInputFiles, writeIntakeArtifacts };
+/**
+ * Manually pair two single-recording units into ONE dual-recording variance
+ * unit — the UI feature for recordings that aren't named __run1/__run2 (e.g.
+ * LOGI_..._0004User + LOGI_..._0006User). Two JMX units → dual-jmx (sidecars
+ * carried); two HAR units → dual-har. Order is preserved: A is canonical.
+ */
+function mergeUnitsAsDual(unitA, unitB) {
+    if (!unitA || !unitB) throw new Error('two units are required to pair');
+    const bothJmx = /\.jmx$/i.test(unitA.primary) && /\.jmx$/i.test(unitB.primary);
+    const bothHar = /\.har$/i.test(unitA.primary) && /\.har$/i.test(unitB.primary);
+    if (!bothJmx && !bothHar) {
+        throw new Error('pairing requires two recordings of the same type (two JMX or two HAR)');
+    }
+    const name = `${unitA.name}__paired`;
+    if (bothHar) {
+        return { name, kind: 'dual-har', primary: unitA.primary, secondary: unitB.primary, golden: unitA.golden || unitB.golden };
+    }
+    return {
+        name,
+        kind: 'dual-jmx',
+        primary: unitA.primary,
+        secondary: unitB.primary,
+        sidecars: { primary: unitA.secondary || undefined, secondary: unitB.secondary || undefined },
+        golden: unitA.golden || unitB.golden,
+    };
+}
+
+module.exports = { groupInputs, loadUnit, analyzeInputFiles, writeIntakeArtifacts, mergeUnitsAsDual };

@@ -204,6 +204,16 @@ async function processUnit(unit) {
     }
     const { entries, secondaryEntries, pages, mode, notes } = loaded;
     rec(`mode=${mode} · parsed ${entries.length} entries, ${pages.length} pages`);
+
+    // Flow & domain understanding — say what the agent SEES before it acts,
+    // so the operator can catch a misread instantly instead of after a run.
+    try {
+        const { summarizeFlow } = require('./src/flow-understanding');
+        const understanding = summarizeFlow({ entries, pages, runCfg: CONFIG.run || {} });
+        for (const line of understanding.lines) rec(line);
+        fs.writeFileSync(path.join(outDir, `${name}_understanding.json`), JSON.stringify(understanding.summary, null, 2));
+    } catch (e) { rec(`flow understanding skipped: ${e.message}`); }
+
     if (notes.dualHar) rec(`dual-recording variance: ${notes.dualHar.dynamicValueCount} dynamic values across the two runs`);
     if (notes.dualHarError) rec(`dual-recording comparison failed (${notes.dualHarError}) — continuing with first recording only`);
     if (notes.jmxJtl) rec(`JMX paired with ${notes.jmxJtl.sidecar}: ${notes.jmxJtl.paired}/${entries.length} response sides matched`);
@@ -450,7 +460,21 @@ async function scanOnce() {
     for (const missing of selection.missing) {
         log(`INPUT ISSUE [warning] selected_input_not_found: ${missing} did not match any logical input unit or file.`);
     }
-    const units = SELECTED_INPUTS.length ? selection.selected : analysis.units;
+    let units = SELECTED_INPUTS.length ? selection.selected : analysis.units;
+    // Manual dual-recording pairing (--pair): merge exactly two selected
+    // single-recording units into one variance unit (for recordings not named
+    // __run1/__run2). Two JMX → dual-jmx (sidecars carried); two HAR → dual-har.
+    if (args.includes('--pair')) {
+        if (units.length === 2) {
+            try {
+                const { mergeUnitsAsDual } = require('./src/ingest');
+                units = [mergeUnitsAsDual(units[0], units[1])];
+                log(`paired 2 recordings as a dual-recording variance run: ${units[0].name}`);
+            } catch (e) { log(`INPUT ISSUE [warning] pair_failed: ${e.message}`); }
+        } else {
+            log(`INPUT ISSUE [warning] pair_needs_two: --pair requires exactly two selected recordings (got ${units.length}).`);
+        }
+    }
     const retryOptions = inputRetryOptions();
     const fresh = units.filter(u => !processed.has(u.primary) && (FORCE || !USE_INPUT_STATE || inputState.shouldProcessUnit(u, processedState, retryOptions)));
     if (fresh.length === 0) {

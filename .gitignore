@@ -12,3 +12,5 @@ memory/verified-lessons.json
 .perfscript-state/
 # real customer recordings never enter git — only synthetic eval fixtures do
 eval-corpus/local-*/
+# saved response-body snapshots from manual debugging
+*.pdf?.html

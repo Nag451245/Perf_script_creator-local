@@ -168,11 +168,17 @@ button:disabled{opacity:.4;cursor:not-allowed}
       <div class="card-b">
         <div id="drop" class="drop">Drop <b>HAR</b>, <b>JMX</b>, <b>XML</b>, or <b>JTL</b> files &mdash; or click to browse</div>
         <input id="file" type="file" multiple style="display:none">
-        <div class="mini-actions">
-          <button id="select-all" class="btn-ghost" type="button">Select all</button>
-          <button id="select-none" class="btn-ghost" type="button">Clear</button>
+        <div class="field" style="margin-top:12px">
+          <label>Recording 1 &mdash; primary</label>
+          <select id="rec1"><option value="">Select a recording…</option></select>
+          <div id="rec1-files" class="unit-files"></div>
         </div>
-        <div id="units"></div>
+        <div class="field">
+          <label>Recording 2 &mdash; pair for variance <span style="color:var(--mut);font-weight:500">(optional)</span></label>
+          <select id="rec2"><option value="">None — run Recording 1 alone</option></select>
+          <div id="rec2-files" class="unit-files"></div>
+        </div>
+        <div id="pair-status" class="hint" style="margin-top:2px"></div>
         <div id="input-issues"></div>
       </div>
     </section>
@@ -190,10 +196,6 @@ button:disabled{opacity:.4;cursor:not-allowed}
             <option value="agent-watch">Watch input folder</option>
           </select>
         </div>
-        <div id="pair-row" class="pair">
-          <label class="sw"><input id="pair-toggle" type="checkbox"><span class="track"></span><span class="knob"></span></label>
-          <span class="txt"><b>Pair as dual recording</b> — treat the two selected recordings as one variance run (finds dynamic values across both).</span>
-        </div>
         <div class="grid3">
           <div class="field"><label>Fix iterations</label>
             <select id="iterations">
@@ -210,7 +212,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
           <button id="force-run" class="btn-ghost" type="button">Force rerun</button>
           <button id="stop" class="btn-danger" type="button" disabled>Stop</button>
         </div>
-        <div id="run-hint" class="hint">Select one recording, or two to pair. Multi-select runs sequentially in one agent pass.</div>
+        <div id="run-hint" class="hint">Pick Recording 1 to run it alone, or add Recording 2 to pair them as one variance run.</div>
       </div>
     </section>
 
@@ -279,15 +281,28 @@ The agent will print its understanding of the flow and domain before it begins.<
 </div>
 
 <script>
-var currentRunId=null,poll=null,lastState=null,startedAt=0,logText='';
+var currentRunId=null,poll=null,lastState=null,startedAt=0,logText='',unitsById={};
 function q(s){return document.querySelector(s)}
 function qa(s){return Array.prototype.slice.call(document.querySelectorAll(s))}
 function esc(s){return String(s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 async function j(url,opt){var r=await fetch(url,opt||{});var d=await r.json();if(!r.ok)throw new Error(d.error||r.statusText);return d}
-function selectedInputs(){return qa('.chk:checked').map(function(x){return x.value})}
-function updateSelected(){var n=selectedInputs().length;q('#selected-pill').textContent=n+' selected';
-  qa('.unit').forEach(function(u){var c=u.querySelector('.chk');u.classList.toggle('sel',c&&c.checked)});
-  var pr=q('#pair-row');if(pr)pr.classList.toggle('show',n===2);}
+function selectedInputs(){return [q('#rec1').value,q('#rec2').value].filter(Boolean)}
+function unitFilesHtml(u){if(!u)return '';return (u.files||[]).map(function(f){return '<b>'+esc(f.role)+'</b>: '+esc(f.name)}).join('<br>');}
+function updateSelected(){
+  var ins=selectedInputs();
+  q('#selected-pill').textContent=ins.length+' selected';
+  var u1=unitsById[q('#rec1').value],u2=unitsById[q('#rec2').value];
+  q('#rec1-files').innerHTML=unitFilesHtml(u1);
+  q('#rec2-files').innerHTML=unitFilesHtml(u2);
+  var st=q('#pair-status');
+  if(u1&&u2){
+    var sameType=(/jmx/i.test(u1.kind)&&/jmx/i.test(u2.kind))||(/har/i.test(u1.kind)&&/har/i.test(u2.kind));
+    st.innerHTML=sameType
+      ?'<span style="color:var(--accent)">◆ Will pair as one dual-recording variance run</span> — dynamic values found across both.'
+      :'<span style="color:var(--warn)">Pairing needs two recordings of the same type (two JMX or two HAR).</span>';
+  } else if(u1){ st.textContent='Runs Recording 1 alone. Add Recording 2 to pair.'; }
+  else { st.textContent=''; }
+}
 function phaseOf(txt){
  if(/Finished|DONE|verdict=|report\\.html|Done\\./i.test(txt))return{pct:100,label:'Finished'};
  if(/adjudicat|fold probe|re-verifying|LLM|round|replan/i.test(txt))return{pct:86,label:'Repairing & verifying'};
@@ -308,19 +323,22 @@ async function refresh(){
  if(s.activeRun&&!currentRunId)startPolling(s.activeRun.id,false);
  updateSelected();return s;
 }
-function renderUnits(units){
- if(!units.length){q('#units').innerHTML='<div class="empty">No runnable recordings in input. Drop files above.</div>';return}
- q('#units').innerHTML=units.map(function(u){
-  var warns=(u.warnings||[]).map(function(w){return '<div class="warnrow">'+esc(w.message)+'</div>'}).join('');
-  var files=(u.files||[]).map(function(f){return '<b>'+esc(f.role)+'</b>: '+esc(f.name)}).join('<br>');
-  var golden=u.golden?'<span class="chip golden">golden</span>':'';
-  var host=(u.hosts||[])[0]?'<span class="chip host">'+esc((u.hosts||[])[0])+(u.hosts.length>1?' +'+(u.hosts.length-1):'')+'</span>':'';
-  return '<label class="unit"><div class="unit-top"><input class="chk" type="checkbox" value="'+esc(u.id)+'">'+
-   '<div style="min-width:0"><div class="unit-name">'+esc(u.name)+'</div>'+
-   '<div class="chips"><span class="chip kind">'+esc(u.kind)+'</span><span class="chip">'+(u.requestCount||0)+' requests</span>'+host+golden+'</div>'+
-   '<div class="unit-files">'+files+'</div>'+warns+'</div></div></label>';
+function unitLabel(u){
+ var host=(u.hosts||[])[0]?' · '+u.hosts[0]:'';
+ return u.name+'  ['+u.kind+', '+(u.requestCount||0)+' req'+(u.golden?', golden':'')+host+']';
+}
+function fillSelect(sel,units,keep,firstLabel){
+ var prev=sel.value;
+ sel.innerHTML='<option value="">'+firstLabel+'</option>'+units.map(function(u){
+   return '<option value="'+esc(u.id)+'">'+esc(unitLabel(u))+'</option>';
  }).join('');
- qa('.chk').forEach(function(x){x.onchange=updateSelected});
+ if(keep&&units.some(function(u){return u.id===prev}))sel.value=prev;
+}
+function renderUnits(units){
+ unitsById={};units.forEach(function(u){unitsById[u.id]=u});
+ fillSelect(q('#rec1'),units,true,units.length?'Select a recording…':'No recordings — drop files above');
+ fillSelect(q('#rec2'),units,true,'None — run Recording 1 alone');
+ updateSelected();
 }
 function renderIssues(issues){
  q('#input-issues').innerHTML=(issues||[]).filter(function(i){return i.severity==='error'||i.severity==='warning'}).slice(0,8)
@@ -342,14 +360,14 @@ function renderOutputs(outputs){
 }
 function requestBody(force){
  var ins=selectedInputs();
- return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,iterations:q('#iterations').value,retryFailed:q('#retry').value,geminiPro:q('#gemini-pro').value==='1',pair:ins.length===2&&q('#pair-toggle').checked});
+ return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,iterations:q('#iterations').value,retryFailed:q('#retry').value,geminiPro:q('#gemini-pro').value==='1',pair:ins.length===2});
 }
 async function saveCfg(quiet){
  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetBaseUrl:q('#cfg-target').value,username:q('#cfg-user').value,password:q('#cfg-pass').value,loadProfile:{users:q('#cfg-users').value,rampUpSec:q('#cfg-ramp').value,holdSec:q('#cfg-hold').value},seniorMode:q('#mode').value==='senior-agent'?'mature':'strong',testObjective:q('#cfg-objective').value,techStack:q('#cfg-stack').value,domainNotes:q('#cfg-domain').value,slo:{p95Ms:q('#cfg-p95').value,errorRatePct:q('#cfg-error').value}})});
  q('#cfg-pass').value='';if(!quiet){q('#cfg-status').textContent='Saved';setTimeout(function(){q('#cfg-status').textContent=''},1800)}loadCfg();
 }
 async function loadCfg(){var c=await j('/api/config');q('#cfg-target').value=c.targetBaseUrl||'';q('#cfg-user').value=c.username||'';q('#cfg-pass').placeholder=c.hasPassword?'saved — unchanged':'password';q('#cfg-users').value=c.loadProfile.users||'';q('#cfg-ramp').value=c.loadProfile.rampUpSec||'';q('#cfg-hold').value=c.loadProfile.holdSec||'';q('#cfg-objective').value=c.testObjective||'';q('#cfg-stack').value=c.techStack||'';q('#cfg-domain').value=c.domainNotes||'';q('#cfg-p95').value=(c.slo&&c.slo.p95Ms)||'';q('#cfg-error').value=(c.slo&&c.slo.errorRatePct)||''}
-async function run(force){await saveCfg(true);var d=await j('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:requestBody(force)});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
+async function run(force){if(!selectedInputs().length){alert('Select Recording 1 first.');return}await saveCfg(true);var d=await j('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:requestBody(force)});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
 async function rerunLast(){var d=await j('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
 async function rerunName(name){var d=await j('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selectedInputs:[name]})});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
 function colorLog(text){
@@ -380,8 +398,7 @@ q('#force-run').onclick=function(){run(true).catch(function(e){alert(e.message)}
 q('#rerun-last').onclick=function(){rerunLast().catch(function(e){alert(e.message)})};
 q('#stop').onclick=async function(){await fetch('/api/cancel',{method:'POST'});q('#phase').textContent='Stopping…'};
 q('#refresh').onclick=refresh;q('#cfg-save').onclick=function(){saveCfg(false)};
-q('#select-all').onclick=function(){qa('.chk').forEach(function(x){x.checked=true});updateSelected()};
-q('#select-none').onclick=function(){qa('.chk').forEach(function(x){x.checked=false});updateSelected()};
+q('#rec1').onchange=updateSelected;q('#rec2').onchange=updateSelected;
 q('#copy-log').onclick=function(){navigator.clipboard&&navigator.clipboard.writeText(logText)};
 q('#clear-log').onclick=function(){logText='';q('#log').textContent=''};
 q('#chat-send').onclick=function(){sendChat()};q('#chat-input').onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();sendChat()}};

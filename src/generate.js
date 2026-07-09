@@ -1078,6 +1078,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             bodyCorrelations: bodyCorrelated,
             graphqlCsrfHeaderRepairs: gqlCsrf.substitutions,
             formCorrelations: formCorr.wired.length,
+            duplicateHops: duplicateHopLabels.length,
             goldenApplied,
             outcomeProbe: probe ? { probeLabel: probe.probeLabel, injected: probeInjected } : null,
             loadProfile: loadProfileApplied,

@@ -1,0 +1,10 @@
+{
+  "_comment": "SSO interceptor redirect chain (the class that tripped the LOGI flow: a hop sampler re-firing a single-use grant inside multiple transactions). Pins forever: duplicate hops are folded from 302-Location evidence with ZERO taught rules, and the bridge token is correlated (0 orphans) rather than left literal.",
+  "runCfg": {},
+  "stats": {
+    "duplicateHops": { "min": 2 },
+    "correlations": { "min": 1 },
+    "orphans": 0,
+    "samplers": { "min": 4, "max": 6 }
+  }
+}

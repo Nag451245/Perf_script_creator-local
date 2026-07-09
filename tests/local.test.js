@@ -958,6 +958,72 @@ test('adjudicator: every decision declares its evidence tier', () => {
     assert.ok(Object.values(out.byIndex).every(d => ['guard', 'evidence', 'prior', 'review'].includes(d.tier)), 'all decisions carry a valid tier');
 });
 
+test('redirect hops: recording Location chains identify duplicate hop samplers (any app, zero rules)', () => {
+    const { detectDuplicateRedirectHops } = require('../src/redirect-hops');
+    const hop = (method, url, status, location, extra = {}) => ({
+        request: { method, url, headers: [] },
+        response: { status, headers: location ? [{ name: 'Location', value: location }] : [], content: { text: '' } },
+        ...extra,
+    });
+    const entries = [
+        hop('POST', 'https://app.test/s/interceptor/', 302, '/s/interceptor/authorize/?grant=TOKEN_A'),
+        hop('GET', 'https://app.test/s/interceptor/authorize/?grant=TOKEN_A', 302, 'https://app.test/redirect/'),
+        hop('GET', 'https://app.test/redirect/', 200, null),
+        hop('GET', 'https://app.test/dashboard', 200, null),
+        // …second transaction later in the flow, DIFFERENT single-use grant:
+        hop('POST', 'https://app.test/s/interceptor/', 302, '/s/interceptor/authorize/?grant=TOKEN_B'),
+        hop('GET', 'https://app.test/s/interceptor/authorize/?grant=TOKEN_B', 302, 'https://app.test/redirect/'),
+        hop('GET', 'https://app.test/redirect/', 200, null),
+    ];
+    const dup = detectDuplicateRedirectHops(entries);
+    assert.deepStrictEqual(dup.indexes.sort((a, b) => a - b), [1, 2, 5, 6], 'both occurrences in both transactions + their onward hops');
+    assert.strictEqual(dup.byIndex[1].parentIndex, 0);
+    assert.strictEqual(dup.byIndex[2].rootIndex, 0, 'chained hop resolves to the chain root');
+    assert.strictEqual(dup.byIndex[5].parentIndex, 4, 'second transaction has its own parent');
+    // A GET that is NOT a redirect target is never flagged; POSTs are never hops.
+    assert.ok(!dup.byIndex[3]);
+    const noDup = detectDuplicateRedirectHops([hop('GET', 'https://a/x', 200, null), hop('GET', 'https://a/y', 200, null)]);
+    assert.deepStrictEqual(noDup.indexes, []);
+});
+
+test('operator disable is ABSOLUTE: session-like priors cannot veto run.disableCalls (live LOGI bug)', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/home'),
+        entry('GET', 'https://app.test/s/interceptor/authorize/?grant=abc123def'),
+        entry('GET', 'https://app.test/next'),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'operator-tier', {
+        runCfg: { disableCalls: ['/s/interceptor/authorize/'] },
+    });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+    const sampler = xml.match(/<HTTPSamplerProxy\b[^>]*interceptor\/authorize[^>]*>/) ||
+        xml.match(/<HTTPSamplerProxy\b[^>]*testname="[^"]*authorize[^"]*"[^>]*>/);
+    assert.ok(sampler, 'sampler exists');
+    assert.match(sampler[0], /enabled="false"/, 'operator disable applied despite auth-looking path');
+    // Explicit protect beats explicit disable, with a conflict note.
+    const out2 = tmp();
+    const gen2 = generate(entries, pages, out2, 'operator-conflict', {
+        runCfg: { disableCalls: ['/s/interceptor/authorize/'], protectedCalls: ['/s/interceptor/authorize/'] },
+    });
+    const xml2 = fs.readFileSync(gen2.jmxPath, 'utf8');
+    const sampler2 = xml2.match(/<HTTPSamplerProxy\b[^>]*testname="[^"]*authorize[^"]*"[^>]*>/);
+    assert.match(sampler2[0], /enabled="true"/, 'operator protect outranks operator disable');
+    assert.ok(gen2.reasoning.some(r => r.phase === 'disable-calls-conflict'), 'conflict surfaced in reasoning');
+});
+
+test('business guard: never protects operator-disabled samplers or proven duplicate hops', () => {
+    const xml = `<HTTPSamplerProxy testname="SC01_T02_/s/interceptor/authorize/-017" enabled="true"><stringProp name="HTTPSampler.path">/s/interceptor/authorize/</stringProp><stringProp name="HTTPSampler.method">GET</stringProp><stringProp name="HTTPSampler.domain">stgauth.webpt.com</stringProp></HTTPSamplerProxy><hashTree/>
+<HTTPSamplerProxy testname="SC01_T02_/user/login-019" enabled="true"><stringProp name="HTTPSampler.path">/user/login</stringProp><stringProp name="HTTPSampler.method">POST</stringProp><stringProp name="HTTPSampler.domain">stgauth.webpt.com</stringProp></HTTPSamplerProxy><hashTree/>`;
+    // Case 1: operator disable — no allowUnsafeDisableProtected flag needed.
+    const g1 = businessGuard.buildBusinessGuard({ xml, flowName: 'logi', runCfg: { disableCalls: ['/s/interceptor/authorize/'] } });
+    assert.ok(!g1.protectedNames.has('SC01_T02_/s/interceptor/authorize/-017'), 'operator-disabled sampler is not protected');
+    assert.ok(g1.protectedNames.has('SC01_T02_/user/login-019'), 'real login stays protected');
+    // Case 2: duplicate-hop evidence.
+    const g2 = businessGuard.buildBusinessGuard({ xml, flowName: 'logi', runCfg: {}, duplicateHopLabels: ['SC01_T02_/s/interceptor/authorize/-017'] });
+    assert.ok(!g2.protectedNames.has('SC01_T02_/s/interceptor/authorize/-017'), 'duplicate hop is not protected');
+});
+
 test('AI provider label prefers OpenAI over Gemini when both are configured', () => {
     assert.strictEqual(runnerInternal.llmProviderLabel({ OPENAI_API_KEY: 'openai-key', GOOGLE_API_KEY: 'google-key' }), 'OpenAI');
     assert.strictEqual(runnerInternal.llmProviderLabel({ GOOGLE_API_KEY: 'google-key' }), 'Gemini');
@@ -3347,8 +3413,10 @@ test('generate: generic browser/OIDC noise is disabled by default; app-specific 
     });
     const xmlCfg = fs.readFileSync(genCfg.jmxPath, 'utf8');
     assert.strictEqual(samplerEnabledForPath(xmlCfg, 'auth-gateway/rbac-public-key'), false);
-    assert.strictEqual(samplerEnabledForPath(xmlCfg, 'iam/callback'), true,
-        'session callback producers stay enabled even when a broad disableCalls entry matches');
+    assert.strictEqual(samplerEnabledForPath(xmlCfg, 'iam/callback'), false,
+        'operator tier is absolute: an explicit disableCalls entry is applied even to session-looking paths (heuristics may only warn)');
+    assert.ok(genCfg.reasoning.some(r => r.phase === 'disable-calls-warning'),
+        'the disagreement is surfaced as a warning, not a silent veto');
 });
 
 test('generate: step-named samplers are disabled via run.disableCalls, not by default', () => {
@@ -3371,8 +3439,8 @@ test('generate: step-named samplers are disabled via run.disableCalls, not by de
         runCfg: { disableCalls: ['Step 07 - POST /'] },
     });
     const xmlCfg = fs.readFileSync(genCfg.jmxPath, 'utf8');
-    assert.strictEqual(samplerEnabledForName(xmlCfg, 'Step 07 - POST /'), true,
-        'configured broad step disables must not remove auth/session producers');
+    assert.strictEqual(samplerEnabledForName(xmlCfg, 'Step 07 - POST /'), false,
+        'operator step-label disable applies semantically (step number + method + exact path) under pe-naming');
 });
 
 test('generate: disableCalls cannot remove protected auth/session producers without unsafe override', () => {
@@ -3400,14 +3468,18 @@ test('generate: disableCalls cannot remove protected auth/session producers with
     });
     const xml = fs.readFileSync(gen.jmxPath, 'utf8');
 
-    assert.strictEqual(samplerEnabledForPath(xml, '/u/login/identifier'), true);
-    assert.strictEqual(samplerEnabledForPath(xml, '/u/login/password'), true);
-    assert.strictEqual(samplerEnabledForPath(xml, '/authorization/'), true);
-    assert.strictEqual(samplerEnabledForPath(xml, '/s/interceptor/authorize/'), false,
-        'configured interceptor authorize hop is redirect plumbing and must actually be disabled');
-    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), false,
-        'configured jwt create-cookie with no downstream consumer is browser plumbing and should fold');
+    // Operator tier is absolute: every explicit disableCalls entry applies —
+    // including auth/session-looking ones. Heuristic disagreement becomes a
+    // WARNING note, never a veto (the veto is how the interceptor hop kept
+    // tripping the LOGI flow run after run).
+    assert.strictEqual(samplerEnabledForPath(xml, '/u/login/identifier'), false);
+    assert.strictEqual(samplerEnabledForPath(xml, '/u/login/password'), false);
+    assert.strictEqual(samplerEnabledForPath(xml, '/authorization/'), false);
+    assert.strictEqual(samplerEnabledForPath(xml, '/s/interceptor/authorize/'), false);
+    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), false);
     assert.strictEqual(samplerEnabledForPath(xml, '/sdk/evalx'), false);
+    assert.ok(gen.reasoning.some(r => r.phase === 'disable-calls-warning'),
+        'heuristics disagree loudly about the login POSTs — as a warning');
 });
 
 test('generate: jwt create-cookie stays enabled when its cookie is consumed downstream', () => {
@@ -3429,8 +3501,18 @@ test('generate: jwt create-cookie stays enabled when its cookie is consumed down
     });
     const xml = fs.readFileSync(gen.jmxPath, 'utf8');
 
-    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), true,
-        'jwt create-cookie is protected when it produces a live downstream cookie');
+    // Operator wins even against consumption evidence — but the disagreement
+    // must be loud, because this one may genuinely break a consumer.
+    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), false,
+        'explicit operator disable applies; evidence disagreement becomes a warning');
+    assert.ok(gen.reasoning.some(r => r.phase === 'disable-calls-warning'),
+        'consumed-producer disable is flagged for the operator');
+    // Without the operator entry, the default heuristics leave it alone.
+    const out2 = tmp();
+    const gen2 = generate(entries, pages, out2, 'jwt-untouched', { runCfg: {} });
+    const xml2 = fs.readFileSync(gen2.jmxPath, 'utf8');
+    assert.strictEqual(samplerEnabledForPath(xml2, '/jwt/v2/create-cookie'), true,
+        'no default pattern folds a consumed producer');
 });
 
 function samplerEnabledForPath(xml, pathPart) {

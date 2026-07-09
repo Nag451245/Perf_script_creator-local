@@ -733,9 +733,22 @@ function applyLoadProfile(xml, profile = {}) {
  * "Step 07 - POST /u/login/identifier" — the agent disabled that flow's
  * login. Non-step patterns (paths, hosts) keep substring semantics.
  */
-const STEP_LABEL_PATTERN_RE = /^Step \d+ - [A-Z]+ \S*$/;
-function samplerPatternMatches(pattern, name, hay) {
-    if (STEP_LABEL_PATTERN_RE.test(String(pattern))) return name === pattern;
+const STEP_LABEL_PATTERN_RE = /^Step (\d+) - ([A-Z]+) (\S*)$/;
+function samplerPatternMatches(pattern, sampler, hay) {
+    const s = typeof sampler === 'string' ? { name: sampler } : (sampler || {});
+    const m = String(pattern).match(STEP_LABEL_PATTERN_RE);
+    if (m) {
+        if (s.name === pattern) return true; // legacy "Step NN - ..." testnames
+        // pe-named samplers ("SC01_T02_/-007"): a step label matches SEMANTICALLY —
+        // same step number, same method, same exact path — never by substring.
+        const stepNo = Number(m[1]);
+        const nameStep = Number((String(s.name || '').match(/-(\d+)$/) || [])[1]);
+        if (!Number.isFinite(nameStep) || nameStep !== stepNo) return false;
+        const samplerPath = String(s.path || '').split('?')[0] || '/';
+        const patternPath = m[3].split('?')[0] || '/';
+        const methodOk = !s.method || String(s.method).toUpperCase() === m[2];
+        return methodOk && samplerPath === patternPath;
+    }
     return hay.includes(pattern);
 }
 
@@ -749,7 +762,7 @@ function disableSamplersByPattern(xml, patterns, opts = {}) {
         const method = (inner.match(/<stringProp name="HTTPSampler\.method">([^<]*)</) || [])[1] || '';
         const name = (attrs.match(/testname="([^"]*)"/) || [])[1] || '';
         const hay = `${domain}${path} ${name}`;
-        if (patterns.some(p => samplerPatternMatches(p, name, hay)) && /enabled="true"/.test(attrs)) {
+        if (patterns.some(p => samplerPatternMatches(p, { name, path, method }, hay)) && /enabled="true"/.test(attrs)) {
             const sampler = { name, path, domain, method, body: inner };
             if (protect && protect(sampler)) {
                 skippedProtected.push((name || path).slice(0, 80));

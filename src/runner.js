@@ -1440,6 +1440,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         flowName: name,
         runCfg: enrichedRunCfg,
         valueFlowDecisions: samplerDecisions,
+        duplicateHopLabels: gen.duplicateHopLabels || [],
     });
     const blockedDisables = [];
     const requestAdjudications = [];
@@ -1689,6 +1690,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                     flowName: name,
                     runCfg: replanCfg,
                     valueFlowDecisions: samplerDecisions2,
+                    duplicateHopLabels: gen2.duplicateHopLabels || [],
                 });
                 const replanBlockedDisables = [];
                 const result2 = await runFeedbackLoop(

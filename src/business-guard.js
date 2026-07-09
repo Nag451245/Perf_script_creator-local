@@ -10,14 +10,25 @@ const AUTH_OR_SESSION_PATH = /\/(?:u\/login|user\/login|jwt\/v2\/create-cookie|a
 const JWT_CREATE_COOKIE_PATH = /\/jwt\/v2\/create-cookie(?:\/|\?|$)/i;
 const MUTATING_METHOD = /^(POST|PUT|PATCH|DELETE)$/i;
 
-function buildBusinessGuard({ xml, flowName = '', runCfg = {}, valueFlowDecisions = null } = {}) {
+function buildBusinessGuard({ xml, flowName = '', runCfg = {}, valueFlowDecisions = null, duplicateHopLabels = [] } = {}) {
     const samplers = indexSamplers(xml || '');
     const goalTerms = goalTermsFor(flowName, runCfg);
-    const operatorDisables = runCfg.allowUnsafeDisableProtected === true && Array.isArray(runCfg.disableCalls)
-        ? runCfg.disableCalls.filter(Boolean)
-        : [];
+    // Operator tier is ABSOLUTE: run.disableCalls entries are deliberate
+    // per-flow decisions and heuristics may never protect them (gating this
+    // behind allowUnsafeDisableProtected made the guard veto the operator's
+    // own config — the interceptor-hop failure). The only thing that outranks
+    // an operator disable is an operator protect (protectedCalls), which
+    // isProtectedSampler honors before we get here.
+    const operatorDisables = Array.isArray(runCfg.disableCalls) ? runCfg.disableCalls.filter(Boolean) : [];
+    const operatorProtects = Array.isArray(runCfg.protectedCalls) ? runCfg.protectedCalls.filter(Boolean) : [];
+    // Duplicate redirect hops are recording-proven: the parent's followed
+    // chain already executes them, so protecting the standalone copy only
+    // preserves a session-tripping replay. Evidence outranks priors.
+    const duplicateHops = new Set((duplicateHopLabels || []).map(String));
     const protectedSamplers = samplers
-        .filter(s => isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions) && !matchesAnyConfigured(s, operatorDisables))
+        .filter(s => isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions))
+        .filter(s => matchesAnyConfigured(s, operatorProtects) ||
+            (!matchesAnyConfigured(s, operatorDisables) && !duplicateHops.has(s.name)))
         .map(s => ({
             name: s.name,
             method: s.method,
@@ -180,11 +191,11 @@ function goalTermsFor(flowName, runCfg) {
 function matchesAnyConfigured(s, patterns) {
     if (!Array.isArray(patterns) || patterns.length === 0) return false;
     const hay = `${s.name} ${s.domain}${s.path}`;
-    // Full step labels are recording-specific — exact testname match only,
-    // so one flow's "Step 07 - POST /" never matches another flow's
-    // "Step 07 - POST /u/login/identifier" (same rule as the disable pass).
-    const stepLabel = /^Step \d+ - [A-Z]+ \S*$/;
-    return patterns.some(p => p && (stepLabel.test(String(p)) ? s.name === p : hay.includes(String(p))));
+    // Delegate step-label semantics to the shared matcher (exact / semantic
+    // step-number+method+path — never substring) so the guard and the disable
+    // pass can never disagree about what an operator pattern means.
+    const { samplerPatternMatches } = require('./transforms');
+    return patterns.some(p => p && samplerPatternMatches(String(p), { name: s.name, path: s.path, method: s.method }, hay));
 }
 
 function isFirstParty(domain) {

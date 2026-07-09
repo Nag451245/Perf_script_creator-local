@@ -36,6 +36,7 @@ const seniorPe = require('./senior-pe');
 const playbooks = require('./playbooks');
 const scenario = require('./scenario');
 const outcomeProbe = require('./outcome-probe');
+const redirectHops = require('./redirect-hops');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
 const peNaming = require('./pe-naming');
@@ -353,6 +354,36 @@ function isGraphqlOperationDocument(candidate) {
     if (String(candidate.name || '').toLowerCase() !== 'query') return false;
     const value = String(candidate.value || '').trim();
     return /^(query|mutation|subscription)\b/i.test(value) && /[{]/.test(value);
+}
+
+/** Sampler order → {name, path, position, openEnd} map built from the XML. */
+function indexSamplersForGenerate(xml) {
+    const out = [];
+    const re = /<HTTPSamplerProxy\b([^>]*)>/g;
+    let m;
+    while ((m = re.exec(xml)) !== null) {
+        const attrs = m[1] || '';
+        const openEnd = m.index + m[0].length;
+        const tail = xml.slice(openEnd, xml.indexOf('</HTTPSamplerProxy>', openEnd));
+        out.push({
+            order: out.length,
+            position: m.index,
+            openEnd,
+            name: (attrs.match(/testname="([^"]*)"/) || [])[1] || '',
+            path: (tail.match(/<stringProp name="HTTPSampler\.path">([^<]*)</) || [])[1] || '',
+            enabled: !/enabled="false"/.test(attrs),
+        });
+    }
+    return out;
+}
+
+/** Flip one sampler's enabled attribute at its exact document position. */
+function flipEnabledAtPosition(xml, sampler) {
+    if (!sampler || !sampler.enabled) return { xml, changed: false };
+    const openTag = xml.slice(sampler.position, sampler.openEnd);
+    const nextTag = openTag.replace('enabled="true"', 'enabled="false"');
+    if (nextTag === openTag) return { xml, changed: false };
+    return { xml: xml.slice(0, sampler.position) + nextTag + xml.slice(sampler.openEnd), changed: true };
 }
 
 function shouldProtectDisableTarget(sampler = {}, runCfg = {}, valueFlow = null) {
@@ -745,27 +776,91 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // flags: /authorize/resume, /interceptor/, jwt create-cookie). They carry
     // single-use tokens and are meant to be auto-followed, not replayed.
     let disabledCount = 0;
-    const disablePatterns = [
-        ...((runCfg && runCfg.disableDefaultNoise === false) ? [] : DEFAULT_DISABLE_PATTERNS),
-        ...((runCfg && runCfg.disableCalls) || []),
-    ];
-    if (disablePatterns.length) {
-        const disableValueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
-            entries: flat,
-            protectedCalls: runCfg.protectedCalls,
+    const disableValueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries: flat,
+        protectedCalls: runCfg.protectedCalls,
+    });
+
+    // TIER 1 — OPERATOR disables (config / steering / golden / playbook).
+    // The operator's explicit instruction is ABSOLUTE against heuristics: the
+    // live LOGI failure was this exact inversion — "/s/interceptor/authorize/"
+    // sat in run.disableCalls, and a "path looks session-like" prior vetoed
+    // it, run after run. Only an explicit operator protect (protectedCalls)
+    // may contradict an operator disable; when both match, protect wins with
+    // a note so the conflict is visible.
+    const operatorPatterns = (runCfg && runCfg.disableCalls) || [];
+    if (operatorPatterns.length) {
+        const heuristicDisagreements = [];
+        const dis = disableSamplersByPattern(xml, operatorPatterns, {
+            protect: sampler => {
+                const hay = `${sampler.name || ''} ${sampler.domain || ''}${sampler.path || ''}`;
+                if (matchesConfiguredPattern(hay, runCfg.protectedCalls)) return true; // operator vs operator: protect wins
+                // Heuristics may WARN about an operator disable, never veto it.
+                if (shouldProtectDisableTarget(sampler, runCfg, disableValueFlow)) {
+                    heuristicDisagreements.push(sampler.name || sampler.path);
+                }
+                return false;
+            },
         });
-        const dis = disableSamplersByPattern(xml, disablePatterns, {
+        xml = dis.xml; disabledCount += dis.disabled;
+        if (dis.disabled) note('disable-calls',
+            `${dis.disabled} sampler(s) disabled on operator instruction (run.disableCalls)`,
+            `matched: ${dis.hits.slice(0, 8).join(', ')}`,
+            `operator tier is absolute — heuristics may not veto an explicit disable`);
+        if (heuristicDisagreements.length) note('disable-calls-warning',
+            `${heuristicDisagreements.length} operator-disabled sampler(s) look like auth/session producers to the heuristics`,
+            `disabled anyway (operator wins): ${heuristicDisagreements.slice(0, 8).join(', ')}`,
+            `if the run now fails at a downstream consumer, re-enable these or move them to protectedCalls`);
+        if (dis.skippedProtected && dis.skippedProtected.length) note('disable-calls-conflict',
+            `${dis.skippedProtected.length} sampler(s) match BOTH disableCalls and protectedCalls`,
+            `kept enabled: ${dis.skippedProtected.slice(0, 8).join(', ')}`,
+            `explicit protect outranks explicit disable — resolve the conflict in config`);
+    }
+
+    // TIER 3 — code-default noise patterns. These are priors, so the full
+    // heuristic protection hook applies to them (a default must never fold a
+    // producer the evidence says is consumed).
+    const defaultPatterns = (runCfg && runCfg.disableDefaultNoise === false) ? [] : DEFAULT_DISABLE_PATTERNS;
+    if (defaultPatterns.length) {
+        const dis = disableSamplersByPattern(xml, defaultPatterns, {
             protect: sampler => shouldProtectDisableTarget(sampler, runCfg, disableValueFlow),
         });
-        xml = dis.xml; disabledCount = dis.disabled;
+        xml = dis.xml; disabledCount += dis.disabled;
         if (dis.disabled) note('disable-calls',
-            `${dis.disabled} browser/OIDC/noise sampler(s) disabled`,
+            `${dis.disabled} browser/OIDC/noise sampler(s) disabled by default patterns`,
             `matched: ${dis.hits.slice(0, 8).join(', ')}`,
             `set enabled=false so JMeter skips non-business / un-replayable plumbing`);
         if (dis.skippedProtected && dis.skippedProtected.length) note('disable-calls-protected',
-            `${dis.skippedProtected.length} disable match(es) blocked because they are auth/session producers`,
+            `${dis.skippedProtected.length} default-pattern match(es) blocked — evidence says they are producers`,
             `kept enabled: ${dis.skippedProtected.slice(0, 8).join(', ')}`,
-            `protected producers must execute; set run.allowUnsafeDisableProtected=true only for a deliberate expert override`);
+            `default patterns are priors; evidence outranks them`);
+    }
+
+    // TIER 2 — EVIDENCE: duplicate redirect hops. The recording proves these
+    // samplers re-execute a hop the parent's followed redirect chain already
+    // performs; replaying them out of band re-fires single-use tokens and
+    // trips the session (the /s/interceptor/authorize/-in-two-transactions
+    // failure class). Safe to fold BY CONSTRUCTION — the hop still runs
+    // inside the parent. Outranks "session-like path" priors; yields only to
+    // an explicit operator protect.
+    const dupHops = redirectHops.detectDuplicateRedirectHops(flat);
+    let duplicateHopLabels = [];
+    if (dupHops.indexes.length) {
+        const samplerIndex = indexSamplersForGenerate(xml);
+        let folded = 0;
+        for (const idx of dupHops.indexes) {
+            const s = samplerIndex[idx];
+            if (!s) continue;
+            const hay = `${s.name} ${s.path || ''}`;
+            if (matchesConfiguredPattern(hay, runCfg.protectedCalls)) continue; // operator protect wins
+            const flipped = flipEnabledAtPosition(xml, s);
+            if (flipped.changed) { xml = flipped.xml; folded++; }
+        }
+        if (folded) note('duplicate-redirect-hops',
+            `${folded} sampler(s) are recorded redirect hops the parent chain already executes`,
+            dupHops.indexes.slice(0, 6).map(i => `entry ${i} ← ${dupHops.byIndex[i].via}`).join('; '),
+            `folded (evidence tier): replaying a followed hop out of band re-fires single-use tokens and trips the session`);
+        disabledCount += folded;
     }
 
     // Golden-script learning: a human-fixed WORKING script for this flow was
@@ -896,6 +991,17 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     const jmxPath = path.join(outDir, `${name}.jmx`);
     fs.writeFileSync(jmxPath, xml);
 
+    // Duplicate-hop labels must reflect the FINAL sampler names (pe-naming
+    // renames after the fold), or the guard/adjudicator exclusion sets match
+    // nothing. Recompute from the shipped XML; include hops that were already
+    // disabled by other passes — they are still duplicates to every consumer.
+    if (dupHops.indexes.length) {
+        const finalSamplerIndex = indexSamplersForGenerate(xml);
+        duplicateHopLabels = dupHops.indexes
+            .map(i => finalSamplerIndex[i] && finalSamplerIndex[i].name)
+            .filter(Boolean);
+    }
+
     const seniorPeDebrief = seniorPe.buildSeniorPeDebrief({
         name,
         entries: flat,
@@ -943,6 +1049,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         playbooksApplied: pbResult.applied,
         playbookDisables: pbResult.addedDisables,
         playbookProtects: pbResult.addedProtects || [],
+        duplicateHopLabels,
         effectiveLlmFlowNotes: runCfg.llmFlowNotes || [],
         scenario: scenarioPlan,
         uploadFiles: uploadPlan,

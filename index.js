@@ -56,10 +56,25 @@ if (CONFIG.javaHome) {
     process.env.JAVA_HOME = CONFIG.javaHome;
     process.env.PATH = path.join(CONFIG.javaHome, 'bin') + path.delimiter + (process.env.PATH || '');
 }
-if (CONFIG.gemini && CONFIG.gemini.apiKey && !process.env.GOOGLE_API_KEY) process.env.GOOGLE_API_KEY = CONFIG.gemini.apiKey;
-if (!process.env.GOOGLE_MODEL) process.env.GOOGLE_MODEL = resolveGeminiModel(args, CONFIG, process.env);
-if (CONFIG.openai && CONFIG.openai.apiKey && !process.env.OPENAI_API_KEY) process.env.OPENAI_API_KEY = CONFIG.openai.apiKey;
-if (CONFIG.openai && CONFIG.openai.model && !process.env.OPENAI_MODEL) process.env.OPENAI_MODEL = CONFIG.openai.model;
+// AI assist is OFF unless explicitly enabled — LLM calls cost money, so the
+// default run is deterministic-only (generation, correlation, fold-safety,
+// validation, self-repair, learned-lesson replay all run WITHOUT any AI). The
+// UI's "AI assist" control (or the CLI --ai flag) turns paid escalation on;
+// when off we never even load the API keys, guaranteeing zero LLM calls.
+const AI_ON = args.includes('--ai') && !args.includes('--no-ai');
+if (AI_ON) {
+    if (CONFIG.gemini && CONFIG.gemini.apiKey && !process.env.GOOGLE_API_KEY) process.env.GOOGLE_API_KEY = CONFIG.gemini.apiKey;
+    if (!process.env.GOOGLE_MODEL) process.env.GOOGLE_MODEL = resolveGeminiModel(args, CONFIG, process.env);
+    if (CONFIG.openai && CONFIG.openai.apiKey && !process.env.OPENAI_API_KEY) process.env.OPENAI_API_KEY = CONFIG.openai.apiKey;
+    if (CONFIG.openai && CONFIG.openai.model && !process.env.OPENAI_MODEL) process.env.OPENAI_MODEL = CONFIG.openai.model;
+} else {
+    // Belt-and-suspenders: strip any keys the environment already carries so
+    // the engine's ai-service singleton initializes disabled.
+    delete process.env.GOOGLE_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    // Also zero the LLM rounds so the agent never attempts escalation.
+    if (CONFIG.agent && typeof CONFIG.agent === 'object') CONFIG.agent = { ...CONFIG.agent, maxLlmRounds: 0 };
+}
 
 const { recordingXml } = require('./src/engine');
 const { generate } = require('./src/generate');
@@ -530,6 +545,9 @@ function buildIdleScanMessage({ processable, units, retryOptions, selectedInputs
     }
     if ((memoryImport || memoryExport) && !WATCH && !DO_RUN && !FAST_LOOP) return;
     log(`perfscript-local — mode: ${labelForAgentOptions(AGENT_OPTS, WATCH)}`);
+    log(AI_ON
+        ? 'AI assist: ON — the LLM may be consulted for unresolved failures (this can incur cost).'
+        : 'AI assist: OFF — deterministic only. No LLM calls, no AI cost this run.');
     if (SELECTED_INPUTS.length) log(`selected input(s): ${SELECTED_INPUTS.join(', ')}`);
     log(`engine: ${require('./src/engine').ENGINE_ROOT}`);
     await scanOnce();

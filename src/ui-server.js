@@ -130,6 +130,7 @@ function normalizeRunRequest(url, body = {}) {
         force: !!body.force,
         iterations: body.iterations,
         retryFailed: body.retryFailed,
+        aiAssist: body.aiAssist || 'off',
         geminiPro: !!body.geminiPro,
         pair: !!body.pair,
     };

@@ -25,7 +25,10 @@ function flagsForRunRequest(request = {}) {
     if (request.force) flags.push('--force');
     pushPositiveIntFlag(flags, '--iterations', request.iterations, { max: 6 });
     pushPositiveIntFlag(flags, '--retry-failed', request.retryFailed);
-    if (request.geminiPro) flags.push('--gemini-pro');
+    // AI assist: off by default (cost). 'on' or 'pro' enables paid LLM.
+    const ai = String(request.aiAssist || 'off').toLowerCase();
+    if (ai === 'on' || ai === 'pro') flags.push('--ai');
+    if (request.geminiPro || ai === 'pro') flags.push('--gemini-pro');
     const inputs = normalizeList(request.selectedInputs);
     for (const input of inputs) {
         flags.push('--input', input);

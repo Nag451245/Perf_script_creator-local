@@ -1110,6 +1110,19 @@ test('dual-recording pairing: two single JMX units merge into a dual-jmx varianc
     assert.throws(() => mergeUnitsAsDual({ primary: '/in/a.har' }, { primary: '/in/b.jmx' }), /same type/);
 });
 
+test('run flags: AI assist is off by default; on/pro emit --ai (+ --gemini-pro for pro)', () => {
+    const { flagsForRunRequest } = require('../src/ui-run-mode');
+    const off = flagsForRunRequest({ mode: 'agent', aiAssist: 'off' }).join(' ');
+    assert.ok(!off.includes('--ai'), 'off → no AI (no cost)');
+    assert.ok(!off.includes('--gemini-pro'));
+    const on = flagsForRunRequest({ mode: 'agent', aiAssist: 'on' }).join(' ');
+    assert.ok(on.includes('--ai') && !on.includes('--gemini-pro'), 'on → --ai standard');
+    const pro = flagsForRunRequest({ mode: 'agent', aiAssist: 'pro' }).join(' ');
+    assert.ok(pro.includes('--ai') && pro.includes('--gemini-pro'), 'pro → --ai + --gemini-pro');
+    // Absent aiAssist defaults to off.
+    assert.ok(!flagsForRunRequest({ mode: 'agent' }).join(' ').includes('--ai'));
+});
+
 test('run flags: --pair is emitted only when exactly two inputs are selected', () => {
     const { flagsForRunRequest } = require('../src/ui-run-mode');
     const two = flagsForRunRequest({ mode: 'agent', selectedInputs: ['a', 'b'], pair: true }).join(' ');

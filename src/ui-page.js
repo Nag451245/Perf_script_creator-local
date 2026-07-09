@@ -115,7 +115,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .log{flex:1;min-height:300px;max-height:44vh;overflow:auto;padding:13px 15px;white-space:pre-wrap;word-break:break-word;font:12.5px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;color:#c4d0e4}
 .log .l-warn{color:var(--warn)} .log .l-verdict{color:var(--accent);font-weight:700}
 .log .l-you{color:#a9c1ff} .log .l-agent{color:var(--accent)}
-.log .l-head{color:#7c5cff;font-weight:700} .log .l-key{color:var(--ink)}
+.log .l-head{color:#8ea6ff;font-weight:700;display:inline-block;margin-top:6px} .log .l-key{color:var(--ink2)}
+.log .l-dim{color:var(--mut)} .log .l-ic{display:inline-block;width:1.3em;text-align:center}
+.log span{display:block;padding:1px 0}
 
 .chat{margin:0 18px 14px;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
 .chat-h{display:flex;align-items:center;justify-content:space-between;padding:10px 13px;border-bottom:1px solid var(--line)}
@@ -216,8 +218,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
               <option value="5">5</option><option value="6">6 (max)</option>
             </select></div>
           <div class="field"><label>Retry failed</label><input id="retry" type="number" min="1" placeholder="3"></div>
-          <div class="field"><label>Gemini Pro</label><select id="gemini-pro"><option value="">No</option><option value="1">Yes</option></select></div>
+          <div class="field"><label>AI assist</label>
+            <select id="ai-assist">
+              <option value="off" selected>Off — no AI cost</option>
+              <option value="on">On — standard model</option>
+              <option value="pro">On — Gemini Pro</option>
+            </select></div>
         </div>
+        <div id="ai-note" class="hint" style="margin-top:-4px;color:var(--accent)">Deterministic only — generation, correlation &amp; self-repair run free. No LLM calls.</div>
         <div class="run-btns">
           <button id="run-selected" class="btn-primary" type="button">Run selected</button>
           <button id="rerun-last" class="btn-soft" type="button">Rerun last</button>
@@ -271,7 +279,8 @@ button:disabled{opacity:.4;cursor:not-allowed}
     </div>
 
     <div class="console">
-      <div class="console-h"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="lbl">agent&nbsp;·&nbsp;live log</span></div>
+      <div class="console-h"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="lbl">agent&nbsp;·&nbsp;live log</span>
+        <label style="margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--mut);cursor:pointer"><input id="raw-log" type="checkbox" style="width:auto">Raw</label></div>
       <pre id="log" class="log">Idle. Add or select recordings, then run the agent.
 The agent will print its understanding of the flow and domain before it begins.</pre>
     </div>
@@ -408,7 +417,7 @@ function toggleHist(i){
 }
 function requestBody(force){
  var ins=selectedInputs();
- return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,iterations:q('#iterations').value,retryFailed:q('#retry').value,geminiPro:q('#gemini-pro').value==='1',pair:ins.length===2});
+ return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,iterations:q('#iterations').value,retryFailed:q('#retry').value,aiAssist:q('#ai-assist').value,pair:ins.length===2});
 }
 async function saveCfg(quiet){
  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetBaseUrl:q('#cfg-target').value,username:q('#cfg-user').value,password:q('#cfg-pass').value,loadProfile:{users:q('#cfg-users').value,rampUpSec:q('#cfg-ramp').value,holdSec:q('#cfg-hold').value},seniorMode:q('#mode').value==='senior-agent'?'mature':'strong',testObjective:q('#cfg-objective').value,techStack:q('#cfg-stack').value,domainNotes:q('#cfg-domain').value,slo:{p95Ms:q('#cfg-p95').value,errorRatePct:q('#cfg-error').value}})});
@@ -418,16 +427,60 @@ async function loadCfg(){var c=await j('/api/config');q('#cfg-target').value=c.t
 async function run(force){if(!selectedInputs().length){alert('Select Recording 1 first.');return}await saveCfg(true);var d=await j('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:requestBody(force)});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
 async function rerunLast(){var d=await j('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
 async function rerunName(name){var d=await j('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selectedInputs:[name]})});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
+// Turn one raw agent log line into a friendly, plain-English line — or null to
+// hide pure noise. Keeps the important details, drops the plumbing.
+function humanize(ln){
+ var t=ln.trim();
+ if(!t)return null;
+ // ── noise to hide entirely ──
+ if(/DeprecationWarning|trace-deprecation|SSLManager: Keystore file not found|Existing CookieManager .* superseded|node:internal|Use .node --trace|No GOOGLE_API_KEY found|Smart correlations will be disabled/.test(t))return null;
+ if(/^\\[iter\\]/.test(t)){ // iteration JSON → friendly summary
+  try{var j=JSON.parse(t.replace(/^\\[iter\\]\\s*/,''));return {icon:'🔁',cls:'',text:'Iteration '+(j.iteration||'?')+': '+(j.passed||0)+' of '+(j.totalSamplers||((j.passed||0)+(j.failed||0)))+' requests passed'+(j.failed?', '+j.failed+' failed':'')+(j.clean?' — clean':'')};}catch(e){}
+ }
+ // ── milestones (friendly rewrites) ──
+ var m;
+ if(/AI Service initialized/.test(t))return {icon:'🤖',cls:'',text:'AI service ready'};
+ if(/^perfscript-local — mode:/.test(t))return {icon:'▶',cls:'l-head',text:t.replace('perfscript-local — mode:','Mode:')};
+ if(/^AI assist:/.test(t))return {icon:/OFF/.test(t)?'💤':'💸',cls:/OFF/.test(t)?'l-agent':'l-warn',text:t};
+ if(/^engine:/.test(t))return null;
+ if(/^── Flow understanding/.test(t))return {icon:'🧭',cls:'l-head',text:'What the agent understands about this flow'};
+ if(/^────/.test(t))return null;
+ if(/^(Business flow|Primary business action|Auth \\/ session|Tech stack detected|Application host|Playbooks matched|Native managers|User-input data|Stated objective|Operator domain notes):/.test(t))return {icon:'·',cls:'l-key',text:t};
+ if((m=t.match(/^mode=\\S+ · parsed (\\d+) entries, (\\d+) pages/)))return {icon:'📄',cls:'',text:'Read the recording: '+m[1]+' requests across '+m[2]+' pages'};
+ if(/^paired 2 recordings/.test(t))return {icon:'🔗',cls:'',text:'Paired two recordings for variance analysis'};
+ if((m=t.match(/generated .*\\.jmx — (\\d+) samplers, (\\d+) correlations, (\\d+) parameterized/)))return {icon:'🛠️',cls:'',text:'Built the script: '+m[1]+' requests, '+m[2]+' correlations wired, '+m[3]+' fields parameterized'};
+ if(/duplicate redirect hop|fold-safety|folded \\(evidence/.test(t))return {icon:'✂️',cls:'',text:t.replace(/^\\s*/,'')};
+ if((m=t.match(/^\\s*target=(\\S+)/)))return {icon:'🎯',cls:'',text:'Validating against '+m[1]};
+ if(/running bounded feedback loop/.test(t))return {icon:'🧪',cls:'',text:'Running the script through JMeter to validate…'};
+ if(/strict business guard: protecting/.test(t))return {icon:'🛡️',cls:'',text:t.replace(/^\\s*strict business guard:\\s*/,'Protecting business steps: ')};
+ if(/^\\s*playbooks:/.test(t))return {icon:'📘',cls:'',text:t.replace(/^\\s*playbooks:/,'Applied playbooks:')};
+ if(/BLOCKED —/.test(t))return {icon:'🚧',cls:'l-warn',text:t};
+ if(/^\\s*·\\s/.test(t)&&/ask/.test(logText))return {icon:'❓',cls:'l-warn',text:t};
+ if(/verdict=GREEN|final green gate: GREEN/.test(t))return {icon:'✅',cls:'l-verdict',text:t.replace(/^\\s*/,'')};
+ if(/USE THIS JMX/.test(t))return {icon:'📦',cls:'l-verdict',text:t.replace(/^\\s*USE THIS JMX ->/,'Final script:')};
+ if(/verdict=needs attention|NOT GREEN/.test(t))return {icon:'⚠️',cls:'l-warn',text:t.replace(/^\\s*/,'')};
+ if(/^\\s*\\[chat\\]\\s+you:/.test(t))return null;   // chat rendered in its own panel
+ if(/^\\s*\\[chat\\]\\s+agent:/.test(t))return null;
+ if(/^progress:/.test(t))return {icon:'⏳',cls:'l-dim',text:t,heartbeat:true};
+ if(/WARN/.test(t))return null; // JMeter WARN spam
+ return {icon:'',cls:'',text:t};
+}
+function renderLog(){
+ var raw=q('#raw-log')&&q('#raw-log').checked;
+ q('#log').innerHTML=raw?esc(logText):colorLog(logText);
+ q('#log').scrollTop=q('#log').scrollHeight;
+}
 function colorLog(text){
- return text.split('\\n').map(function(ln){
-  var e=esc(ln);
-  if(/^\\s*\\[chat\\]\\s+you:/.test(ln))return '<span class="l-you">'+e+'</span>';
-  if(/^\\s*\\[chat\\]\\s+agent:/.test(ln))return '<span class="l-agent">'+e+'</span>';
-  if(/^\\s*──|Flow understanding/.test(ln))return '<span class="l-head">'+e+'</span>';
-  if(/^\\s*(Business flow|Primary business action|Auth \\/ session|Tech stack|Application host|Playbooks matched|Native managers|User-input data|Stated objective|Operator domain notes):/.test(ln))return '<span class="l-key">'+e+'</span>';
-  if(/verdict=GREEN|final green gate: GREEN|USE THIS/.test(ln))return '<span class="l-verdict">'+e+'</span>';
-  if(/WARN|needs attention|BLOCKED|NOT GREEN/.test(ln))return '<span class="l-warn">'+e+'</span>';
-  return e;
+ var rows=text.split('\\n').map(humanize).filter(Boolean);
+ // collapse consecutive heartbeats to just the latest
+ var out=[];
+ for(var i=0;i<rows.length;i++){
+  if(rows[i].heartbeat&&i+1<rows.length&&rows[i+1].heartbeat)continue;
+  out.push(rows[i]);
+ }
+ return out.map(function(r){
+  var ic=r.icon?'<span class="l-ic">'+r.icon+'</span> ':'';
+  return '<span class="'+(r.cls||'')+'">'+ic+esc(r.text)+'</span>';
  }).join('\\n');
 }
 function addChat(role,text){var box=q('#chat');var em=box.querySelector('.chat-empty');if(em)em.remove();var el=document.createElement('div');el.className='bubble '+role;el.textContent=text;box.appendChild(el);box.scrollTop=box.scrollHeight}
@@ -436,7 +489,7 @@ function setChatEnabled(on){q('#chat-send').disabled=!on;q('#chat-input').disabl
 async function sendChat(){var t=q('#chat-input').value.trim();if(!t)return;q('#chat-input').value='';try{await j('/api/steer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})})}catch(e){addChat('agent','(not delivered: '+e.message+')')}}
 function startPolling(id,reset){currentRunId=id;startedAt=Date.now();var since=0;if(reset){q('#progress').className='progress';q('#progress i').style.width='6%';q('#chat').innerHTML='<div class="chat-empty">Chat activates during a run. Your messages change the agent\\'s next decision.</div>'}setChatEnabled(true);clearInterval(poll);
  poll=setInterval(async function(){var d=await j('/api/log?id='+id+'&since='+since);
-  if(d.lines&&d.lines.length){since=d.total;absorbChat(d.lines);logText+=d.lines.join('\\n')+'\\n';q('#log').innerHTML=colorLog(logText);q('#log').scrollTop=q('#log').scrollHeight;var ph=phaseOf(logText);q('#phase').textContent=ph.label;q('#progress i').style.width=ph.pct+'%'}
+  if(d.lines&&d.lines.length){since=d.total;absorbChat(d.lines);logText+=d.lines.join('\\n')+'\\n';renderLog();var ph=phaseOf(logText);q('#phase').textContent=ph.label;q('#progress i').style.width=ph.pct+'%'}
   if(startedAt)q('#elapsed').textContent=Math.floor((Date.now()-startedAt)/1000)+'s elapsed';
   if(d.done){clearInterval(poll);poll=null;currentRunId=null;setChatEnabled(false);q('#progress').className='progress'+(d.code===0?'':' err');q('#progress i').style.width='100%';q('#phase').textContent=d.code===0?'Finished':'Finished — exit '+d.code;refresh()}
  },700)}
@@ -448,8 +501,12 @@ q('#stop').onclick=async function(){await fetch('/api/cancel',{method:'POST'});q
 q('#refresh').onclick=refresh;q('#cfg-save').onclick=function(){saveCfg(false)};
 q('#rec1').onchange=updateSelected;q('#rec2').onchange=updateSelected;
 q('#hist-search').oninput=function(){histPage=0;paintHistory()};
+q('#ai-assist').onchange=function(){var v=q('#ai-assist').value,n=q('#ai-note');
+ if(v==='off'){n.style.color='var(--accent)';n.textContent='Deterministic only — generation, correlation & self-repair run free. No LLM calls.';}
+ else{n.style.color='var(--warn)';n.textContent='AI assist ON'+(v==='pro'?' (Gemini Pro)':'')+' — the LLM may be consulted for unresolved failures. This can incur cost.';}};
 q('#copy-log').onclick=function(){navigator.clipboard&&navigator.clipboard.writeText(logText)};
 q('#clear-log').onclick=function(){logText='';q('#log').textContent=''};
+q('#raw-log').onchange=renderLog;
 q('#chat-send').onclick=function(){sendChat()};q('#chat-input').onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();sendChat()}};
 var drop=q('#drop'),file=q('#file');drop.onclick=function(){file.click()};file.onchange=function(){upload(file.files)};
 drop.ondragover=function(e){e.preventDefault();drop.classList.add('hot')};drop.ondragleave=function(){drop.classList.remove('hot')};drop.ondrop=function(e){e.preventDefault();drop.classList.remove('hot');upload(e.dataTransfer.files)};

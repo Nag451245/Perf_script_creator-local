@@ -64,7 +64,7 @@ const { recordingXml } = require('./src/engine');
 const { generate } = require('./src/generate');
 const { runValidate } = require('./src/runner');
 const { writeHtmlReport } = require('./src/report');
-const { groupInputs, loadUnit } = require('./src/ingest');
+const { analyzeInputFiles, loadUnit, writeIntakeArtifacts } = require('./src/ingest');
 const { scrubRecordingXml } = require('./src/scrubber');
 const { replayAll } = require('./src/fast-replay');
 const { resolveAgentOptions, labelForAgentOptions } = require('./src/agent-config');
@@ -72,6 +72,7 @@ const learningStore = require('./src/learning-store');
 const inputState = require('./src/input-state');
 const { archiveSuccessfulRun } = require('./src/success-archive');
 const { writeFinalJmxPointer } = require('./src/final-artifact');
+const runProgress = require('./src/run-progress');
 
 const AGENT_OPTS = resolveAgentOptions(args, CONFIG);
 const DO_RUN = AGENT_OPTS.doRun;
@@ -90,6 +91,7 @@ const MAX_ITER = iterFlag >= 0
     : Math.min(5, Math.max(1, Number(CONFIG.maxIterations) || 3));
 
 const processed = new Set();
+let lastIdleScanMessageKey = '';
 const processedStatePath = INPUT_STATE_CFG.storePath
     ? resolveFromRoot(INPUT_STATE_CFG.storePath)
     : inputState.defaultStatePath(ROOT);
@@ -102,6 +104,14 @@ function safeName(name) {
 function valueAfterFlag(flag) {
     const idx = args.indexOf(flag);
     return idx >= 0 ? args[idx + 1] : null;
+}
+function inputRetryOptions() {
+    const retryFlag = valueAfterFlag('--retry-failed');
+    return {
+        retryFailed: INPUT_STATE_CFG.retryFailed !== false,
+        maxFailedAttempts: Math.max(1, Number(retryFlag || INPUT_STATE_CFG.maxFailedAttempts || 3) || 3),
+        reprocessLegacy: DO_RUN || DO_AGENT,
+    };
 }
 function resolveFromRoot(file) {
     return path.isAbsolute(file) ? file : path.join(ROOT, file);
@@ -120,6 +130,31 @@ function archiveGreenRun({ outDir, name, rec }) {
     });
     if (res.ok) rec(`archived GREEN run -> ${path.relative(ROOT, res.zipPath)}`);
     else rec(`archive skipped: ${res.error}`);
+}
+
+function startRunProgressHeartbeat(outDir, rec) {
+    const ms = Math.max(5000, Number(CONFIG.run && CONFIG.run.progressIntervalMs || 10000) || 10000);
+    rec(`validation progress heartbeat every ${Math.round(ms / 1000)}s while JMeter is running`);
+    let lastProgressKey = '';
+    let unchangedMs = 0;
+    let lastUnchangedNoticeMs = 0;
+    const timer = setInterval(() => {
+        const progress = runProgress.snapshotRunProgress(outDir);
+        if (progress.key === lastProgressKey) {
+            unchangedMs += ms;
+            if (unchangedMs - lastUnchangedNoticeMs >= 60000) {
+                lastUnchangedNoticeMs = unchangedMs;
+                rec(`progress: no new JMeter samples for ${Math.round(unchangedMs / 1000)}s; still waiting on the current validation step`);
+            }
+        } else {
+            unchangedMs = 0;
+            lastUnchangedNoticeMs = 0;
+            lastProgressKey = progress.key;
+            rec(`progress: ${progress.summary}`);
+        }
+    }, ms);
+    if (typeof timer.unref === 'function') timer.unref();
+    return timer;
 }
 
 async function processUnit(unit) {
@@ -149,7 +184,7 @@ async function processUnit(unit) {
     } catch (e) {
         rec(`PARSE FAILED: ${e.message}`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
-        return;
+        return { success: false, verdict: 'parse failed' };
     }
     const { entries, secondaryEntries, pages, mode, notes } = loaded;
     rec(`mode=${mode} · parsed ${entries.length} entries, ${pages.length} pages`);
@@ -213,9 +248,11 @@ async function processUnit(unit) {
 
     let runAttemptError = null;
     if (DO_RUN) {
+        let progressTimer = null;
         try {
             rec(`running bounded feedback loop (max ${MAX_ITER})…`);
             if (DO_AGENT) rec(`agent mode enabled · max LLM rounds=${AGENT_OPTS.agent.maxLlmRounds} · java-safe=${AGENT_OPTS.agent.javaSafeMode ? 'on' : 'off'}`);
+            progressTimer = startRunProgressHeartbeat(outDir, rec);
             const out = await runValidate({
                 entries, pages, outDir, name,
                 runCfg: CONFIG.run || {},
@@ -260,12 +297,14 @@ async function processUnit(unit) {
                 rec(`open ${name}_report.html for a summary`);
                 if (out.result.success) archiveGreenRun({ outDir, name, rec });
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
-                return;
+                return { success: !!out.result.success, verdict };
             }
         } catch (e) {
             runAttemptError = e.message;
             rec(`feedback loop error: ${e.message} — falling back to generate-only.`);
             fs.writeFileSync(path.join(outDir, `${name}_run_status.json`), JSON.stringify({ ok: false, error: e.message, verified: false }, null, 2));
+        } finally {
+            if (progressTimer) clearInterval(progressTimer);
         }
     }
 
@@ -298,29 +337,75 @@ async function processUnit(unit) {
             reasoning: gen.reasoning || [],
         });
         rec(`open ${name}_report.html for a summary`);
+        const verdict = runAttemptError ? 'not verified' : 'generated';
+        return { success: !runAttemptError, verdict };
     } catch (e) {
         rec(`GENERATE FAILED: ${e.message}`);
+        fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
+        return { success: false, verdict: 'generate failed' };
     }
     fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
+    return { success: false, verdict: 'failed' };
 }
 
 async function scanOnce() {
-    const all = fs.readdirSync(INPUT)
-        .filter(f => /\.(har|jmx|xml|jtl)$/i.test(f))
+    const allInputFiles = fs.readdirSync(INPUT)
+        .filter(f => !f.startsWith('.'))
         .map(f => path.join(INPUT, f));
-    const units = groupInputs(all);
-    const fresh = units.filter(u => !processed.has(u.primary) && (FORCE || !USE_INPUT_STATE || inputState.shouldProcessUnit(u, processedState)));
-    if (fresh.length === 0 && !WATCH) {
-        log(all.length ? `No new HAR / JMX files in ${INPUT}. Drop changed recordings there and re-run, or use --force to reprocess unchanged inputs.` : `No HAR / JMX files in ${INPUT}. Drop recordings there and re-run.`);
+    const processable = allInputFiles.filter(f => /\.(har|jmx|xml|jtl)$/i.test(f));
+    const analysis = analyzeInputFiles(allInputFiles);
+    if (analysis.inventory.length || analysis.issues.length) {
+        fs.writeFileSync(path.join(OUTPUT, 'input_inventory.json'), JSON.stringify({
+            generatedAt: new Date().toISOString(),
+            inventory: analysis.inventory,
+            issues: analysis.issues,
+            units: analysis.units.map(u => ({
+                name: u.name,
+                kind: u.kind,
+                primary: path.basename(u.primary || ''),
+                secondary: u.secondary ? path.basename(u.secondary) : undefined,
+                sidecars: u.sidecars,
+            })),
+        }, null, 2));
+        writeIntakeArtifacts(OUTPUT, analysis);
+    }
+    for (const issue of analysis.issues) {
+        log(`INPUT ISSUE [${issue.severity || 'info'}] ${issue.code}: ${issue.message}`);
+    }
+    const units = analysis.units;
+    const retryOptions = inputRetryOptions();
+    const fresh = units.filter(u => !processed.has(u.primary) && (FORCE || !USE_INPUT_STATE || inputState.shouldProcessUnit(u, processedState, retryOptions)));
+    if (fresh.length === 0) {
+        const idleMessage = buildIdleScanMessage({ processable, units, retryOptions });
+        const idleMessageKey = idleMessage.join('\n');
+        if (!WATCH || idleMessageKey !== lastIdleScanMessageKey) {
+            for (const line of idleMessage) log(line);
+            lastIdleScanMessageKey = idleMessageKey;
+        }
     }
     for (const u of fresh) {
         processed.add(u.primary);
         if (u.secondary) processed.add(u.secondary);
         if (u.sidecars?.primary) processed.add(u.sidecars.primary);
         if (u.sidecars?.secondary) processed.add(u.sidecars.secondary);
-        await processUnit(u);
-        if (USE_INPUT_STATE) inputState.markUnitProcessed(u, processedState, processedStatePath);
+        const outcome = await processUnit(u);
+        if (USE_INPUT_STATE) inputState.markUnitProcessed(u, processedState, processedStatePath, outcome || { success: false, verdict: 'failed' });
     }
+}
+
+function buildIdleScanMessage({ processable, units, retryOptions }) {
+    if (!processable.length) {
+        return [`No HAR / JMX files in ${INPUT}. Drop recordings there and re-run.`];
+    }
+    if (units.length) {
+        const listed = units.map(u => `${u.kind}:${u.name}`).join(', ');
+        return [
+            `Detected ${units.length} logical input unit(s), but none need processing: ${listed}.`,
+            `They are unchanged according to ${processedStatePath} and have either succeeded or reached the failed-run retry cap (${retryOptions.maxFailedAttempts}).`,
+            'Use --force to reprocess unchanged inputs, --retry-failed N to raise the cap, or edit/replace the input files.',
+        ];
+    }
+    return [`Found ${processable.length} recording-like file(s), but none formed a runnable input unit. Review INPUT ISSUE lines and output/input_inventory.json.`];
 }
 
 (async () => {

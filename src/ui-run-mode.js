@@ -6,6 +6,10 @@ function flagsForRunMode(mode) {
             return ['--run'];
         case 'agent':
             return ['--agent'];
+        case 'senior-agent':
+            return ['--agent', '--senior'];
+        case 'agent-watch':
+            return ['--agent', '--watch'];
         case 'generate':
         case '':
         case null:

@@ -29,6 +29,7 @@
 const fs = require('fs');
 const path = require('path');
 const { HarParser, jmxSource, jtlParser, harComparator: HarComparator } = require('./engine');
+const uploadFiles = require('./upload-files');
 
 // File-extension recognition. Recording sidecars for JMX are JMeter-style JTLs
 // (or our own recording.xml, which uses the same testResults schema), so we
@@ -39,6 +40,10 @@ const JTL_SIDECAR_SUFFIXES = ['.recording.xml', '.jtl', '.xml'];
 
 function baseName(file) {
     return path.basename(file).replace(/\.(har|jmx)$/i, '').replace(/\.recording$/i, '');
+}
+
+function pathKey(file) {
+    return path.normalize(String(file || '')).replace(/\\/g, '/').toLowerCase();
 }
 
 function findSidecarFor(jmxFile, allFiles) {
@@ -55,7 +60,7 @@ function findSidecarFor(jmxFile, allFiles) {
         path.dirname(f) === dir &&
         /\.(xml|jtl)$/i.test(f) &&
         path.basename(f).toLowerCase().startsWith(stemLc)
-    ) || null;
+    ) || findSidecarByContent(jmxFile, allFiles) || null;
 }
 
 /**
@@ -103,6 +108,37 @@ function groupInputs(files) {
         }
     }
 
+    const contentHarPair = inferContentHarPair(files.filter(f => !consumed.has(f) && HAR_RE.test(f)));
+    if (contentHarPair) {
+        units.push({
+            name: contentHarPair.stem,
+            kind: 'dual-har',
+            primary: contentHarPair.primary,
+            secondary: contentHarPair.secondary,
+        });
+        consumed.add(contentHarPair.primary);
+        consumed.add(contentHarPair.secondary);
+    }
+
+    // 1b) Friendly fallback: if the folder contains exactly two remaining HARs
+    // that look like the same flow recorded twice (for example
+    // Batch_Print_Recording1_May15_Filtered.har +
+    // Batch_Print_Recording2_May15_Filtered.har), treat them as a dual
+    // recording only when readable content does not contradict the filename
+    // match. This preserves deterministic pairing without requiring the user
+    // to rename files to __run1/__run2.
+    const looseHarPair = inferLooseHarPair(files.filter(f => !consumed.has(f) && HAR_RE.test(f)));
+    if (looseHarPair) {
+        units.push({
+            name: looseHarPair.stem,
+            kind: 'dual-har',
+            primary: looseHarPair.primary,
+            secondary: looseHarPair.secondary,
+        });
+        consumed.add(looseHarPair.primary);
+        consumed.add(looseHarPair.secondary);
+    }
+
     // 2) Dual-JMX pairs: foo__run1.jmx + foo__run2.jmx (each with its sidecar,
     //    if present). Mirrors the dual-HAR semantics so the comparator gets a
     //    full request+response side from BOTH runs. Sidecar lookup reuses
@@ -127,6 +163,23 @@ function groupInputs(files) {
             sidecars: { primary: s1 || undefined, secondary: s2 || undefined },
         });
         consumed.add(p.run1); consumed.add(p.run2);
+        if (s1) consumed.add(s1);
+        if (s2) consumed.add(s2);
+    }
+
+    const contentJmxPair = inferContentJmxPair(files.filter(f => !consumed.has(f) && JMX_RE.test(f)));
+    if (contentJmxPair) {
+        const s1 = findSidecarFor(contentJmxPair.primary, files);
+        const s2 = findSidecarFor(contentJmxPair.secondary, files);
+        units.push({
+            name: contentJmxPair.stem,
+            kind: 'dual-jmx',
+            primary: contentJmxPair.primary,
+            secondary: contentJmxPair.secondary,
+            sidecars: { primary: s1 || undefined, secondary: s2 || undefined },
+        });
+        consumed.add(contentJmxPair.primary);
+        consumed.add(contentJmxPair.secondary);
         if (s1) consumed.add(s1);
         if (s2) consumed.add(s2);
     }
@@ -160,6 +213,548 @@ function groupInputs(files) {
     }
 
     return units;
+}
+
+function inferLooseHarPair(hars) {
+    if (!Array.isArray(hars) || hars.length !== 2) return null;
+    const [a, b] = hars;
+    if (!hasLooseNameSimilarity(a, b)) return null;
+    const readable = fs.existsSync(a) && fs.existsSync(b);
+    if (readable && !inferContentHarPair(hars)) return null;
+    const common = commonTokens(stemTokens(a), stemTokens(b));
+    return {
+        stem: common.join('_'),
+        primary: sortRecordingPair(a, b)[0],
+        secondary: sortRecordingPair(a, b)[1],
+    };
+}
+
+function hasLooseNameSimilarity(a, b) {
+    const ta = stemTokens(a);
+    const tb = stemTokens(b);
+    const common = commonTokens(ta, tb);
+    if (common.length < 2) return null;
+    const score = common.length / Math.max(ta.length, tb.length, 1);
+    return score >= 0.5;
+}
+
+function commonLooseNameStem(a, b) {
+    if (!hasLooseNameSimilarity(a, b)) return '';
+    return commonTokens(stemTokens(a), stemTokens(b)).join('_');
+}
+
+function stemTokens(file) {
+    return path.basename(file, path.extname(file))
+        .toLowerCase()
+        .replace(/recording\s*\d+/g, 'recording')
+        .replace(/\brun\s*\d+\b/g, 'run')
+        .split(/[^a-z0-9]+/)
+        .filter(Boolean)
+        .filter(t => !/^\d+$/.test(t));
+}
+
+function commonTokens(a, b) {
+    const bset = new Set(b);
+    return [...new Set(a.filter(t => bset.has(t)))];
+}
+
+function sortRecordingPair(a, b) {
+    const rank = f => {
+        const s = path.basename(f).toLowerCase();
+        const m = s.match(/(?:recording|run)[_-]?([12])\b/);
+        return m ? Number(m[1]) : 99;
+    };
+    return [a, b].sort((x, y) => rank(x) - rank(y) || x.localeCompare(y));
+}
+
+function inferContentHarPair(hars) {
+    if (!Array.isArray(hars) || hars.length !== 2 || hars.some(f => !fs.existsSync(f))) return null;
+    const a = readHarFingerprint(hars[0]);
+    const b = readHarFingerprint(hars[1]);
+    if (!a.ok || !b.ok) return null;
+    if (a.sequence.length < 2 || b.sequence.length < 2) return null;
+    if (!fingerprintsLookSameFlow(a, b)) return null;
+    const sorted = sortRecordingPair(hars[0], hars[1]);
+    return {
+        stem: commonLooseNameStem(hars[0], hars[1]) || commonContentStem(a, b) || path.basename(sorted[0], path.extname(sorted[0])),
+        primary: sorted[0],
+        secondary: sorted[1],
+    };
+}
+
+function sequenceSimilarity(a, b) {
+    const len = Math.max(a.length, b.length, 1);
+    let matches = 0;
+    for (let i = 0; i < Math.min(a.length, b.length); i++) {
+        if (a[i] === b[i]) matches++;
+    }
+    return Math.max(matches / len, longestCommonSubsequenceRatio(a, b));
+}
+
+function longestCommonSubsequenceRatio(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || !a.length || !b.length) return 0;
+    let prev = Array(b.length + 1).fill(0);
+    for (const item of a) {
+        const cur = Array(b.length + 1).fill(0);
+        for (let j = 1; j <= b.length; j++) {
+            cur[j] = item === b[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1]);
+        }
+        prev = cur;
+    }
+    return prev[b.length] / Math.max(a.length, b.length, 1);
+}
+
+function commonContentStem(a, b) {
+    const bHosts = new Set(b.hosts || []);
+    const hosts = [...new Set([...(a.hosts || [])].filter(h => bHosts.has(h)))];
+    return hosts[0] ? hosts[0].replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') : '';
+}
+
+function readHarFingerprint(file) {
+    try {
+        const raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+        const entries = raw && raw.log && Array.isArray(raw.log.entries) ? raw.log.entries : [];
+        if (!entries.length) return { ok: false, reason: 'HAR has no log.entries[] requests' };
+        const sequence = [];
+        const hosts = new Set();
+        const urls = [];
+        const uploadEndpoints = [];
+        const downloadEndpoints = [];
+        const referencedFilenames = new Set();
+        const timestamps = entries.map(e => e && e.startedDateTime).filter(Boolean);
+        for (const e of entries) {
+            const req = e.request || {};
+            const method = String(req.method || 'GET').toUpperCase();
+            let u;
+            try { u = new URL(req.url || ''); } catch { u = null; }
+            if (u) hosts.add(u.hostname);
+            if (u) urls.push(u.toString());
+            const pathPart = u ? u.pathname : req.url || '';
+            sequence.push(`${method} ${pathPart}`);
+            const uploads = uploadFilesFromHarEntry(e);
+            if (uploads.length) {
+                for (const name of uploads) referencedFilenames.add(name);
+                uploadEndpoints.push({ method, path: pathPart, url: req.url || '', filenames: uploads });
+            }
+            const downloads = downloadFilesFromHarEntry(e);
+            if (downloads.length) {
+                for (const name of downloads) referencedFilenames.add(name);
+                downloadEndpoints.push({ method, path: pathPart, url: req.url || '', filenames: downloads });
+            }
+        }
+        return {
+            ok: true,
+            type: 'har',
+            requestCount: entries.length,
+            entries: entries.length,
+            sequence,
+            hosts: [...hosts].sort(),
+            firstBusinessUrl: urls[0] || '',
+            lastBusinessUrl: urls[urls.length - 1] || '',
+            uploadEndpoints,
+            downloadEndpoints,
+            referencedFilenames: [...referencedFilenames].sort(),
+            timestamps: { first: timestamps[0] || '', last: timestamps[timestamps.length - 1] || '' },
+        };
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
+
+function readJmxFingerprint(file) {
+    try {
+        const xml = fs.readFileSync(file, 'utf8');
+        if (!/<jmeterTestPlan\b/i.test(xml)) return { ok: false, reason: 'missing jmeterTestPlan root' };
+        const samplers = parseJmxSamplers(xml);
+        if (!samplers.length) return { ok: false, reason: 'no HTTP samplers found' };
+        return fingerprintFromSamplers(samplers, 'jmx');
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
+
+function readSidecarFingerprint(file) {
+    try {
+        const xml = fs.readFileSync(file, 'utf8');
+        if (!/<testResults\b/i.test(xml)) return { ok: false, reason: 'missing testResults root' };
+        const samplers = parseJtlSamples(xml);
+        return fingerprintFromSamplers(samplers, 'sidecar');
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
+
+function fingerprintFromSamplers(samplers, type) {
+    const sequence = [];
+    const hosts = new Set();
+    const urls = [];
+    const uploadEndpoints = [];
+    const downloadEndpoints = [];
+    const referencedFilenames = new Set();
+    const timestamps = samplers.map(s => s.timestamp).filter(Boolean);
+    for (const s of samplers) {
+        const method = String(s.method || 'GET').toUpperCase();
+        const pathPart = s.path || '/';
+        sequence.push(`${method} ${pathPart}`);
+        if (s.host) hosts.add(s.host);
+        if (s.url) urls.push(s.url);
+        if (s.files && s.files.length) {
+            for (const name of s.files) referencedFilenames.add(path.basename(name));
+            uploadEndpoints.push({ method, path: pathPart, url: s.url || '', filenames: s.files.map(path.basename) });
+        }
+        if (s.downloads && s.downloads.length) {
+            for (const name of s.downloads) referencedFilenames.add(path.basename(name));
+            downloadEndpoints.push({ method, path: pathPart, url: s.url || '', filenames: s.downloads.map(path.basename) });
+        }
+    }
+    return {
+        ok: true,
+        type,
+        requestCount: samplers.length,
+        entries: samplers.length,
+        sequence,
+        hosts: [...hosts].sort(),
+        firstBusinessUrl: urls[0] || '',
+        lastBusinessUrl: urls[urls.length - 1] || '',
+        uploadEndpoints,
+        downloadEndpoints,
+        referencedFilenames: [...referencedFilenames].sort(),
+        timestamps: { first: timestamps[0] || '', last: timestamps[timestamps.length - 1] || '' },
+    };
+}
+
+function parseJmxSamplers(xml) {
+    const samplers = [];
+    for (const m of xml.matchAll(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g)) {
+        const attrs = m[1] || '';
+        const body = m[2] || '';
+        const label = attrValue(attrs, 'testname');
+        const method = propValue(body, 'HTTPSampler.method') || methodFromLabel(label) || 'GET';
+        const rawPath = propValue(body, 'HTTPSampler.path') || pathFromLabel(label) || '/';
+        const domain = propValue(body, 'HTTPSampler.domain');
+        const protocol = propValue(body, 'HTTPSampler.protocol') || 'https';
+        const url = domain ? `${protocol}://${domain}${rawPath.startsWith('/') ? rawPath : `/${rawPath}`}` : '';
+        const files = [...body.matchAll(/<stringProp\s+name="File\.path">([\s\S]*?)<\/stringProp>/g)]
+            .map(x => xmlText(x[1])).filter(Boolean);
+        samplers.push({
+            method,
+            path: normalizePathOnly(rawPath),
+            host: domain,
+            url,
+            files,
+        });
+    }
+    return samplers;
+}
+
+function parseJtlSamples(xml) {
+    const samples = [];
+    for (const m of xml.matchAll(/<(?:httpSample|sample)\b([^>]*)>([\s\S]*?)<\/(?:httpSample|sample)>/g)) {
+        const attrs = m[1] || '';
+        const body = m[2] || '';
+        const label = attrValue(attrs, 'lb');
+        const urlText = xmlText((body.match(/<java\.net\.URL>([\s\S]*?)<\/java\.net\.URL>/) || [])[1] || '');
+        let u = null;
+        try { u = urlText ? new URL(urlText) : null; } catch { u = null; }
+        const method = methodFromLabel(label) || 'GET';
+        const pathPart = u ? u.pathname : pathFromLabel(label) || '/';
+        samples.push({
+            method,
+            path: normalizePathOnly(pathPart),
+            host: u ? u.hostname : '',
+            url: u ? u.toString() : '',
+            timestamp: attrValue(attrs, 'ts'),
+        });
+    }
+    return samples;
+}
+
+function uploadFilesFromHarEntry(entry) {
+    return uploadFiles.detectUploadFiles([entry])
+        .map(upload => path.basename(String(upload.fileName || '')))
+        .filter(Boolean);
+}
+
+function downloadFilesFromHarEntry(entry) {
+    const headers = (entry.response && entry.response.headers) || [];
+    const out = [];
+    for (const h of headers) {
+        if (!/^content-disposition$/i.test(h.name || '')) continue;
+        const m = String(h.value || '').match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+        if (m) out.push(path.basename(decodeURIComponent(m[1].replace(/^"|"$/g, ''))));
+    }
+    return out;
+}
+
+function attrValue(attrs, name) {
+    const re = new RegExp(`${name}="([^"]*)"`);
+    const m = String(attrs || '').match(re);
+    return m ? xmlText(m[1]) : '';
+}
+
+function propValue(body, name) {
+    const re = new RegExp(`<stringProp\\s+name="${escapeRegExp(name)}">([\\s\\S]*?)<\\/stringProp>`);
+    const m = String(body || '').match(re);
+    return m ? xmlText(m[1]) : '';
+}
+
+function xmlText(s) {
+    return String(s || '')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+}
+
+function methodFromLabel(label) {
+    const m = String(label || '').match(/\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/i);
+    return m ? m[1].toUpperCase() : '';
+}
+
+function pathFromLabel(label) {
+    const m = String(label || '').match(/\s(\/[^\s?]*)/);
+    return m ? m[1] : '';
+}
+
+function normalizePathOnly(value) {
+    const s = String(value || '/');
+    try { return new URL(s).pathname || '/'; } catch { /* not absolute */ }
+    const noQuery = s.split('?')[0] || '/';
+    return noQuery.startsWith('/') ? noQuery : `/${noQuery}`;
+}
+
+function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function inferContentJmxPair(jmxs) {
+    if (!Array.isArray(jmxs) || jmxs.length !== 2 || jmxs.some(f => !fs.existsSync(f))) return null;
+    const a = readJmxFingerprint(jmxs[0]);
+    const b = readJmxFingerprint(jmxs[1]);
+    if (!a.ok || !b.ok || !fingerprintsLookSameFlow(a, b)) return null;
+    const sorted = sortRecordingPair(jmxs[0], jmxs[1]);
+    return {
+        stem: commonLooseNameStem(jmxs[0], jmxs[1]) || commonContentStem(a, b) || path.basename(sorted[0], path.extname(sorted[0])),
+        primary: sorted[0],
+        secondary: sorted[1],
+    };
+}
+
+function findSidecarByContent(jmxFile, allFiles) {
+    if (!fs.existsSync(jmxFile)) return null;
+    const jmx = readJmxFingerprint(jmxFile);
+    if (!jmx.ok) return null;
+    const matches = [];
+    for (const file of allFiles) {
+        if (!/\.(xml|jtl)$/i.test(file) || !fs.existsSync(file)) continue;
+        const fp = readSidecarFingerprint(file);
+        if (fp.ok && fingerprintsLookSameFlow(jmx, fp)) matches.push(file);
+    }
+    return matches.length === 1 ? matches[0] : null;
+}
+
+function fingerprintsLookSameFlow(a, b) {
+    if (!a || !b || !a.sequence || !b.sequence) return false;
+    if (Math.min(a.sequence.length, b.sequence.length) < 1) return false;
+    if (!hostsOverlap(a.hosts, b.hosts)) return false;
+    return sequenceSimilarity(a.sequence, b.sequence) >= 0.7;
+}
+
+function hostsOverlap(a = [], b = []) {
+    if (!a.length || !b.length) return true;
+    const bset = new Set(b);
+    return a.some(host => bset.has(host));
+}
+
+function analyzeInputFiles(files) {
+    const inventory = files.map(inspectInputFile);
+    const validRecordingFiles = inventory
+        .filter(item => !item.issue && ['har', 'jmx', 'sidecar'].includes(item.kind))
+        .map(item => item.file);
+    const units = groupInputs(validRecordingFiles);
+    const consumed = new Set();
+    for (const u of units) {
+        consumed.add(pathKey(u.primary));
+        if (u.secondary) consumed.add(pathKey(u.secondary));
+        if (u.sidecars?.primary) consumed.add(pathKey(u.sidecars.primary));
+        if (u.sidecars?.secondary) consumed.add(pathKey(u.sidecars.secondary));
+    }
+    const issues = [];
+    issues.push(...detectAmbiguousRecordingPairs(inventory, units));
+    issues.push(...detectMismatchedTwoRecordingRuns(inventory, units));
+    for (const item of inventory) {
+        const file = item.file;
+        if (item.issue) issues.push(item.issue);
+        if (item.kind === 'sidecar' && !consumed.has(pathKey(file))) {
+            issues.push({
+                code: 'orphan_sidecar',
+                file,
+                severity: 'warning',
+                message: `${path.basename(file)} looks like a JMeter recording/JTL response log but is not paired with any JMX.`,
+            });
+        }
+    }
+    for (const u of units) {
+        if (u.kind === 'jmx' && !u.secondary) {
+            issues.push({
+                code: 'jmx_missing_sidecar',
+                file: u.primary,
+                severity: 'warning',
+                message: `Found JMX ${path.basename(u.primary)} but no matching response sidecar (recording.xml/JTL) by name or request sequence.`,
+            });
+        }
+    }
+    return { units, inventory, issues };
+}
+
+function inspectInputFile(file) {
+    const ext = path.extname(file).toLowerCase();
+    const base = path.basename(file);
+    if (ext === '.har') {
+        const fp = readHarFingerprint(file);
+        return fp.ok
+            ? { file, kind: 'har', entries: fp.entries, fingerprint: publicFingerprint(fp) }
+            : { file, kind: 'har', issue: { code: 'invalid_har', file, severity: 'error', message: `${base} is not a usable HAR: ${fp.reason}` } };
+    }
+    if (ext === '.jmx') {
+        const fp = readJmxFingerprint(file);
+        return fp.ok
+            ? { file, kind: 'jmx', samplers: fp.entries, fingerprint: publicFingerprint(fp) }
+            : { file, kind: 'jmx', issue: { code: 'invalid_jmx', file, severity: 'error', message: `${base} is not a usable JMX test plan with HTTP samplers: ${fp.reason}` } };
+    }
+    if (/\.(xml|jtl)$/i.test(file)) {
+        const fp = readSidecarFingerprint(file);
+        if (fp.ok) return { file, kind: 'sidecar', fingerprint: publicFingerprint(fp) };
+        if (fp.reason === 'missing testResults root') return { file, kind: 'xml', issue: { code: 'unsupported_xml', file, severity: 'warning', message: `${base} is XML, but not a JMeter recording/JTL testResults file.` } };
+        return { file, kind: 'xml', issue: { code: 'invalid_xml', file, severity: 'error', message: `${base} could not be read as XML/JTL: ${fp.reason}` } };
+    }
+    return { file, kind: 'support', supportType: supportTypeFor(file) };
+}
+
+function publicFingerprint(fp) {
+    return {
+        type: fp.type,
+        requestCount: fp.requestCount,
+        sequence: fp.sequence,
+        hosts: fp.hosts,
+        firstBusinessUrl: fp.firstBusinessUrl,
+        lastBusinessUrl: fp.lastBusinessUrl,
+        uploadEndpoints: fp.uploadEndpoints,
+        downloadEndpoints: fp.downloadEndpoints,
+        referencedFilenames: fp.referencedFilenames,
+        timestamps: fp.timestamps,
+    };
+}
+
+function supportTypeFor(file) {
+    const ext = path.extname(file).toLowerCase();
+    if (ext === '.pdf') return 'pdf';
+    if (['.doc', '.docx'].includes(ext)) return 'document';
+    if (['.xls', '.xlsx', '.csv'].includes(ext)) return 'spreadsheet';
+    if (['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext)) return 'image';
+    return ext ? ext.slice(1) : 'file';
+}
+
+function detectAmbiguousRecordingPairs(inventory, units) {
+    const issues = [];
+    const paired = new Set(units.filter(u => /^dual-/.test(u.kind)).flatMap(u => [u.primary, u.secondary]).map(pathKey));
+    for (const kind of ['har', 'jmx']) {
+        const items = inventory.filter(i => i.kind === kind && i.fingerprint && !paired.has(pathKey(i.file)));
+        const groups = new Map();
+        for (const item of items) {
+            const key = fingerprintGroupKey(item.fingerprint);
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(item);
+        }
+        for (const group of groups.values()) {
+            if (group.length <= 2) continue;
+            issues.push({
+                code: 'ambiguous_recording_pair',
+                severity: 'error',
+                files: group.map(i => i.file),
+                message: `Found ${group.length} similar ${kind.toUpperCase()}s for this flow. I need exactly two runs or a clear selection: ${group.map(i => path.basename(i.file)).join(', ')}.`,
+            });
+        }
+    }
+    return issues;
+}
+
+function detectMismatchedTwoRecordingRuns(inventory, units) {
+    const issues = [];
+    const paired = new Set(units.filter(u => /^dual-/.test(u.kind)).flatMap(u => [u.primary, u.secondary]).map(pathKey));
+    for (const kind of ['har', 'jmx']) {
+        const items = inventory.filter(i => i.kind === kind && i.fingerprint && !paired.has(pathKey(i.file)));
+        if (items.length !== 2) continue;
+        if (fingerprintsLookSameFlow(items[0].fingerprint, items[1].fingerprint)) continue;
+        if (kind === 'har' && hasLooseNameSimilarity(items[0].file, items[1].file)) {
+            issues.push({
+                code: 'unpaired_similar_recordings',
+                severity: 'warning',
+                files: items.map(i => i.file),
+                message: `These HARs have similar file names but different request flows, so I will not pair them as dual recordings: ${items.map(i => path.basename(i.file)).join(', ')}.`,
+            });
+            continue;
+        }
+        issues.push({
+            code: 'recording_flow_mismatch',
+            severity: 'warning',
+            files: items.map(i => i.file),
+            message: `These two ${kind.toUpperCase()}s do not look like the same business flow: ${items.map(i => path.basename(i.file)).join(', ')}.`,
+        });
+    }
+    return issues;
+}
+
+function fingerprintGroupKey(fp) {
+    return `${(fp.hosts || []).join(',')}|${(fp.sequence || []).join('|')}`;
+}
+
+function writeIntakeArtifacts(outDir, analysis) {
+    fs.mkdirSync(outDir, { recursive: true });
+    const artifacts = [];
+    for (const unit of analysis.units || []) {
+        const flow = safeFlowName(unit.name || baseName(unit.primary || 'input'));
+        const unitFiles = new Set([unit.primary, unit.secondary, unit.sidecars?.primary, unit.sidecars?.secondary].filter(Boolean).map(pathKey));
+        const inventory = (analysis.inventory || []).filter(i => unitFiles.has(pathKey(i.file)));
+        const issues = (analysis.issues || []).filter(i => !i.file && !i.files || i.file && unitFiles.has(pathKey(i.file)) || Array.isArray(i.files) && i.files.some(f => unitFiles.has(pathKey(f))));
+        const jsonPath = path.join(outDir, `${flow}_input_inventory.json`);
+        const mdPath = path.join(outDir, `${flow}_intake_report.md`);
+        fs.writeFileSync(jsonPath, JSON.stringify({ unit, inventory, issues }, null, 2));
+        fs.writeFileSync(mdPath, renderIntakeReport(flow, unit, inventory, issues));
+        artifacts.push({ flow, inventory: jsonPath, report: mdPath });
+    }
+    return artifacts;
+}
+
+function renderIntakeReport(flow, unit, inventory, issues) {
+    const lines = [`# Intake Report: ${flow}`, '', `Mode: ${unit.kind}`, ''];
+    for (const item of inventory) {
+        lines.push(`## ${path.basename(item.file)}`, '');
+        lines.push(`Kind: ${item.kind}`);
+        if (item.fingerprint) {
+            lines.push(`Requests: ${item.fingerprint.requestCount}`);
+            lines.push(`Hosts: ${(item.fingerprint.hosts || []).join(', ') || '(none)'}`);
+            lines.push('Sequence:');
+            for (const step of item.fingerprint.sequence || []) lines.push(`- ${step}`);
+            if ((item.fingerprint.referencedFilenames || []).length) {
+                lines.push(`Referenced files: ${item.fingerprint.referencedFilenames.join(', ')}`);
+            }
+        }
+        lines.push('');
+    }
+    if (issues.length) {
+        lines.push('## Issues', '');
+        for (const issue of issues) lines.push(`- [${issue.severity || 'info'}] ${issue.message}`);
+    } else {
+        lines.push('## Issues', '', '- None');
+    }
+    lines.push('');
+    return lines.join('\n');
+}
+
+function safeFlowName(name) {
+    return String(name || 'input').replace(/[^a-zA-Z0-9_-]+/g, '_').replace(/^_+|_+$/g, '') || 'input';
 }
 
 /**
@@ -305,4 +900,4 @@ function compareAndAnnotate(har1, har2, secondaryPath, notes, okKey, errKey) {
     }
 }
 
-module.exports = { groupInputs, loadUnit };
+module.exports = { groupInputs, loadUnit, analyzeInputFiles, writeIntakeArtifacts };

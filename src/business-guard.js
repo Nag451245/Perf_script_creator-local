@@ -21,6 +21,7 @@ function buildBusinessGuard({ xml, flowName = '', runCfg = {}, valueFlowDecision
             method: s.method,
             path: s.path,
             domain: s.domain,
+            category: protectionCategory(s, goalTerms, valueFlowDecisionFor(s, valueFlowDecisions)),
             reason: protectionReason(s, goalTerms, valueFlowDecisionFor(s, valueFlowDecisions)),
         }));
     const protectedNames = new Set(protectedSamplers.map(s => s.name));
@@ -59,7 +60,7 @@ function evaluateBusinessResult({ result, xml, guard } = {}) {
     if (disabled.length) {
         return {
             ok: false,
-            reason: `protected business sampler(s) disabled: ${disabled.map(s => s.name).slice(0, 5).join(', ')}`,
+            reason: `required sampler(s) disabled: ${disabled.map(s => s.name).slice(0, 5).join(', ')}`,
             protectedSamplers,
             disabled,
         };
@@ -71,7 +72,7 @@ function evaluateBusinessResult({ result, xml, guard } = {}) {
     if (missing.length) {
         return {
             ok: false,
-            reason: `protected business sampler(s) did not execute: ${missing.map(s => s.name).slice(0, 5).join(', ')}`,
+            reason: `required sampler(s) did not execute: ${missing.map(s => s.name).slice(0, 5).join(', ')}`,
             protectedSamplers,
             missing,
         };
@@ -83,15 +84,17 @@ function evaluateBusinessResult({ result, xml, guard } = {}) {
     if (failed.length) {
         return {
             ok: false,
-            reason: `protected business sampler(s) failed: ${failed.map(f => f.sampler.name).slice(0, 5).join(', ')}`,
+            reason: `required sampler(s) failed: ${failed.map(f => f.sampler.name).slice(0, 5).join(', ')}`,
             protectedSamplers,
             failed,
         };
     }
 
+    const businessCount = protectedSamplers.filter(s => s.category !== 'dependency').length;
+    const dependencyCount = protectedSamplers.length - businessCount;
     return {
         ok: true,
-        reason: `${protectedSamplers.length} protected business sampler(s) executed successfully`,
+        reason: `${protectedSamplers.length} required sampler(s) executed successfully (${businessCount} business-critical, ${dependencyCount} required dependenc${dependencyCount === 1 ? 'y' : 'ies'})`,
         protectedSamplers,
     };
 }
@@ -134,13 +137,24 @@ function isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions = null) {
 
 function protectionReason(s, goalTerms, valueFlow = null) {
     const hay = `${s.name} ${s.path}`.toLowerCase();
-    if (valueFlow && valueFlow.consumedOutputCount > 0) return 'downstream value-flow producer';
+    if (valueFlow && valueFlow.consumedOutputCount > 0) return 'required value-flow producer';
     if (goalTerms.length && goalTerms.every(term => hay.includes(term))) return 'matches business goal';
     if (/\bcreate\b|\/tasks\b|task/i.test(hay)) return 'task/create business endpoint';
     if (/GraphQL mutation/i.test(s.name || '')) return 'GraphQL mutation';
     if (AUTH_OR_SESSION_PATH.test(s.path || '')) return 'auth/session producer';
     if (MUTATING_METHOD.test(s.method || '')) return 'first-party mutating request';
     return 'business-critical';
+}
+
+function protectionCategory(s, goalTerms, valueFlow = null) {
+    const hay = `${s.name} ${s.path}`.toLowerCase();
+    if (AUTH_OR_SESSION_PATH.test(s.path || '')) return 'dependency';
+    if (goalTerms.length && goalTerms.every(term => hay.includes(term))) return 'business';
+    if (/\bcreate\b|\/tasks\b|task/i.test(hay)) return 'business';
+    if (/GraphQL mutation/i.test(s.name || '')) return 'business';
+    if (MUTATING_METHOD.test(s.method || '')) return 'business';
+    if (valueFlow && valueFlow.consumedOutputCount > 0) return 'dependency';
+    return 'dependency';
 }
 
 function valueFlowDecisionFor(s, valueFlowDecisions) {
@@ -160,7 +174,11 @@ function goalTermsFor(flowName, runCfg) {
 function matchesAnyConfigured(s, patterns) {
     if (!Array.isArray(patterns) || patterns.length === 0) return false;
     const hay = `${s.name} ${s.domain}${s.path}`;
-    return patterns.some(p => p && hay.includes(String(p)));
+    // Full step labels are recording-specific — exact testname match only,
+    // so one flow's "Step 07 - POST /" never matches another flow's
+    // "Step 07 - POST /u/login/identifier" (same rule as the disable pass).
+    const stepLabel = /^Step \d+ - [A-Z]+ \S*$/;
+    return patterns.some(p => p && (stepLabel.test(String(p)) ? s.name === p : hay.includes(String(p))));
 }
 
 function isFirstParty(domain) {
@@ -205,5 +223,5 @@ module.exports = {
     buildBusinessGuard,
     filterProtectedDisables,
     evaluateBusinessResult,
-    _internal: { indexSamplers, goalTermsFor, isProtectedSampler, valueFlowDecisionFor },
+    _internal: { indexSamplers, goalTermsFor, isProtectedSampler, valueFlowDecisionFor, protectionCategory },
 };

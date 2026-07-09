@@ -101,31 +101,32 @@ function classifyStatusTransition(recordedCode, observedCode) {
 
 function traceStatusRootCause({ entries = [], samples = [], failingIndex = null } = {}) {
     const normalized = normalizeSamples(samples);
-    let failIndex = Number.isFinite(Number(failingIndex))
-        ? Number(failingIndex)
-        : firstFailedIndex(normalized);
-    if (failIndex < 0) failIndex = firstStatusDivergenceIndex(entries, normalized);
-    if (failIndex < 0) return null;
+    const pairs = alignEntrySamplePairs(entries, normalized);
+    const explicitFailIndex = failingIndex == null
+        ? null
+        : (Number.isFinite(Number(failingIndex)) ? Number(failingIndex) : null);
 
     const divergences = [];
-    for (let i = 0; i <= Math.min(failIndex, entries.length - 1); i++) {
-        const entry = entries[i];
-        const sample = normalized[i] || sampleByLabel(normalized, samplerLabel(entry, i));
+    for (const { entry, sample, entryIndex } of pairs) {
+        if (explicitFailIndex != null && entryIndex > explicitFailIndex) continue;
         const recorded = Number(entry && entry.response && entry.response.status || 0);
         const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
         if (!recorded || !observed) continue;
         const transition = classifyStatusTransition(recorded, observed);
         if (!transition.matchesRecording && !transition.folded) {
             divergences.push({
-                index: i,
-                sampler: samplerLabel(entry, i),
+                index: entryIndex,
+                sampler: sample.label || sample.name || samplerLabel(entry, entryIndex),
                 ...transition,
             });
         }
     }
     if (!divergences.length) return null;
     const rootCause = divergences[0];
-    const failing = divergences.find(d => d.index === failIndex) || rootCause;
+    const failIndex = explicitFailIndex != null
+        ? explicitFailIndex
+        : firstFailedEntryIndex(pairs) ?? rootCause.index;
+    const failing = divergences.find(d => d.index === failIndex) || divergences.find(d => d.index >= failIndex) || rootCause;
     const upstream = rootCause.index < failIndex;
     return {
         rootCauseIndex: rootCause.index,
@@ -144,19 +145,18 @@ function normalizeSamples(samples) {
     return (samples || []).filter(s => !s.isTransaction);
 }
 
-function firstFailedIndex(samples) {
-    const idx = samples.findIndex(s => s && (s.success === false || isBadStatus(s)));
-    return idx;
+function firstFailedEntryIndex(pairs) {
+    const pair = pairs.find(({ sample }) => sample && (sample.success === false || isBadStatus(sample)));
+    return pair ? pair.entryIndex : null;
 }
 
 function firstStatusDivergenceIndex(entries, samples) {
-    const compareLen = Math.min((entries || []).length, (samples || []).length);
-    for (let i = 0; i < compareLen; i++) {
-        const recorded = Number(entries[i] && entries[i].response && entries[i].response.status || 0);
-        const observed = Number(samples[i] && (samples[i].responseCode || samples[i].code || samples[i].status) || 0);
+    for (const { entry, sample, entryIndex } of alignEntrySamplePairs(entries, normalizeSamples(samples))) {
+        const recorded = Number(entry && entry.response && entry.response.status || 0);
+        const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
         if (!recorded || !observed || recorded === observed) continue;
         if (classifyStatusTransition(recorded, observed).folded) continue; // redirect folding, not divergence
-        return i;
+        return entryIndex;
     }
     return -1;
 }
@@ -170,10 +170,49 @@ function sampleByLabel(samples, label) {
     return samples.find(s => String(s.label || s.name || '').trim() === label);
 }
 
+function alignEntrySamplePairs(entries, samples) {
+    const pairs = [];
+    const usedSampleIndexes = new Set();
+    const usedEntryIndexes = new Set();
+
+    for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+        const sample = samples[sampleIndex] || {};
+        const stepNumber = stepNumberFromLabel(sample.label || sample.name);
+        if (!stepNumber) continue;
+        const entryIndex = stepNumber - 1;
+        if (entryIndex < 0 || entryIndex >= entries.length || usedEntryIndexes.has(entryIndex)) continue;
+        pairs.push({ entry: entries[entryIndex] || {}, sample, entryIndex, sampleIndex });
+        usedEntryIndexes.add(entryIndex);
+        usedSampleIndexes.add(sampleIndex);
+    }
+
+    let fallbackEntryIndex = 0;
+    for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+        if (usedSampleIndexes.has(sampleIndex)) continue;
+        while (fallbackEntryIndex < entries.length && usedEntryIndexes.has(fallbackEntryIndex)) fallbackEntryIndex++;
+        if (fallbackEntryIndex >= entries.length) break;
+        pairs.push({
+            entry: entries[fallbackEntryIndex] || {},
+            sample: samples[sampleIndex] || {},
+            entryIndex: fallbackEntryIndex,
+            sampleIndex,
+        });
+        usedEntryIndexes.add(fallbackEntryIndex);
+        fallbackEntryIndex++;
+    }
+
+    return pairs.sort((a, b) => a.entryIndex - b.entryIndex || a.sampleIndex - b.sampleIndex);
+}
+
+function stepNumberFromLabel(label) {
+    const match = /^Step\s+0*(\d+)\b/i.exec(String(label || '').trim());
+    return match ? Number(match[1]) : 0;
+}
+
 module.exports = {
     statusFamily,
     statusRelevance,
     classifyStatusTransition,
     traceStatusRootCause,
-    _internal: { firstStatusDivergenceIndex },
+    _internal: { firstStatusDivergenceIndex, alignEntrySamplePairs },
 };

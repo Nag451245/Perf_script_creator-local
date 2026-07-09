@@ -1,6 +1,7 @@
 'use strict';
 
 const { _internal: { samplerLabel } } = require('./value-flow-decisions');
+const domainKnowledge = require('./domain-knowledge');
 
 const DEFAULT_OBJECTIVE = 'mixed-load capacity';
 
@@ -20,6 +21,7 @@ function buildSeniorPeDebrief({
     const flow = reconstructFlow(entries, pages);
     const stackFingerprint = fingerprintStack(entries);
     const nativeManagers = auditNativeManagers(entries);
+    const domainProfile = domainKnowledge.buildDomainProfile({ name, entries, runCfg });
     const valueLedger = buildValueLedger({
         entries,
         correlations,
@@ -28,8 +30,8 @@ function buildSeniorPeDebrief({
         objective,
         nativeManagers,
     });
-    const validityGates = buildValidityGates({ objective, flow, nativeManagers, stats });
-    const negativeSpace = buildNegativeSpaceAudit({ objective, entries, polling });
+    const validityGates = buildValidityGates({ objective, flow, nativeManagers, stats, domainProfile });
+    const negativeSpace = buildNegativeSpaceAudit({ objective, entries, polling, runCfg, domainProfile });
     const coverage = estimateCoverage({ valueLedger, correlations, plannedExtractors, stats });
 
     return {
@@ -37,6 +39,7 @@ function buildSeniorPeDebrief({
         objective,
         flow,
         stackFingerprint,
+        domainProfile,
         nativeManagers,
         valueLedger,
         validityGates,
@@ -232,17 +235,26 @@ function labelForIndex(entries, idx) {
     return samplerLabel(entries[n], n);
 }
 
-function buildValidityGates({ objective, flow, nativeManagers, stats }) {
-    return [
+function buildValidityGates({ objective, flow, nativeManagers, stats, domainProfile = null }) {
+    const gates = [
         { gate: 'business_content_assertions', required: true, status: 'review', rationale: 'HTTP 200 is insufficient; assertions must prove the business step completed.' },
         { gate: 'data_realism', required: true, status: 'review', rationale: `Validate CSV/UDV cardinality against objective "${objective.value}".` },
         { gate: 'pacing_and_think_time', required: true, status: stats && stats.pacingTimers ? 'partially_covered' : 'review', rationale: 'Recording speed is not user pacing; tune for soak/stress/spike objective.' },
         { gate: 'transaction_grouping', required: true, status: flow.businessSteps.length ? 'covered_by_mapping' : 'review', rationale: 'Results should report business steps, not anonymous HTTP sampler numbers.' },
         { gate: 'native_managers_present', required: true, status: nativeManagers.length ? 'review' : 'not_applicable', rationale: 'Cookie/Cache/Auth/redirect manager decisions must be deliberate.' },
     ];
+    if (domainProfile && domainProfile.slo && Object.keys(domainProfile.slo).length) {
+        gates.push({
+            gate: 'performance_slo',
+            required: true,
+            status: 'review',
+            rationale: `Validate configured SLO targets against run metrics: ${JSON.stringify(domainProfile.slo)}.`,
+        });
+    }
+    return gates;
 }
 
-function buildNegativeSpaceAudit({ objective, entries = [], polling = [] }) {
+function buildNegativeSpaceAudit({ objective, entries = [], polling = [], runCfg = {}, domainProfile = null }) {
     const gaps = [];
     const obj = String(objective.value || '').toLowerCase();
     if (/soak|endurance|capacity|stress/.test(obj)) {
@@ -256,9 +268,15 @@ function buildNegativeSpaceAudit({ objective, entries = [], polling = [] }) {
     }
     if (entries.some(e => /^(POST|PUT|PATCH|DELETE)$/i.test(e.request && e.request.method || ''))) {
         gaps.push({ gap: 'setup/teardown and data exhaustion', severity: 'high', action: 'Confirm seed data, cleanup, uniqueness, and idempotency strategy for mutating flows.' });
+        if (!(runCfg.scenario || runCfg.loadProfile)) {
+            gaps.push({ gap: 'workload model missing', severity: 'high', action: 'Provide transactions/hour, users, duration, or loadProfile before treating this as a production load model.' });
+        }
     }
     if (entries.some(e => Number(e.response && e.response.status || 0) === 429 || hasHeader(e.response && e.response.headers, 'retry-after'))) {
         gaps.push({ gap: 'rate limiting / Retry-After', severity: 'high', action: 'Model throttling as a load ceiling signal, not a script failure only.' });
+    }
+    for (const risk of (domainProfile && domainProfile.risks) || []) {
+        gaps.push(risk);
     }
     return gaps;
 }
@@ -295,6 +313,13 @@ function renderSeniorPeDebriefMarkdown(debrief) {
         lines.push('- No strong stack signal detected.');
     }
     lines.push('');
+    if (debrief.domainProfile && debrief.domainProfile.hasOperatorContext) {
+        lines.push('## Domain / SLO Context');
+        lines.push(`- Application key: ${debrief.domainProfile.applicationKey}`);
+        if (debrief.domainProfile.slo && Object.keys(debrief.domainProfile.slo).length) lines.push(`- SLO: ${JSON.stringify(debrief.domainProfile.slo)}`);
+        if (debrief.domainProfile.domainNotes.length) lines.push(`- Notes: ${debrief.domainProfile.domainNotes.join('; ')}`);
+        lines.push('');
+    }
     lines.push('## Value Ledger');
     for (const v of debrief.valueLedger.slice(0, 100)) {
         lines.push(`- ${v.name}: ${v.role} -> ${v.decision}. ${v.necessityRationale}`);

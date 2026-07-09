@@ -36,6 +36,7 @@ const seniorPe = require('./senior-pe');
 const playbooks = require('./playbooks');
 const scenario = require('./scenario');
 const outcomeProbe = require('./outcome-probe');
+const uploadFiles = require('./upload-files');
 const {
     wrapPollingInWhileController,
     injectGhostSynthesizers,
@@ -131,6 +132,124 @@ function repairStaticOauthConstants(xml) {
     return { xml: out, repaired: before !== out ? 1 : 0 };
 }
 
+function applyForcedNativeManagers(xml, force = {}) {
+    const requested = ['cookie', 'cache', 'authorization', 'redirects'].filter(k => force && force[k]);
+    const result = {
+        xml,
+        applied: [],
+        inserted: [],
+        existing: [],
+        cookieHeadersRemoved: 0,
+        redirectSamplersUpdated: 0,
+    };
+    if (!requested.length) return result;
+
+    const missingBlocks = [];
+    for (const key of ['cookie', 'cache', 'authorization']) {
+        if (!requested.includes(key)) continue;
+        result.applied.push(key);
+        if (nativeManagerExists(result.xml, key)) {
+            result.existing.push(key);
+        } else {
+            missingBlocks.push(nativeManagerBlock(key));
+            result.inserted.push(key);
+        }
+    }
+    if (missingBlocks.length) {
+        result.xml = insertNativeManagerBlocks(result.xml, missingBlocks.join(''));
+    }
+    if (requested.includes('cookie')) {
+        const stripped = removeCookieHeaders(result.xml);
+        result.xml = stripped.xml;
+        result.cookieHeadersRemoved = stripped.count;
+    }
+    if (requested.includes('redirects')) {
+        result.applied.push('redirects');
+        const redirects = forceFollowRedirects(result.xml);
+        result.xml = redirects.xml;
+        result.redirectSamplersUpdated = redirects.updated;
+    }
+    return result;
+}
+
+function nativeManagerExists(xml, key) {
+    const tag = key === 'authorization' ? 'AuthManager' : key === 'cache' ? 'CacheManager' : 'CookieManager';
+    return new RegExp(`<${tag}\\b`).test(xml);
+}
+
+function nativeManagerBlock(key) {
+    if (key === 'cookie') {
+        return `
+        <CookieManager guiclass="CookiePanel" testclass="CookieManager" testname="HTTP Cookie Manager" enabled="true">
+          <collectionProp name="CookieManager.cookies"/>
+          <boolProp name="CookieManager.clearEachIteration">true</boolProp>
+          <boolProp name="CookieManager.controlledByThreadGroup">false</boolProp>
+        </CookieManager>
+        <hashTree/>
+`;
+    }
+    if (key === 'cache') {
+        return `
+        <CacheManager guiclass="CacheManagerGui" testclass="CacheManager" testname="HTTP Cache Manager" enabled="true">
+          <boolProp name="clearEachIteration">true</boolProp>
+          <boolProp name="useExpires">true</boolProp>
+          <intProp name="maxSize">5000</intProp>
+          <boolProp name="CacheManager.controlledByThread">false</boolProp>
+        </CacheManager>
+        <hashTree/>
+`;
+    }
+    return `
+        <AuthManager guiclass="AuthPanel" testclass="AuthManager" testname="HTTP Authorization Manager" enabled="true">
+          <collectionProp name="AuthManager.auth_list"/>
+        </AuthManager>
+        <hashTree/>
+`;
+}
+
+function insertNativeManagerBlocks(xml, blocks) {
+    const threadGroupTree = /(<ThreadGroup\b[\s\S]*?<\/ThreadGroup>\s*<hashTree>)/;
+    if (threadGroupTree.test(xml)) return xml.replace(threadGroupTree, `$1${blocks}`);
+    const testPlanTree = /(<TestPlan\b[\s\S]*?<\/TestPlan>\s*<hashTree>)/;
+    if (testPlanTree.test(xml)) return xml.replace(testPlanTree, `$1${blocks}`);
+    return xml;
+}
+
+function removeCookieHeaders(xml) {
+    let count = 0;
+    const out = xml.replace(/<elementProp\b(?=[^>]*elementType="Header")[\s\S]*?<\/elementProp>/g, block => {
+        if (!/<stringProp name="Header\.name">\s*Cookie\s*<\/stringProp>/i.test(block)) return block;
+        count++;
+        return '';
+    });
+    return { xml: out, count };
+}
+
+function forceFollowRedirects(xml) {
+    let updated = 0;
+    const out = xml.replace(/<HTTPSamplerProxy\b[\s\S]*?<\/HTTPSamplerProxy>/g, block => {
+        const next = setSamplerBoolProp(
+            setSamplerBoolProp(block, 'HTTPSampler.follow_redirects', true),
+            'HTTPSampler.auto_redirects',
+            false,
+        );
+        if (next !== block) updated++;
+        return next;
+    });
+    return { xml: out, updated };
+}
+
+function setSamplerBoolProp(block, name, value) {
+    const re = new RegExp(`<boolProp name="${escapeRegExp(name)}">(?:true|false)<\\/boolProp>`);
+    const prop = `<boolProp name="${name}">${value ? 'true' : 'false'}</boolProp>`;
+    if (re.test(block)) return block.replace(re, prop);
+    return block.replace('</HTTPSamplerProxy>', `          ${prop}\n        </HTTPSamplerProxy>`);
+}
+
+function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Body fingerprint used by `detectPolling` to distinguish *real* polling
  * (same URL + same body, repeated) from *different work on the same endpoint*
@@ -205,6 +324,11 @@ const DEFAULT_DISABLE_PATTERNS = [
     '/v2/logout',
 ];
 
+const AUTH_SESSION_DISABLE_PROTECT_RE = /\/(?:u\/login(?:\/|\?|$)|user\/login(?:\/|\?|$)|authorization(?:\/|\?|$)|user\/iam\/save(?:\/|\?|$)|jwt\/v2\/create-cookie(?:\/|\?|$)|s\/interceptor\/authorize(?:\/|\?|$)|iam\/callback(?:\/|\?|$))/i;
+const AUTH_HOST_RE = /(?:^|[.-])(?:login|auth|sso|iam)(?:[.-]|$)|webpt|stage|stg/i;
+const SAFE_DISABLE_NOISE_RE = /ohttp|safebrowsing|domainreliability|beacon|gstatic|launchdarkly|\/sdk\/evalx|\/avatar\/|\/_next\/data\//i;
+const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
+
 function filterParameterCandidates(candidates, policy = {}) {
     const include = toLowerList(policy.includeNames);
     const exclude = toLowerList(policy.excludeNames);
@@ -226,6 +350,27 @@ function isGraphqlOperationDocument(candidate) {
     if (String(candidate.name || '').toLowerCase() !== 'query') return false;
     const value = String(candidate.value || '').trim();
     return /^(query|mutation|subscription)\b/i.test(value) && /[{]/.test(value);
+}
+
+function shouldProtectDisableTarget(sampler = {}, runCfg = {}) {
+    if (runCfg.allowUnsafeDisableProtected === true) return false;
+    const hay = `${sampler.name || ''} ${sampler.domain || ''}${sampler.path || ''}`;
+    if (SAFE_DISABLE_NOISE_RE.test(hay)) return false;
+    if (matchesConfiguredPattern(hay, runCfg.protectedCalls)) return true;
+    if (AUTH_SESSION_DISABLE_PROTECT_RE.test(sampler.path || '')) return true;
+    if (MUTATING_METHOD_RE.test(sampler.method || methodFromSamplerName(sampler.name)) && /^\/?$/.test(String(sampler.path || '/'))) return true;
+    if (MUTATING_METHOD_RE.test(sampler.method || methodFromSamplerName(sampler.name)) && AUTH_HOST_RE.test(sampler.domain || '')) return true;
+    if (/GraphQL mutation/i.test(sampler.name || '') && /(login|authenticate|verify|token|session)/i.test(hay)) return true;
+    return false;
+}
+
+function matchesConfiguredPattern(hay, patterns) {
+    return Array.isArray(patterns) && patterns.some(p => p && String(hay || '').includes(String(p)));
+}
+
+function methodFromSamplerName(name) {
+    const match = /\b(GET|POST|PUT|PATCH|DELETE)\b/i.exec(String(name || ''));
+    return match ? match[1].toUpperCase() : '';
 }
 
 function filterBareOauthStateNonceCorrelations(corrs, entries) {
@@ -328,6 +473,24 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     const polling = detectPolling(flat);
     if (polling.length) fs.writeFileSync(path.join(outDir, `${name}_polling.json`), JSON.stringify(polling, null, 2));
 
+    const uploadPlan = uploadFiles.resolveAndStageUploads({
+        entries: flat,
+        searchDirs: uploadSearchDirs(opts, runCfg),
+        outDir,
+    });
+    if (uploadPlan.required.length) {
+        fs.writeFileSync(path.join(outDir, `${name}_file_uploads.json`), JSON.stringify(uploadPlan, null, 2));
+        note('file-uploads',
+            `${uploadPlan.required.length} multipart upload file(s) referenced by the recording`,
+            uploadPlan.matched.length
+                ? `staged ${uploadPlan.matched.map(u => u.fileName).join(', ')} under test_files/`
+                : `missing ${uploadPlan.missing.map(u => u.fileName).join(', ')}`,
+            uploadPlan.missing.length
+                ? `ask the user to place missing file(s) in input/ or bin/ before validation`
+                : `mapped JMeter HTTPFileArg paths to staged local files`);
+    }
+    uploadFiles.applyResolvedUploadsToEntries(flat, uploadPlan);
+
     // 4. Parameterization + unique data (state-pollution defense). Discover
     //    user-input fields, synthesize a multi-row pool, wire one CSV Data Set.
     const rawCandidates = suggestParameterizations(flat) || [];
@@ -360,6 +523,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         sourceFile: name, recordingFilename: `${name}.recording.xml`,
         includeThinkTimes: false, includeAssertions: false,
         parameterizations: params, userDefinedVariables: params,
+        fileMappings: uploadPlan.fileMappings,
         harGapValues: [], userDefinedGaps: [], stableAssertions: [],
     };
     const ir = buildPlanFromHar({
@@ -368,6 +532,12 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         config: { correlationThreshold: 0.75 },
     });
     let xml = getRenderer(DEFAULT_RENDERER_ID).render(ir).xml;
+    const nativeManagers = applyForcedNativeManagers(xml, runCfg.forceNativeManagers || {});
+    xml = nativeManagers.xml;
+    if (nativeManagers.applied.length) note('native-managers',
+        `forced native JMeter manager strategy applied: ${nativeManagers.applied.join(', ')}`,
+        `inserted=${nativeManagers.inserted.join(', ') || 'none'}; existing=${nativeManagers.existing.join(', ') || 'none'}; cookieHeadersRemoved=${nativeManagers.cookieHeadersRemoved}`,
+        `honored replan forceNativeManagers before validator/repair passes`);
     let vr = dryRunValidator.validate(xml, corrs);
 
     // Filter false orphans: anything the test plan already supplies via a
@@ -490,19 +660,36 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // carries <input type="hidden" name=X value=V> and later requests must
     // send the FRESH V, not the recorded literal. Runs after the Auth0 repair
     // pass so that pass cannot rewrite the CSS extractors emitted here.
-    const formCorr = correlateFormHiddenInputs(xml, flat);
+    const formCorr = correlateFormHiddenInputs(xml, flat, {
+        maxVars: runCfg.formCorrelation && runCfg.formCorrelation.maxVars,
+    });
+    if (formCorr.skippedByCap && formCorr.skippedByCap.length) {
+        note('form-correlation',
+            `${formCorr.skippedByCap.length} additional form hidden-input value(s) skipped by the correlation cap`,
+            `each wired variable costs a CSS DOM parse per response at runtime; the most-consumed ones were kept`,
+            `raise run.formCorrelation.maxVars deliberately if a skipped field breaks replay: ${formCorr.skippedByCap.slice(0, 6).map(s => s.input).join(', ')}`);
+    }
     xml = formCorr.xml;
     if (formCorr.wired.length) note('form-correlation',
         `${formCorr.wired.length} form hidden-input value(s) must be fresh per run`,
         formCorr.wired.map(w => `${w.input} produced by "${w.producerSampler}" (recorded page body carries the hidden input; later requests consume it)`).join('; '),
         `emitted CSS extractor per producer + substituted \${var} at ${formCorr.wired.reduce((n, w) => n + w.substitutions, 0)} consumer field(s)`);
 
-    const assertInj = injectAssertionsFromMined(xml, flat, corrs.map(c => c.value).filter(Boolean));
+    // runCfg.mineAssertions === false is the replanner's "assertion relief"
+    // strategy: regenerate without mined text assertions to separate "text
+    // drifted" from "flow broken" (outcome probe + business guard remain).
+    const assertInj = runCfg.mineAssertions === false
+        ? { xml, injected: 0 }
+        : injectAssertionsFromMined(xml, flat, corrs.map(c => c.value).filter(Boolean));
     xml = assertInj.xml;
     if (assertInj.injected) note('assertions',
         `${assertInj.injected} sampler(s) had stable response text to assert on`,
         `mined HTML titles / JSON status keys / page headings from recording`,
         `injected ResponseAssertion (substring, OR) per sampler`);
+    if (runCfg.mineAssertions === false) note('assertions',
+        'mined text assertions disabled for this attempt',
+        'replan strategy: separate assertion strictness from real flow breakage',
+        'no mined ResponseAssertions injected (outcome probe and business guard still verify)');
 
     // Outcome probe: the recording shows some later read ECHOES the value the
     // business mutation submitted. Assert that echo so "every request 200s
@@ -551,12 +738,18 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         ...((runCfg && runCfg.disableCalls) || []),
     ];
     if (disablePatterns.length) {
-        const dis = disableSamplersByPattern(xml, disablePatterns);
+        const dis = disableSamplersByPattern(xml, disablePatterns, {
+            protect: sampler => shouldProtectDisableTarget(sampler, runCfg),
+        });
         xml = dis.xml; disabledCount = dis.disabled;
         if (dis.disabled) note('disable-calls',
             `${dis.disabled} browser/OIDC/noise sampler(s) disabled`,
             `matched: ${dis.hits.slice(0, 8).join(', ')}`,
             `set enabled=false so JMeter skips non-business / un-replayable plumbing`);
+        if (dis.skippedProtected && dis.skippedProtected.length) note('disable-calls-protected',
+            `${dis.skippedProtected.length} disable match(es) blocked because they are auth/session producers`,
+            `kept enabled: ${dis.skippedProtected.slice(0, 8).join(', ')}`,
+            `protected producers must execute; set run.allowUnsafeDisableProtected=true only for a deliberate expert override`);
     }
 
     // Golden-script learning: a human-fixed WORKING script for this flow was
@@ -699,6 +892,9 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     });
     fs.writeFileSync(path.join(outDir, `${name}_senior_pe_debrief.json`), JSON.stringify(seniorPeDebrief, null, 2));
     fs.writeFileSync(path.join(outDir, `${name}_senior_pe_debrief.md`), seniorPe.renderSeniorPeDebriefMarkdown(seniorPeDebrief));
+    if (seniorPeDebrief.domainProfile && seniorPeDebrief.domainProfile.hasOperatorContext) {
+        fs.writeFileSync(path.join(outDir, `${name}_domain_profile.json`), JSON.stringify(seniorPeDebrief.domainProfile, null, 2));
+    }
 
     if (reasoning.length) {
         fs.writeFileSync(path.join(outDir, `${name}_reasoning.json`), JSON.stringify(reasoning, null, 2));
@@ -719,11 +915,14 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     return {
         jmxPath, flat, csvFile, candidates, ghosts, polling, correlations: corrs,
         plannedExtractors, reasoning, dualHarHints, loadProfile: loadProfileApplied, seniorPeDebrief,
+        domainProfile: seniorPeDebrief.domainProfile || null,
         goldenDisables, goldenApplied,
         playbooksApplied: pbResult.applied,
         playbookDisables: pbResult.addedDisables,
         effectiveLlmFlowNotes: runCfg.llmFlowNotes || [],
         scenario: scenarioPlan,
+        uploadFiles: uploadPlan,
+        nativeManagers,
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
             correlations: corrs.length, parameterized: params.length,
@@ -740,6 +939,10 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             allowJsr223,
             assertions: assertInj.injected,
             pacingTimers: pacingInj.injected,
+            uploadFiles: uploadPlan.required.length,
+            stagedUploadFiles: uploadPlan.matched.length,
+            missingUploadFiles: uploadPlan.missing.length,
+            nativeManagersApplied: nativeManagers.applied.length,
             bodyCorrelations: bodyCorrelated,
             graphqlCsrfHeaderRepairs: gqlCsrf.substitutions,
             formCorrelations: formCorr.wired.length,
@@ -786,6 +989,17 @@ function renderReasoningMarkdown(name, entries, header) {
     lines.push('');
     lines.push('Open `' + name + '_report.html` for the executable summary; `' + name + '.jmx` is the generated script. Validation status is shown in the run log/report.');
     return lines.join('\n');
+}
+
+function uploadSearchDirs(opts = {}, runCfg = {}) {
+    const root = path.join(__dirname, '..');
+    const dirs = [
+        ...(Array.isArray(opts.uploadSearchDirs) ? opts.uploadSearchDirs : []),
+        ...(Array.isArray(runCfg.uploadSearchDirs) ? runCfg.uploadSearchDirs : []),
+        path.join(root, 'input'),
+        path.join(root, 'bin'),
+    ];
+    return dirs.map(dir => path.isAbsolute(dir) ? dir : path.join(root, dir));
 }
 
 /** Best-effort lookup of a variable's recorded value, used to seed extractor search. */

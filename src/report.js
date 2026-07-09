@@ -20,13 +20,24 @@ const ARTIFACTS = [
     ['_parameters.json', 'Parameterization candidates'],
     ['_ghosts.json', 'Client-side (ghost) values'],
     ['_polling.json', 'Detected polling loops'],
+    ['_file_uploads.json', 'Multipart upload files detected, staged, or missing'],
     ['_llm_suggestions.json', 'LLM fix suggestions'],
     ['_java_safe_generate.json', 'Generated JMX Java-safe compatibility report'],
     ['_run_status.json', 'Validation attempt status'],
     ['_baseline_diff.json', 'Baseline vs test diff (status / length / shape)'],
+    ['_failure_forensics.json', 'Failure forensics ledger and recommended action'],
+    ['_failure_forensics.md', 'Failure forensics summary (Markdown)'],
     ['_final_green_gate.json', 'Final green gate verdict'],
     ['_senior_pe_debrief.json', 'Senior performance engineering debrief'],
     ['_senior_pe_debrief.md', 'Senior performance engineering debrief (Markdown)'],
+    ['_domain_profile.json', 'Domain, stack, SLO, and memory-scope profile'],
+    ['_pe_analysis.json', 'Senior PE failure and flow-intent analysis'],
+    ['_pe_analysis.md', 'Senior PE failure and flow-intent analysis (Markdown)'],
+    ['_ai_strategy.json', 'Bounded senior PE AI strategy'],
+    ['_human_questions.md', 'Targeted human questions from senior PE analysis'],
+    ['_evidence_citations.json', 'Evidence citations for senior PE strategy'],
+    ['_blockers.json', 'Terminal blockers requiring human input'],
+    ['_blockers.md', 'Terminal blockers requiring human input (Markdown)'],
     ['_blueprint_context.json', 'Blueprint agent phase context'],
     ['_lineage.json', 'Blueprint dynamic producer-to-consumer lineage'],
     ['_repair_rounds.json', 'Blueprint closed-loop repair rounds'],
@@ -48,6 +59,15 @@ function statCard(label, value) {
     return `<div class="card"><div class="num">${esc(value)}</div><div class="lbl">${esc(label)}</div></div>`;
 }
 
+function firstPresent(...values) {
+    return values.find(v => v !== undefined && v !== null && String(v) !== '');
+}
+
+function stepLabel(index) {
+    const n = Number(index);
+    return Number.isFinite(n) ? `Step ${String(n + 1).padStart(2, '0')}` : '';
+}
+
 /**
  * @param outDir folder the run wrote into
  * @param name   base name
@@ -61,6 +81,7 @@ function writeHtmlReport(outDir, name, data = {}) {
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
     const failures = reqs.filter(s => s.success === false);
+    const failureForensics = data.failureForensics || readJsonIfExists(path.join(outDir, `${name}_failure_forensics.json`));
 
     const verdictClass = verdict === 'GREEN' ? 'ok' : (verdict === 'generated' ? 'neutral' : 'bad');
 
@@ -81,15 +102,15 @@ function writeHtmlReport(outDir, name, data = {}) {
         <tr class="${s.success ? 'ok' : 'bad'}">
             <td>${s.success ? '✓' : '✗'}</td>
             <td>${esc(s.label || s.name || '')}</td>
-            <td>${esc(s.responseCode || '')}</td>
-            <td>${esc(s.responseMessage || s.failureMessage || '')}</td>
+            <td>${esc(firstPresent(s.responseCode, s.code, s.rc, ''))}</td>
+            <td>${esc(firstPresent(s.responseMessage, s.message, s.failureMessage, ''))}</td>
         </tr>`).join('') : `<tr><td colspan="4" class="muted">No request results (generate-only, or run did not execute).</td></tr>`;
 
     const businessSection = businessVerification ? `<h2>Business verification</h2>
       <p><span class="badge ${businessVerification.ok ? 'ok' : 'bad'}">${businessVerification.ok ? 'PASSED' : 'NOT VERIFIED'}</span></p>
       <p>${esc(businessVerification.reason || '')}</p>
       ${businessVerification.protectedSamplers && businessVerification.protectedSamplers.length
-        ? `<ul>${businessVerification.protectedSamplers.slice(0, 20).map(s => `<li>${esc(s.name)} <span class="muted">(${esc(s.reason || 'protected')})</span></li>`).join('')}</ul>`
+        ? renderBusinessSamplerList(businessVerification.protectedSamplers)
         : ''}
       ${businessVerification.blockedDisables && businessVerification.blockedDisables.length
         ? `<p class="muted">Blocked disable attempts: ${esc(businessVerification.blockedDisables.map(s => s.sampler).slice(0, 8).join(', '))}</p>`
@@ -132,8 +153,11 @@ function writeHtmlReport(outDir, name, data = {}) {
     if (Array.isArray(correlations) && correlations.length) {
         const rows = correlations.slice(0, 200).map(c => {
             const variable = c.variableName || c.refname || c.name || c.value || '?';
-            const source = c.sourceUrl || c.source || c.sourceSampler || (c.origin && (c.origin.sampler || c.origin.label)) || '?';
-            const sink   = c.targetUrl || c.sink || c.targetSampler || c.location || '';
+            const source = firstPresent(c.sourceUrl, c.source, c.sourceSampler, c.producerSampler,
+                c.origin && (c.origin.sampler || c.origin.label),
+                stepLabel(firstPresent(c.sourceRequestIndex, c.producer))) || '';
+            const sink   = firstPresent(c.targetUrl, c.sink, c.targetSampler, c.consumerSampler, c.location,
+                stepLabel(firstPresent(c.targetRequestIndex, c.consumer))) || '';
             const type   = c.extractorType || c.type || c.kind || '';
             const conf   = (c.confidence != null) ? Number(c.confidence).toFixed(2) : '';
             return `<tr><td><code>${esc(variable)}</code></td><td>${esc(source)}</td><td>${esc(sink)}</td><td>${esc(type)}</td><td>${esc(conf)}</td></tr>`;
@@ -193,6 +217,24 @@ function writeHtmlReport(outDir, name, data = {}) {
                 <table><thead><tr><th>Sampler</th><th>Drift</th></tr></thead><tbody>${rows}</tbody></table>
                 <p class="muted">Drift means the live response did not match what the recording captured. "200 OK" alone can hide login pages returned in place of dashboards, empty lists in place of data, etc.</p>`;
         }
+    }
+
+    let failureForensicsSection = '';
+    if (failureForensics && failureForensics.rootCause) {
+        const root = failureForensics.rootCause;
+        const missingCookies = failureForensics.authSession && failureForensics.authSession.missingSessionCookies || [];
+        const interactiveAuthWall = !!(failureForensics.redirects && failureForensics.redirects.interactiveAuthWall);
+        const downstreamGraphql = failureForensics.graphql && failureForensics.graphql.downstreamSymptoms || [];
+        const action = failureForensics.recommendedAction && failureForensics.recommendedAction.id || 'review';
+        failureForensicsSection = `<h2>Failure forensics</h2>
+            <p>First divergence: <b>${esc(root.sampler || '')}</b> recorded ${esc(root.recordedStatus ?? root.expected ?? '')}, observed ${esc(root.observedStatus ?? root.observed ?? '')}.</p>
+            <ul>
+                <li>Session-cookie proof: ${missingCookies.length ? esc(`missing ${missingCookies.join(', ')}`) : 'no missing session cookie proven'}</li>
+                <li>Redirect/auth wall proof: ${interactiveAuthWall ? 'interactive auth redirect wall detected' : 'not detected'}</li>
+                <li>Downstream symptoms: ${esc(downstreamGraphql.length)} GraphQL/API auth symptom(s)</li>
+                <li>Recommended action: <code>${esc(action)}</code></li>
+            </ul>
+            <p class="muted">Full evidence: <a href="${esc(name)}_failure_forensics.json">JSON</a> · <a href="${esc(name)}_failure_forensics.md">Markdown</a></p>`;
     }
 
     let learningSection = '';
@@ -258,6 +300,8 @@ function writeHtmlReport(outDir, name, data = {}) {
 
   ${reasoningSection}
 
+  ${failureForensicsSection}
+
   ${driftSection}
 
   ${learningSection}
@@ -269,6 +313,28 @@ function writeHtmlReport(outDir, name, data = {}) {
     const out = path.join(outDir, `${name}_report.html`);
     fs.writeFileSync(out, html);
     return out;
+}
+
+function renderBusinessSamplerList(protectedSamplers) {
+    const business = protectedSamplers.filter(s => s.category !== 'dependency');
+    const dependencies = protectedSamplers.filter(s => s.category === 'dependency');
+    const renderGroup = (title, items) => {
+        if (!items.length) return '';
+        const rows = items.slice(0, 12).map(s => `<li>${esc(s.name)} <span class="muted">(${esc(s.reason || 'required')})</span></li>`).join('');
+        const more = items.length > 12 ? `<li class="muted">Showing first 12 of ${esc(items.length)}.</li>` : '';
+        return `<p class="muted">${esc(title)} (${esc(items.length)})</p><ul>${rows}${more}</ul>`;
+    };
+    return renderGroup('Business-critical samplers', business) +
+        renderGroup('Required dependency samplers', dependencies);
+}
+
+function readJsonIfExists(file) {
+    try {
+        if (!fs.existsSync(file)) return null;
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+        return null;
+    }
 }
 
 module.exports = { writeHtmlReport };

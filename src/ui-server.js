@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { flagsForRunMode } = require('./ui-run-mode');
+const uiConfig = require('./ui-config');
 
 const ROOT = path.join(__dirname, '..');
 const INPUT = path.join(ROOT, 'input');
@@ -23,41 +24,12 @@ fs.mkdirSync(OUTPUT, { recursive: true });
 
 // ── config (perfscript.config.json) — read/write only the run-relevant subset,
 // preserving everything else (jmeterHome, javaHome, gemini key, …).
-function readConfig() {
-    try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^﻿/, '')); }
-    catch { return {}; }
-}
+function readConfig() { return uiConfig.readConfigFromPath(CONFIG_PATH); }
 function readConfigForUi() {
-    const c = readConfig(); const run = c.run || {};
-    const lp = run.loadProfile || {};
-    return {
-        targetBaseUrl: run.targetBaseUrlOverride || '',
-        username: (run.credentials && run.credentials.username) || '',
-        hasPassword: !!(run.credentials && run.credentials.password),
-        loadProfile: { users: lp.users || '', rampUpSec: lp.rampUpSec || '', holdSec: lp.holdSec || '' },
-        jmeterHome: c.jmeterHome || '', javaHome: c.javaHome || '',
-    };
+    return uiConfig.readConfigForUiPath(CONFIG_PATH);
 }
 function writeConfigFromUi(body) {
-    const c = readConfig();
-    c.run = c.run || {};
-    if (typeof body.targetBaseUrl === 'string') c.run.targetBaseUrlOverride = body.targetBaseUrl.trim();
-    if (typeof body.username === 'string' || typeof body.password === 'string') {
-        c.run.credentials = c.run.credentials || {};
-        if (typeof body.username === 'string') c.run.credentials.username = body.username;
-        // Only overwrite the password when a non-empty one is supplied (the UI
-        // never reads it back, so an empty field means "leave unchanged").
-        if (typeof body.password === 'string' && body.password !== '') c.run.credentials.password = body.password;
-    }
-    const lp = body.loadProfile || {};
-    const num = (v) => (v === '' || v == null ? undefined : Math.max(0, parseInt(v, 10) || 0));
-    const prof = {};
-    if (num(lp.users) != null) prof.users = num(lp.users);
-    if (num(lp.rampUpSec) != null) prof.rampUpSec = num(lp.rampUpSec);
-    if (num(lp.holdSec) != null) prof.holdSec = num(lp.holdSec);
-    if (Object.keys(prof).length) c.run.loadProfile = prof; else delete c.run.loadProfile;
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(c, null, 2));
-    return { ok: true };
+    return uiConfig.writeConfigFromUiPath(CONFIG_PATH, body);
 }
 
 // In-memory run registry: id -> { mode, lines:[], done, code, startedAt }
@@ -67,7 +39,7 @@ let activeChild = null;
 
 function listInputs() {
     return fs.readdirSync(INPUT)
-        .filter(f => /\.(har|jmx|xml|jtl)$/i.test(f))
+        .filter(f => !f.startsWith('.'))
         .map(f => ({ name: f, size: fs.statSync(path.join(INPUT, f)).size }));
 }
 
@@ -171,7 +143,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (p === '/api/upload' && req.method === 'POST') {
             const name = path.basename(u.searchParams.get('name') || '');
-            if (!name || !/\.(har|jmx|xml|jtl)$/i.test(name)) return send(res, 400, { error: 'name must end in .har/.jmx/.xml/.jtl' });
+            if (!name || /\.(exe|cmd|bat|ps1|js|mjs|cjs)$/i.test(name)) return send(res, 400, { error: 'unsupported or unsafe file type' });
             const body = await readBody(req);
             fs.writeFileSync(path.join(INPUT, name), body);
             return send(res, 200, { ok: true, name, size: body.length });
@@ -253,7 +225,7 @@ li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:
   <div class="card">
    <h2>1 · Recordings (input)</h2>
    <div id="drop" class="drop">Drop .har / .jmx / .xml here — or click to browse</div>
-   <input id="file" type="file" multiple accept=".har,.jmx,.xml,.jtl" style="display:none">
+   <input id="file" type="file" multiple style="display:none">
    <ul id="inputs"></ul>
   </div>
   <div class="card">
@@ -261,12 +233,14 @@ li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:
    <div class="row">
     <button id="gen" class="primary">Generate</button>
     <button id="run" class="ghost">Generate + Validate (JMeter)</button>
-    <button id="agent" class="ghost">Senior AI Agent</button>
+    <button id="agent" class="ghost">Senior AI Agent (one-shot)</button>
+    <button id="senior-agent" class="ghost">Mature PE Agent</button>
+    <button id="agent-watch" class="ghost">Start Watch Agent</button>
     <button id="cancel" class="danger" style="display:none">Cancel</button>
    </div>
    <div id="bar" class="bar"><i></i></div>
    <div><span id="phase" class="phase"></span><span id="elapsed" class="elapsed"></span></div>
-   <p class="mut" style="font-size:13px">Generate = correlate &amp; build the .jmx. Validate = also execute it with local JMeter and report pass/fail. Senior AI Agent = Validate plus bounded OpenAI/Gemini diagnosis, safe JSON patching, and re-verification when deterministic repair leaves failures. The final <code>.jmx</code> is always saved to <code>output\\&lt;name&gt;\\</code>.</p>
+   <p class="mut" style="font-size:13px">Generate = correlate &amp; build the .jmx. Validate = also execute it with local JMeter and report pass/fail. Senior AI Agent (one-shot) = Validate plus bounded OpenAI/Gemini diagnosis, safe JSON patching, and re-verification. Start Watch Agent = the same agent in folder-watch mode, like <code>START_AGENT.cmd</code>; stop it with Cancel. Settings are saved automatically before each run. The final <code>.jmx</code> is always saved to <code>output\\&lt;name&gt;\\</code>.</p>
    <div id="status" class="mut"></div>
   </div>
   <div class="card full">
@@ -280,6 +254,16 @@ li:last-child{border:0}.mut{color:var(--mut)}a{color:var(--acc);text-decoration:
     <label>Users<input id="cfg-users" type="number" min="1" class="sm"></label>
     <label>Ramp-up (s)<input id="cfg-ramp" type="number" min="0" class="sm"></label>
     <label>Hold (s)<input id="cfg-hold" type="number" min="0" class="sm"></label>
+    <label>Senior mode<select id="cfg-senior" style="font:inherit;background:#0e1524;border:1px solid var(--line);border-radius:8px;padding:8px 10px;color:var(--ink)"><option value="strong">strong</option><option value="mature">mature</option><option value="off">off</option></select></label>
+   </div>
+   <div class="row">
+    <label>Business objective<input id="cfg-objective" placeholder="checkout capacity / soak / certification"></label>
+    <label>Tech stack<input id="cfg-stack" placeholder="React, Spring Boot, OAuth"></label>
+   </div>
+   <div class="row">
+    <label>Domain notes<input id="cfg-domain" placeholder="business rules, cleanup, data dependencies"></label>
+    <label>p95 SLO (ms)<input id="cfg-p95" type="number" min="0" class="sm"></label>
+    <label>Error %<input id="cfg-error" type="number" min="0" class="sm"></label>
     <button id="cfg-save" class="ghost">Save settings</button>
     <span id="cfg-status" class="mut"></span>
    </div>
@@ -318,7 +302,7 @@ async function refresh(){
    const acts=[o.jmx?\`<a class="dl" href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.jmx)}">⬇ Download .jmx</a>\`:'',o.report?\`<a class="open" href="/out/\${encodeURIComponent(o.name)}/\${encodeURIComponent(o.report)}" target="_blank">Open report</a>\`:''].filter(Boolean).join('');
    return \`<li style="flex-direction:column;align-items:stretch;gap:2px"><div class="row" style="justify-content:space-between"><b>\${esc(o.name)}</b> \${t}</div>\${summary}<div class="acts">\${acts}</div><div class="mut" style="font-size:12px">saved to output\\\\\${esc(o.name)}\\\\</div></li>\`;
  }).join(''):'<li class="mut">No results yet.</li>';
- $('#gen').disabled=$('#run').disabled=$('#agent').disabled=s.busy;
+$('#gen').disabled=$('#run').disabled=$('#agent').disabled=$('#senior-agent').disabled=$('#agent-watch').disabled=s.busy;
  $('#cancel').style.display=s.busy?'':'none';
  return s;
 }
@@ -338,22 +322,32 @@ async function loadCfg(){
  $('#cfg-target').value=c.targetBaseUrl||'';$('#cfg-user').value=c.username||'';
  $('#cfg-pass').placeholder=c.hasPassword?'(saved — unchanged)':'password';
  $('#cfg-users').value=c.loadProfile.users||'';$('#cfg-ramp').value=c.loadProfile.rampUpSec||'';$('#cfg-hold').value=c.loadProfile.holdSec||'';
+ $('#cfg-senior').value=c.seniorMode||'strong';
+ $('#cfg-objective').value=c.testObjective||'';$('#cfg-stack').value=c.techStack||'';$('#cfg-domain').value=c.domainNotes||'';
+ $('#cfg-p95').value=(c.slo&&c.slo.p95Ms)||'';$('#cfg-error').value=(c.slo&&c.slo.errorRatePct)||'';
 }
-async function saveCfg(){
- const body={targetBaseUrl:$('#cfg-target').value,username:$('#cfg-user').value,password:$('#cfg-pass').value,
-   loadProfile:{users:$('#cfg-users').value,rampUpSec:$('#cfg-ramp').value,holdSec:$('#cfg-hold').value}};
- await fetch('/api/config',{method:'POST',body:JSON.stringify(body)});
- $('#cfg-pass').value='';$('#cfg-status').textContent='Saved.';setTimeout(()=>$('#cfg-status').textContent='',2500);loadCfg();
+function cfgBody(){
+ return {targetBaseUrl:$('#cfg-target').value,username:$('#cfg-user').value,password:$('#cfg-pass').value,
+   loadProfile:{users:$('#cfg-users').value,rampUpSec:$('#cfg-ramp').value,holdSec:$('#cfg-hold').value},
+   seniorMode:$('#cfg-senior').value,testObjective:$('#cfg-objective').value,techStack:$('#cfg-stack').value,
+   domainNotes:$('#cfg-domain').value,slo:{p95Ms:$('#cfg-p95').value,errorRatePct:$('#cfg-error').value}};
 }
-$('#cfg-save').onclick=saveCfg;
+async function saveCfg(quiet=false){
+ await fetch('/api/config',{method:'POST',body:JSON.stringify(cfgBody())});
+ $('#cfg-pass').value='';
+ if(!quiet){$('#cfg-status').textContent='Saved.';setTimeout(()=>$('#cfg-status').textContent='',2500)}
+ loadCfg();
+}
+$('#cfg-save').onclick=()=>saveCfg(false);
 $('#cancel').onclick=async()=>{await fetch('/api/cancel',{method:'POST'});$('#status').textContent='Cancelling…'};
 async function start(mode){
+ await saveCfg(true);
  const r=await j('/api/run?mode='+mode,{method:'POST'});
  if(r.error){$('#status').textContent=r.error;return}
  logEl.textContent='';$('#status').textContent='';
  const bar=$('#bar'),fill=bar.querySelector('i'),phaseEl=$('#phase'),elEl=$('#elapsed');
  bar.className='bar on indet';fill.style.width='8%';phaseEl.textContent='Starting…';
- const t0=Date.now();let acc='';const id=r.id;let since=0;
+ const t0=Date.now();let acc='';const id=r.id;let since=0;let lastRefresh=0;
  const tick=setInterval(()=>{if(phaseEl.textContent.indexOf('Finished')<0)elEl.textContent=((Date.now()-t0)/1000|0)+'s elapsed'},1000);
  clearInterval(poll);
  poll=setInterval(async()=>{
@@ -361,6 +355,7 @@ async function start(mode){
   if(d.lines&&d.lines.length){since=d.total;acc+=d.lines.join('\\n')+'\\n';logEl.textContent=acc;logEl.scrollTop=logEl.scrollHeight;
     const ph=phaseOf(acc);fill.style.width=Math.max(8,ph.pct)+'%';phaseEl.textContent=ph.label;
     if(ph.pct>=20)bar.classList.remove('indet');}
+  if(Date.now()-lastRefresh>4000){lastRefresh=Date.now();refresh()}
   if(d.done){clearInterval(poll);poll=null;clearInterval(tick);
     const ok=d.code===0;fill.style.width='100%';bar.className='bar on'+(ok?'':' err');
     phaseEl.textContent=ok?'Finished ✓ — see Results below':'Finished with errors (exit '+d.code+')';
@@ -370,6 +365,8 @@ async function start(mode){
 $('#gen').onclick=()=>start('generate');
 $('#run').onclick=()=>start('run');
 $('#agent').onclick=()=>start('agent');
+$('#senior-agent').onclick=()=>start('senior-agent');
+$('#agent-watch').onclick=()=>start('agent-watch');
 async function del(n){await fetch('/api/input?name='+encodeURIComponent(n),{method:'DELETE'});refresh()}
 async function upload(files){for(const f of files){await fetch('/api/upload?name='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()})}refresh()}
 const drop=$('#drop'),file=$('#file');

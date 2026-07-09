@@ -22,16 +22,17 @@ matching `.recording.xml` files, and the agent automatically groups the files,
 generates the JMX, validates it with JMeter, and asks OpenAI/Gemini for bounded
 safe fixes whenever deterministic repair still leaves failures. Keep the console
 window open; close it to stop the agent. Files are tracked by path, size, and
-modified time, so an existing input is processed once and skipped on future
-restarts unless it changes.
+  modified time. Inputs that reached GREEN/generated-success are skipped on
+  future restarts unless they change; failed Validate/Agent runs are retried up
+  to the configured failed-attempt cap.
 
 **Simple UI (Windows):** double-click **`perfscript-ui.cmd`** (or the *PerfScript
 UI* desktop shortcut). Your browser opens `http://localhost:7070` where you can
 drag-drop recordings, edit run settings (target / credentials / load profile),
-press **Generate**, **Generate + Validate**, or **Senior AI Agent**, watch the
-live log, cancel a run, and open the report / download the `.jmx`. Keep the
-console window open; close it to stop the server. (Port auto-falls-back if 7070
-is busy.)
+press **Generate**, **Generate + Validate**, **Senior AI Agent (one-shot)**,
+**Mature PE Agent**, or **Start Watch Agent**, watch the live log, cancel/stop a run, and open the report
+/ download the `.jmx`. Keep the console window open; close it to stop the
+server. (Port auto-falls-back if 7070 is busy.)
 
 **One-click validate:** double-click **`perfscript-run.cmd`** = generate + run
 through local JMeter in one shot.
@@ -46,9 +47,11 @@ watching for new inputs.
 perfscript            :: generate scripts from every HAR in input\
 perfscript --run      :: also validate with local JMeter
 perfscript --agent    :: validate + bounded AI diagnose/patch/re-verify
+perfscript --agent --senior :: mature PE mode (adds deeper business/stack/SLO evidence)
 perfscript --agent --gemini-pro :: use Gemini 3.1 Pro Preview for agent fixes
 perfscript --agent --watch :: keep watching input\ and agent-process new files
 perfscript --agent --force :: reprocess unchanged input files after code/prompt changes
+perfscript --agent --retry-failed 5 :: retry unchanged failed inputs up to 5 failed attempts
 perfscript --watch    :: process files as they appear in generate-only mode
 perfscript --memory-export memory\team-lessons.json :: export sanitized lessons
 perfscript --memory-import memory\team-lessons.json :: import teammate lessons
@@ -70,6 +73,9 @@ node index.js --agent --iterations 3
 
 # 3b) Agent mode with Gemini 3.1 Pro Preview instead of default Flash
 node index.js --agent --gemini-pro --iterations 3
+
+# 3c) Mature PE mode — add deeper objective, stack, domain, and SLO reasoning
+node index.js --agent --senior --iterations 3
 
 # 4) Watch mode — process files as they land in input/
 node index.js --watch
@@ -96,6 +102,9 @@ Output per input file lands in `output/<name>/`:
 - `<name>_parameters.json` — discovered user-input fields
 - `<name>_ghosts.json` — client-side (UUID/timestamp/trace) values + JMeter snippet
 - `<name>_polling.json` — detected polling loops (wrap in a While Controller)
+- `<name>_file_uploads.json` — multipart upload files detected from the HAR,
+  plus whether matching local files were staged from `input/`, `bin/`, or
+  configured upload search directories
 - `<name>_llm_suggestions.json` / `_llm_validation_round*.json` — AI proposals
   and strict schema-gate results (`--agent`, or `agent.enabled=true`, on failure)
 - `<name>_java_safe_*.json` — JSR223 blocks stripped before JMeter when Java-safe
@@ -107,6 +116,14 @@ Output per input file lands in `output/<name>/`:
 - `<name>_senior_pe_debrief.json` / `.md` — senior performance-engineering
   objective, flow narrative, value ledger, native-manager audit, validity gates,
   coverage estimate, and negative-space gaps
+- `<name>_domain_profile.json` — operator/domain/stack/SLO context normalized
+  into a profile and memory scope
+- `<name>_pe_analysis.json` / `.md` — post-evidence senior PE analysis of the
+  business journey, broken step, upstream cause, recommended strategy, and
+  remaining risk gaps
+- `<name>_ai_strategy.json`, `<name>_human_questions.md`, and
+  `<name>_evidence_citations.json` — bounded mature-mode strategy context,
+  specific questions, and cited evidence; these do not patch JMX or mark GREEN
 - `<name>_memory_matches.json` / `_memory_patches.json` — verified lessons the
   agent tried before AI escalation, plus what the schema-gated patcher applied
 - `<name>_learned_lessons.json` — redacted lessons saved only after green
@@ -130,6 +147,10 @@ to set things without command-line flags:
 - `gemini.proModel` — model used by `--gemini-pro`, `gemini-3.1-pro-preview`
 - `agent.enabled` — makes normal validate runs behave like `--agent`
 - `agent.maxLlmRounds` — bounded AI patch/re-verify rounds (1–3, default 1)
+- `agent.maxReplans` — bounded regenerate-with-a-different-strategy attempts
+  after repair rounds are exhausted (0–2, default 0)
+- `agent.seniorMode` — `strong` by default in agent mode; set `mature` or run
+  `--agent --senior` to add deeper objective, stack, domain, and SLO evidence
 - `agent.javaSafeMode` — strips JSR223 pre/post processors before JMeter so Java
   22+ does not hit Groovy class-version failures
 - `learning.enabled` — enables the verified learning store (default true)
@@ -138,24 +159,33 @@ to set things without command-line flags:
   schema gate and JMeter re-verification
 - `learning.storePath` — local default is `memory/verified-lessons.json`
 - `learning.exportFile` — suggested sanitized team bundle path
-- `inputState.enabled` / `inputState.storePath` — persistent tracking for files
-  already handled in `input\`, so unchanged JMX/HAR/XML inputs are skipped after
-  restart
+- `inputState.enabled` / `inputState.storePath` / `inputState.maxFailedAttempts`
+  — persistent tracking for files already handled in `input\`. GREEN/generated
+  inputs skip after restart; failed Validate/Agent inputs retry until the cap.
 - `successArchive.enabled` / `successArchive.folder` / `successArchive.keepOriginals`
   — ZIP GREEN run folders into `output/successful/` while keeping loose files
   visible by default
 - `run.targetBaseUrlOverride` / `run.credentials` / `run.dataFiles` — used by
   `--run` (credentials become `-JUSERNAME`/`-JPASSWORD`; data files are staged
   next to the JMX)
+- `run.uploadSearchDirs` — local folders to search for files referenced by
+  multipart upload steps. Defaults include `input/` and `bin/`.
 - `run.testObjective` — senior PE workload objective. Examples:
   `single-scenario certification`, `stress/capacity`, `soak/endurance`,
   `search/cache-behavior`, `spike`. If blank, the agent assumes mixed-load
   capacity and reports the assumption.
+- `run.techStack` / `run.domainNotes` / `run.businessCriticalSteps` — optional
+  mature PE context used to interpret the business journey and stack-specific
+  risks. Names are hints only; replay evidence and deterministic gates still win.
+- `run.slo.p95Ms` / `run.slo.errorRatePct` — optional performance targets used
+  in senior PE reports and scenario-gap checks.
 - `run.allowJsr223` — default `false`; keep generated JMX Java-safe by stripping
   Groovy helpers. Set `true` only when you intentionally need JSR223 and have a
   compatible JMeter/Java runtime.
 - `run.protectedCalls` / `run.disableCalls` — per-flow business samplers to
-  protect or intentional noise/plumbing to disable.
+  protect or intentional noise/plumbing to disable. `disableCalls` will not
+  remove login/session/business producers unless `run.allowUnsafeDisableProtected`
+  is deliberately set to `true`.
 - `run.parameterization.includeNames` / `excludeNames` — optional guardrails so
   CSV data is limited to business/user data, not auth/session/protocol values.
 

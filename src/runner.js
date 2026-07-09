@@ -29,6 +29,9 @@ const correlationHypotheses = require('./correlation-hypotheses');
 const statusAnalysis = require('./status-analysis');
 const finalGreenGate = require('./final-green-gate');
 const blockersModule = require('./blockers');
+const replanner = require('./replanner');
+const seniorPeAnalysis = require('./senior-pe-analysis');
+const failureForensics = require('./failure-forensics');
 const { runFeedbackLoop } = require(path.join(ENGINE_ROOT, 'src/execution/feedbackLoop'));
 const autoPatcher = require(path.join(ENGINE_ROOT, 'src/execution/autoPatcher'));
 const aiService = require(path.join(ENGINE_ROOT, 'src/services/ai-service'));
@@ -329,6 +332,7 @@ function normalizeAgentCfg(agentCfg = {}) {
     return {
         enabled: agentCfg.enabled === true,
         maxLlmRounds: clampInt(agentCfg.maxLlmRounds, 1, 3, 1),
+        maxReplans: clampInt(agentCfg.maxReplans, 0, 2, 0),
         javaSafeMode: agentCfg.javaSafeMode !== false,
     };
 }
@@ -466,6 +470,27 @@ function applyStatusRootCauseToResult(result = {}, entries = []) {
     return result;
 }
 
+function attachFailureForensics({ result = {}, entries = [], outDir, name, blueprintCtx = null, onLog = () => {} } = {}) {
+    const analysis = failureForensics.analyzeFailureForensics({
+        entries,
+        samples: result.samples || [],
+    });
+    result.failureForensics = analysis;
+    if (blueprintCtx && blueprintCtx.validation) blueprintCtx.validation.failureForensics = analysis;
+    if (outDir && name) {
+        fs.writeFileSync(path.join(outDir, `${name}_failure_forensics.json`), JSON.stringify(analysis, null, 2));
+        fs.writeFileSync(path.join(outDir, `${name}_failure_forensics.md`), failureForensics.renderFailureForensicsMarkdown(name, analysis));
+    }
+    if (analysis.rootCause) {
+        const root = analysis.rootCause;
+        const missing = analysis.authSession && analysis.authSession.missingSessionCookies && analysis.authSession.missingSessionCookies.length
+            ? `; missing session cookie(s): ${analysis.authSession.missingSessionCookies.join(', ')}`
+            : '';
+        onLog(`failure forensics: first divergence ${root.sampler} recorded ${root.recordedStatus} observed ${root.observedStatus}${missing}`);
+    }
+    return analysis;
+}
+
 function refreshBlueprintFirstFailure(ctx, result = {}) {
     if (!ctx || !ctx.loop) return null;
     if (result.statusRootCause) {
@@ -499,6 +524,10 @@ function clampNumber(value, min, max, fallback) {
     const n = Number(value);
     if (!Number.isFinite(n)) return fallback;
     return Math.min(max, Math.max(min, n));
+}
+
+function reverifyIterationBudget(config = {}) {
+    return clampInt(config.maxIterations, 1, 5, 1);
 }
 
 function resolveJMeterBinPath({ detector = jmeterDetector, homes = null } = {}) {
@@ -548,7 +577,14 @@ function summarizeBlueprintEvidence(ctx) {
     return {
         firstFailure: ctx.loop.firstFailure || null,
         statusRootCause: ctx.validation.statusRootCause || null,
+        failureForensics: ctx.validation.failureForensics ? summarizeFailureForensics(ctx.validation.failureForensics) : null,
         seniorPe: ctx.seniorPe ? summarizeSeniorPeDebrief(ctx.seniorPe) : null,
+        flowIntentAnalysis: ctx.seniorPeAnalysis ? summarizeSeniorPeAnalysis(ctx.seniorPeAnalysis) : null,
+        aiStrategy: ctx.seniorPeAiStrategy ? {
+            proposedStrategy: ctx.seniorPeAiStrategy.proposedStrategy || null,
+            questions: (ctx.seniorPeAiStrategy.questions || []).slice(0, 8),
+            evidenceCitationCount: (ctx.seniorPeAiStrategy.evidenceCitations || []).length,
+        } : null,
         lineageSummary: (ctx.lineage.links || []).slice(0, 25).map(l => ({
             variable: l.varName || l.variable,
             producer: l.producer,
@@ -556,6 +592,31 @@ function summarizeBlueprintEvidence(ctx) {
         })),
         orphanCount: (ctx.lineage.orphans || []).length,
         repairAttempts: ctx.loop.attempts || [],
+    };
+}
+
+function summarizeFailureForensics(analysis) {
+    return {
+        summary: analysis.summary || '',
+        rootCause: analysis.rootCause || null,
+        recommendedAction: analysis.recommendedAction || null,
+        missingSessionCookies: analysis.authSession && analysis.authSession.missingSessionCookies || [],
+        interactiveAuthWall: !!(analysis.redirects && analysis.redirects.interactiveAuthWall),
+        downstreamGraphqlSymptoms: analysis.graphql && Array.isArray(analysis.graphql.downstreamSymptoms)
+            ? analysis.graphql.downstreamSymptoms.length
+            : 0,
+    };
+}
+
+function summarizeSeniorPeAnalysis(analysis) {
+    return {
+        businessJourney: analysis.businessJourney,
+        brokenBusinessStep: analysis.brokenBusinessStep || null,
+        failureClass: analysis.failureClass,
+        upstreamCause: analysis.upstreamCause || null,
+        recommendedNextStrategy: analysis.recommendedNextStrategy || null,
+        riskGaps: (analysis.riskGaps || []).slice(0, 12),
+        seniorPeVerdict: analysis.seniorPeVerdict || null,
     };
 }
 
@@ -626,7 +687,7 @@ async function tryMemoryPatchRound({ result, jmxPath, config, gen, outDir, name,
         });
 
         onLog(`learning memory: applied ${patched.applied.length} verified lesson patch(es) · re-verifying before AI escalation`);
-        const result2 = await runFeedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: 1 }, gen.flat);
+        const result2 = await runFeedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: reverifyIterationBudget(config) }, gen.flat);
         const success = !!result2.success;
         return {
             result: result2,
@@ -746,7 +807,7 @@ async function tryVerifiedCorrelationRepairRound({
     });
 
     onLog(`verified correlation repair: applied ${patched.applied.length} patch(es) · re-verifying with JMeter`);
-    const result2 = await feedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: 1 }, gen.flat);
+    const result2 = await feedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: reverifyIterationBudget(config) }, gen.flat);
     const success = !!result2.success;
     if (blueprintCtx) {
         blueprintCtx.loop.patches.push({
@@ -902,7 +963,7 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
             });
 
             onLog(`LLM patcher round ${round}: applied ${patched.applied.length} / skipped ${patched.skipped.length} · re-verifying`);
-            const result2 = await runFeedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: 1 }, gen.flat);
+            const result2 = await runFeedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: reverifyIterationBudget(config) }, gen.flat);
             applyStatusRootCauseToResult(result2, gen.flat);
             const success = !!result2.success;
             rounds.push({ round, applied: patched.applied.length, skipped: patched.skipped.length, success });
@@ -1157,7 +1218,22 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
         onLog(`status root cause: ${finalResult.statusRootCause.summary}`);
     }
+    attachFailureForensics({ result: finalResult, entries: gen.flat, outDir, name, blueprintCtx, onLog });
     refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+    try {
+        blueprintCtx.seniorPeAnalysis = seniorPeAnalysis.analyzeSeniorPeFailure({
+            name,
+            seniorPeDebrief: gen.seniorPeDebrief || null,
+            result: finalResult,
+            blueprintEvidence: summarizeBlueprintEvidence(blueprintCtx),
+        });
+        seniorPeAnalysis.writeSeniorPeAnalysisArtifacts(outDir, name, blueprintCtx.seniorPeAnalysis);
+        blueprintCtx.seniorPeAiStrategy = seniorPeAnalysis.buildAiStrategy(blueprintCtx.seniorPeAnalysis);
+        seniorPeAnalysis.writeAiStrategyArtifacts(outDir, name, blueprintCtx.seniorPeAiStrategy);
+        onLog(`senior PE analysis: ${blueprintCtx.seniorPeAnalysis.failureClass} → ${blueprintCtx.seniorPeAnalysis.recommendedNextStrategy.id}`);
+    } catch (e) {
+        onLog(`senior PE analysis skipped: ${e.message}`);
+    }
     blueprintEvidence = summarizeBlueprintEvidence(blueprintCtx);
     let llmPatch = null;
     if (!finalResult.success) {
@@ -1191,10 +1267,69 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         if (finalResult.statusRootCause) {
             blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
         }
+        attachFailureForensics({ result: finalResult, entries: gen.flat, outDir, name, blueprintCtx, onLog });
         if (!verified.evaluation.ok) {
             onLog(`strict business guard after AI escalation: NOT GREEN — ${verified.evaluation.reason}`);
         }
         llmPatch = llm.llmPatch;
+    }
+
+    // ORGANIC RE-PLANNING: repair rounds patch the current script; when they
+    // are exhausted the agent changes APPROACH — it regenerates with a
+    // different strategy chosen from the failure evidence (flip state
+    // handling, fold disposables, relieve assertions) and verifies the new
+    // script like any other attempt. Bounded; every attempt recorded.
+    const replans = [];
+    if (!finalResult.success && agent.enabled) {
+        const triedStrategies = [];
+        for (let attempt = 1; attempt <= agent.maxReplans && !finalResult.success; attempt++) {
+            const strategy = replanner.proposeReplan({
+                result: finalResult,
+                runCfg: enrichedRunCfg,
+                valueFlow,
+                classification: (blueprintCtx && blueprintCtx.loop && blueprintCtx.loop.firstFailure) || null,
+                seniorPeAnalysis: blueprintCtx && blueprintCtx.seniorPeAnalysis || null,
+                tried: triedStrategies,
+            });
+            if (!strategy) { onLog('replan: no untried strategy fits the evidence'); break; }
+            triedStrategies.push(strategy.id);
+            onLog(`REPLAN ${attempt}/${agent.maxReplans}: ${strategy.id} — ${strategy.reason}`);
+            try {
+                const replanCfg = { ...enrichedRunCfg, ...strategy.runCfgPatch };
+                const replanDir = path.join(outDir, `replan_${attempt}`);
+                const gen2 = generate(entries, pages, replanDir, name, { ...genOpts, runCfg: replanCfg });
+                try {
+                    const swap = stripGuiListenersForRun(fs.readFileSync(gen2.jmxPath, 'utf8'), stableJtl);
+                    if (swap.disabled > 0) fs.writeFileSync(gen2.jmxPath, swap.xml);
+                } catch { /* keep unstripped */ }
+                applyJavaSafeGuard({ jmxPath: gen2.jmxPath, outDir: replanDir, name, label: `replan_${attempt}`, enabled: agent.javaSafeMode, onLog });
+                try { fs.rmSync(stableJtl, { force: true }); } catch { /* locked */ }
+                const result2 = await runFeedbackLoop({ ...config, jmxPath: gen2.jmxPath, maxIterations: reverifyIterationBudget(config) }, gen2.flat);
+                recoverSamplesFromJtl(result2, stableJtl, outDir, onLog);
+                const guard2 = businessGuard.buildBusinessGuard({
+                    xml: fs.readFileSync(result2.finalJmxPath || gen2.jmxPath, 'utf8'),
+                    flowName: name, runCfg: replanCfg, valueFlowDecisions: valueFlow,
+                });
+                const verified2 = applyBusinessVerification(result2, result2.finalJmxPath || gen2.jmxPath, guard2, blockedDisables);
+                applyStatusRootCauseToResult(verified2.result, gen2.flat);
+                const success = !!verified2.result.success;
+                replans.push({ attempt, strategy: strategy.id, reason: strategy.reason, evidence: strategy.evidence, success });
+                if (blueprintCtx) blueprintCtx.loop.attempts.push({ phase: 'replan', strategy: strategy.id, reason: strategy.reason, success });
+                if (success) {
+                    onLog(`REPLAN ${strategy.id} SUCCEEDED — adopting the regenerated script as final`);
+                    finalResult = verified2.result;
+                    finalJmxPath = verified2.result.finalJmxPath || gen2.jmxPath;
+                    Object.assign(enrichedRunCfg, strategy.runCfgPatch);
+                    Object.assign(gen, gen2);
+                } else {
+                    const stillFailing = (verified2.result.samples || []).filter(s => !s.isTransaction && s.success === false).length;
+                    onLog(`replan ${strategy.id} did not reach GREEN (${stillFailing} failing) — keeping evidence, trying next strategy`);
+                }
+            } catch (e) {
+                replans.push({ attempt, strategy: strategy.id, error: e.message, success: false });
+                onLog(`replan ${strategy.id} errored: ${e.message}`);
+            }
+        }
     }
 
     if (blueprintCtx) {
@@ -1264,6 +1399,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 entries: gen.flat,
                 hasSecondRecording: !!(genOpts.secondaryEntries && genOpts.secondaryEntries.length),
                 ghostsRefused: (gen.stats && gen.stats.ghostsRefused) || 0,
+                uploadFiles: gen.uploadFiles || null,
             });
             if (humanBlockers.length) {
                 fs.writeFileSync(path.join(outDir, `${name}_blockers.json`), JSON.stringify(humanBlockers, null, 2));
@@ -1274,13 +1410,18 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         } catch (e) { onLog(`blocker analysis skipped: ${e.message}`); }
     }
 
-    // 5c. JMeter HTML dashboard. Best-effort; uses the stable JTL when present
-    //     (SimpleDataWriter), otherwise the last iteration's JTL.
+    // 5c. JMeter HTML dashboard. Best-effort and opt-in; `jmeter -g` can hang
+    //     on large/XML JTLs and should never block the agent's final verdict.
     try {
-        const jtlForDash = fs.existsSync(stableJtl) ? stableJtl
-            : (baselineDiff && baselineDiff.jtlPath) || null;
-        if (jtlForDash) {
-            const dash = await generateHtmlDashboard({ jmeterBinPath, jtlPath: jtlForDash, outDir, onLog });
+        const dashboardEnabled = enrichedRunCfg.dashboard && enrichedRunCfg.dashboard.enabled === true;
+        const jtlForDash = dashboardEnabled
+            ? (fs.existsSync(stableJtl) ? stableJtl : (baselineDiff && baselineDiff.jtlPath) || null)
+            : null;
+        if (!dashboardEnabled) {
+            onLog('dashboard skipped: disabled by default; set run.dashboard.enabled=true to generate JMeter HTML dashboard');
+        } else if (jtlForDash) {
+            const timeoutMs = Number(enrichedRunCfg.dashboard && enrichedRunCfg.dashboard.timeoutMs) || 30_000;
+            const dash = await generateHtmlDashboard({ jmeterBinPath, jtlPath: jtlForDash, outDir, onLog, timeoutMs });
             if (!dash.ok) onLog(`dashboard not generated: ${dash.error}`);
         }
     } catch (e) { onLog(`dashboard skipped: ${e.message}`); }
@@ -1317,6 +1458,7 @@ module.exports = {
         applyBusinessVerification,
         recoverSamplesFromJtl,
         applyStatusRootCauseToResult,
+        attachFailureForensics,
         refreshBlueprintFirstFailure,
         applyJavaSafeGuard,
         tryVerifiedCorrelationRepairRound,

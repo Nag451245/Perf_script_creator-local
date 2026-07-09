@@ -20,6 +20,7 @@ const { writeHtmlReport } = require('../src/report');
 const { resolveAgentOptions, labelForAgentOptions } = require('../src/agent-config');
 const { sanitizeJavaUnsafeJmx } = require('../src/java-safe');
 const { flagsForRunMode } = require('../src/ui-run-mode');
+const uiConfig = require('../src/ui-config');
 const { resolveGeminiModel } = require('../src/gemini-model');
 const inputState = require('../src/input-state');
 const { archiveSuccessfulRun } = require('../src/success-archive');
@@ -27,7 +28,7 @@ const { writeFinalJmxPointer } = require('../src/final-artifact');
 const businessGuard = require('../src/business-guard');
 const { escalateToLlm, _internal: runnerInternal } = require('../src/runner');
 const learningStore = require('../src/learning-store');
-const { groupInputs } = require('../src/ingest');
+const { groupInputs, analyzeInputFiles, writeIntakeArtifacts } = require('../src/ingest');
 const goldenDiff = require('../src/golden-diff');
 const { knownDefinedVars, planExtractor, _internal: extractorsInternal } = require('../src/extractors');
 const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun, rewireClientMintedOauthVars, repairAuth0LoginStateExtractors, correlateFormHiddenInputs } = require('../src/transforms');
@@ -52,6 +53,12 @@ const semanticResponse = require('../src/semantic-response');
 const finalGreenGate = require('../src/final-green-gate');
 const requestDiff = require('../src/request-diff');
 const seniorPe = require('../src/senior-pe');
+const seniorPeAnalysis = require('../src/senior-pe-analysis');
+const failureForensics = require('../src/failure-forensics');
+const replanner = require('../src/replanner');
+const domainKnowledge = require('../src/domain-knowledge');
+const uploadFiles = require('../src/upload-files');
+const runProgress = require('../src/run-progress');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
 function listenLocal(server) {
@@ -73,6 +80,37 @@ function entry(method, url, extra = {}) {
     };
 }
 const har = (entries) => ({ log: { version: '1.2', creator: { name: 't', version: '1' }, entries } });
+function jmxXml(requests) {
+    const samplers = requests.map((r, i) => `
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="Step ${String(i + 1).padStart(2, '0')} - ${r.method} ${r.path}" enabled="true">
+            <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+              <collectionProp name="Arguments.arguments"/>
+            </elementProp>
+            <stringProp name="HTTPSampler.domain">${r.domain || 'app.test'}</stringProp>
+            <stringProp name="HTTPSampler.protocol">${r.protocol || 'https'}</stringProp>
+            <stringProp name="HTTPSampler.path">${r.path}</stringProp>
+            <stringProp name="HTTPSampler.method">${r.method}</stringProp>
+          </HTTPSamplerProxy>
+          <hashTree/>`).join('');
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="Test Plan" enabled="true"/>
+    <hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Thread Group" enabled="true"/>
+      <hashTree>${samplers}
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>`;
+}
+function jtlXml(samples) {
+    const rows = samples.map(s => {
+        const u = new URL(s.url);
+        return `<httpSample t="10" ts="1760000000000" s="true" lb="${s.method} ${u.pathname}" rc="200" rm="OK" dt="text" by="10" ng="1" na="1"><java.net.URL>${s.url}</java.net.URL></httpSample>`;
+    }).join('');
+    return `<testResults version="1.2">${rows}</testResults>`;
+}
 
 test('parameterization: user-input fields become a CSV Data Set + ${var} substitution', () => {
     const { entries, pages } = parse(har([
@@ -517,6 +555,107 @@ test('blockers: terminal failures translate to precise human asks', () => {
     assert.deepStrictEqual(deriveBlockers({ result: { success: true, samples: [] } }), []);
 });
 
+test('blockers: failure forensics creates exact auth/session human ask', () => {
+    const { deriveBlockers } = require('../src/blockers');
+    const blockers = deriveBlockers({
+        result: {
+            success: false,
+            samples: [{ label: 'Step 03 - GraphQL GetCurrentUser', success: false, responseCode: '401' }],
+            failureForensics: {
+                rootCause: {
+                    sampler: 'Step 02 - GET /authorize/resume',
+                    recordedStatus: 302,
+                    observedStatus: 401,
+                    category: 'auth_or_session_correlation_failed',
+                },
+                recommendedAction: { id: 'provide-test-auth-path' },
+                authSession: { missingSessionCookies: ['stgapp_sess'] },
+                redirects: { interactiveAuthWall: true },
+                graphql: { downstreamSymptoms: [{ sampler: 'Step 03 - GraphQL GetCurrentUser' }] },
+            },
+        },
+    });
+
+    const blocker = blockers.find(b => b.id === 'auth-session-forensics');
+    assert.ok(blocker);
+    assert.match(blocker.blocker, /Step 02 - GET \/authorize\/resume/);
+    assert.match(blocker.blocker, /recorded 302.*observed 401/);
+    assert.match(blocker.ask, /test-friendly login path|non-MFA account|browser-captured session|API token/);
+    assert.match(blocker.evidence, /stgapp_sess/);
+    assert.match(blocker.evidence, /GraphQL.*downstream symptom/);
+});
+
+test('blockers: failure forensics keeps first 5xx as environment ask', () => {
+    const { deriveBlockers } = require('../src/blockers');
+    const blockers = deriveBlockers({
+        result: {
+            success: false,
+            samples: [{ label: 'Step 04 - POST /api/save', success: false, responseCode: '503' }],
+            failureForensics: {
+                rootCause: {
+                    sampler: 'Step 04 - POST /api/save',
+                    recordedStatus: 200,
+                    observedStatus: 503,
+                    category: 'server_error_after_replay_request',
+                },
+                recommendedAction: { id: 'fix-environment' },
+                authSession: { missingSessionCookies: [] },
+                redirects: { interactiveAuthWall: false },
+                graphql: { downstreamSymptoms: [] },
+            },
+        },
+    });
+
+    const blocker = blockers.find(b => b.id === 'environment-forensics');
+    assert.ok(blocker);
+    assert.match(blocker.blocker, /recorded 200.*observed 503/);
+    assert.match(blocker.ask, /validate staging manually/i);
+});
+
+test('blockers: missing upload file is a precise human ask', () => {
+    const { deriveBlockers } = require('../src/blockers');
+    const blockers = deriveBlockers({
+        result: {
+            success: false,
+            samples: [{ label: 'Step 49 - POST /edoc/temporal-file/save', success: false, responseCode: '422' }],
+        },
+        uploadFiles: {
+            missing: [{ fileName: 'sample.pdf', fieldName: 'file', samplerLabel: 'Step 49 - POST /edoc/temporal-file/save' }],
+        },
+    });
+
+    const upload = blockers.find(b => b.id === 'upload-file');
+    assert.ok(upload);
+    assert.match(upload.ask, /sample\.pdf/);
+    assert.match(upload.ask, /input/);
+    assert.match(upload.ask, /bin/);
+});
+
+test('blockers: ambiguous upload candidates ask for selection instead of claiming missing', () => {
+    const { deriveBlockers } = require('../src/blockers');
+    const blockers = deriveBlockers({
+        result: {
+            success: false,
+            samples: [{ label: 'Step 49 - POST /edoc/temporal-file/save', success: false, responseCode: '422' }],
+        },
+        uploadFiles: {
+            missing: [{
+                fileName: 'recorded-name.pdf',
+                fieldName: 'file',
+                samplerLabel: 'Step 49 - POST /edoc/temporal-file/save',
+                reason: 'ambiguous-compatible-file',
+                candidateNames: ['first.pdf', 'second.pdf'],
+            }],
+        },
+    });
+
+    const upload = blockers.find(b => b.id === 'upload-file');
+    assert.ok(upload);
+    assert.match(upload.ask, /Choose the correct file/);
+    assert.match(upload.ask, /first\.pdf/);
+    assert.match(upload.ask, /second\.pdf/);
+});
+
 test('scenario designer: Little\'s Law from objective to threads/pacing/data pool', () => {
     const { designScenario, insertPacingTimers } = require('../src/scenario');
     const entries = [
@@ -533,6 +672,8 @@ test('scenario designer: Little\'s Law from objective to threads/pacing/data poo
     const pt = insertPacingTimers(xml, s.pacing);
     assert.strictEqual(pt.inserted, 1);
     assert.match(pt.xml, /PreciseThroughputTimer/);
+    assert.match(pt.xml, /<\/TestAction>\s*<hashTree\/>\s*<PreciseThroughputTimer/,
+        'pacing timer must be a ThreadGroup-scope sibling, not nested under the pacing anchor');
     // No scenario config → no plan; explicit loadProfile is never touched here.
     assert.strictEqual(designScenario({ entries, runCfg: {} }), null);
 });
@@ -725,6 +866,50 @@ test('runner learning config: defaults to local verified memory with confidence 
     assert.strictEqual(disabled.storePath, 'custom.json');
 });
 
+test('runner agent config: preserves bounded replan budget', () => {
+    const cfg = runnerInternal.normalizeAgentCfg({ enabled: true, maxReplans: 2 });
+    assert.strictEqual(cfg.enabled, true);
+    assert.strictEqual(cfg.maxReplans, 2);
+
+    const clamped = runnerInternal.normalizeAgentCfg({ enabled: true, maxReplans: 99 });
+    assert.strictEqual(clamped.maxReplans, 2);
+});
+
+test('replanner: senior PE native-manager correction is evidence gated and bounded', () => {
+    const result = {
+        success: false,
+        samples: [{ label: 'Step 02 - GET /me', success: false, responseCode: '401' }],
+    };
+    const seniorPe = {
+        recommendedNextStrategy: { id: 'native-manager-correction' },
+        nativeManagerFindings: [{ manager: 'HTTP Cookie Manager', decision: 'required' }],
+    };
+
+    const first = replanner.proposeReplan({ result, seniorPeAnalysis: seniorPe, tried: [] });
+    const skipped = replanner.proposeReplan({ result, seniorPeAnalysis: seniorPe, tried: ['native-manager-correction'] });
+
+    assert.strictEqual(first.id, 'native-manager-correction');
+    assert.strictEqual(first.runCfgPatch.forceNativeManagers.cookie, true);
+    assert.strictEqual(skipped, null);
+});
+
+test('replanner: senior PE scenario gap warning does not mutate JMX strategy knobs', () => {
+    const result = {
+        success: false,
+        samples: [{ label: 'Step 05 - POST /orders', success: false, responseCode: '500' }],
+    };
+    const seniorPe = {
+        recommendedNextStrategy: { id: 'scenario-gap-warning' },
+        riskGaps: [{ gap: 'workload_model_missing', severity: 'high', action: 'Provide transactions per hour and data volume.' }],
+    };
+
+    const strategy = replanner.proposeReplan({ result, seniorPeAnalysis: seniorPe, tried: [] });
+
+    assert.strictEqual(strategy.id, 'scenario-gap-warning');
+    assert.deepStrictEqual(strategy.runCfgPatch, {});
+    assert.match(strategy.reason, /workload/i);
+});
+
 test('Gemini model resolver: defaults to 3.5 Flash and supports 3.1 Pro switch', () => {
     assert.strictEqual(resolveGeminiModel([], {}, {}), 'gemini-3.5-flash');
     assert.strictEqual(resolveGeminiModel(['--gemini-pro'], {}, {}), 'gemini-3.1-pro-preview');
@@ -750,6 +935,79 @@ test('input state: unchanged files are skipped after being processed once', () =
     fs.writeFileSync(input, 'second-version-with-different-size');
     state = inputState.loadProcessedState(statePath);
     assert.strictEqual(inputState.shouldProcessUnit(unit, state), true);
+});
+
+test('input state: unchanged failed runs retry until max failed attempts', () => {
+    const dir = tmp();
+    const statePath = path.join(dir, 'processed-inputs.json');
+    const input = path.join(dir, 'login.jmx');
+    fs.writeFileSync(input, 'same-version');
+
+    const unit = { kind: 'single', primary: input };
+    let state = inputState.loadProcessedState(statePath);
+
+    inputState.markUnitProcessed(unit, state, statePath, { success: false, verdict: 'needs attention' });
+    state = inputState.loadProcessedState(statePath);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, state, { maxFailedAttempts: 3 }), true);
+
+    inputState.markUnitProcessed(unit, state, statePath, { success: false, verdict: 'needs attention' });
+    state = inputState.loadProcessedState(statePath);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, state, { maxFailedAttempts: 3 }), true);
+
+    inputState.markUnitProcessed(unit, state, statePath, { success: false, verdict: 'needs attention' });
+    state = inputState.loadProcessedState(statePath);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, state, { maxFailedAttempts: 3 }), false);
+
+    inputState.markUnitProcessed(unit, state, statePath, { success: true, verdict: 'GREEN' });
+    state = inputState.loadProcessedState(statePath);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, state, { maxFailedAttempts: 3 }), false);
+});
+
+test('input state: legacy hash-only records can be reprocessed once for verdict migration', () => {
+    const dir = tmp();
+    const statePath = path.join(dir, 'processed-inputs.json');
+    const input = path.join(dir, 'login.jmx');
+    fs.writeFileSync(input, 'same-version');
+    const unit = { kind: 'single', primary: input };
+    const state = inputState.loadProcessedState(statePath);
+    const sig = inputState.markUnitProcessed(unit, state, statePath);
+    const legacyState = inputState.loadProcessedState(statePath);
+    legacyState.units[sig.id] = sig.hash;
+
+    assert.strictEqual(inputState.shouldProcessUnit(unit, legacyState), false);
+    assert.strictEqual(inputState.shouldProcessUnit(unit, legacyState, { reprocessLegacy: true }), true);
+});
+
+test('run progress: summarizes live JMeter artifacts for console heartbeat', () => {
+    const out = tmp();
+    const iter = path.join(out, 'iteration_1');
+    fs.mkdirSync(iter, { recursive: true });
+    fs.writeFileSync(path.join(iter, 'run.log'), '2026-07-09 INFO started\n2026-07-09 WARN still running\n');
+    fs.writeFileSync(path.join(iter, 'results.jtl'), '<testResults><httpSample s="true"/><httpSample s="false"/></testResults>');
+    fs.writeFileSync(path.join(out, 'final.jtl'), '<testResults><httpSample/></testResults>');
+
+    const summary = runProgress.summarizeRunProgress(out);
+
+    assert.match(summary, /iteration_1/);
+    assert.match(summary, /results.jtl/);
+    assert.match(summary, /2 sample/);
+    assert.match(summary, /last: 2026-07-09 WARN still running/);
+});
+
+test('run progress: repeated CookieManager warnings do not count as new progress', () => {
+    const out = tmp();
+    const iter = path.join(out, 'iteration_1');
+    fs.mkdirSync(iter, { recursive: true });
+    fs.writeFileSync(path.join(iter, 'results.jtl'), '<testResults><httpSample s="true"/></testResults>');
+    fs.writeFileSync(path.join(out, 'final.jtl'), '<testResults><httpSample/></testResults>');
+    const logPath = path.join(iter, 'run.log');
+    fs.writeFileSync(logPath, '2026-07-09 12:33:35,766 WARN o.a.j.p.h.s.HTTPSamplerBase: Existing CookieManager HTTP Cookie Manager superseded by HTTP Cookie Manager\n');
+    const first = runProgress.snapshotRunProgress(out);
+    fs.writeFileSync(logPath, '2026-07-09 12:33:45,749 WARN o.a.j.p.h.s.HTTPSamplerBase: Existing CookieManager HTTP Cookie Manager superseded by HTTP Cookie Manager\n');
+    const second = runProgress.snapshotRunProgress(out);
+
+    assert.strictEqual(first.key, second.key);
+    assert.match(first.summary, /CookieManager/);
 });
 
 test('success archive: GREEN output folder is zipped while loose files stay readable', () => {
@@ -830,6 +1088,43 @@ test('business guard: protects first-party mutating business samplers from disab
     assert.deepStrictEqual(filtered.blocked.map(s => s.samplerLabel), ['Step 01 - POST /tasks']);
 });
 
+test('business guard: classifies value-flow producers as dependencies, not business actions', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /auth" enabled="true">
+    <stringProp name="HTTPSampler.domain">app.test</stringProp>
+    <stringProp name="HTTPSampler.path">/auth</stringProp>
+    <stringProp name="HTTPSampler.method">GET</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - POST /tasks" enabled="true">
+    <stringProp name="HTTPSampler.domain">app.test</stringProp>
+    <stringProp name="HTTPSampler.path">/tasks</stringProp>
+    <stringProp name="HTTPSampler.method">POST</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const valueFlow = {
+        bySampler: {
+            'Step 01 - GET /auth': { consumedOutputCount: 1 },
+        },
+    };
+    const guard = businessGuard.buildBusinessGuard({ xml, flowName: 'createtask', valueFlowDecisions: valueFlow });
+    const auth = guard.protectedSamplers.find(s => s.name === 'Step 01 - GET /auth');
+    const task = guard.protectedSamplers.find(s => s.name === 'Step 02 - POST /tasks');
+
+    assert.strictEqual(auth.category, 'dependency');
+    assert.strictEqual(task.category, 'business');
+
+    const result = {
+        success: true,
+        samples: [
+            { label: 'Step 01 - GET /auth', success: true, responseCode: '200' },
+            { label: 'Step 02 - POST /tasks', success: true, responseCode: '200' },
+        ],
+    };
+    const evaluation = businessGuard.evaluateBusinessResult({ result, xml, guard });
+    assert.match(evaluation.reason, /1 business-critical/);
+    assert.match(evaluation.reason, /1 required dependenc/);
+});
+
 test('LLM schema gate: rejects disabling ambiguous first-party root samplers', () => {
     const validation = {
         accepted: [
@@ -871,7 +1166,24 @@ test('agent config: --agent implies validate mode with safe bounded defaults', (
     assert.strictEqual(opts.doRun, true);
     assert.strictEqual(opts.agent.enabled, true);
     assert.strictEqual(opts.agent.maxLlmRounds, 1);
+    assert.strictEqual(opts.agent.maxReplans, 0);
     assert.strictEqual(opts.agent.javaSafeMode, true);
+    assert.strictEqual(opts.agent.seniorMode, 'strong');
+});
+
+test('agent config: senior mode is opt-in beyond strong defaults and clamps invalid values', () => {
+    assert.strictEqual(resolveAgentOptions(['--run'], {}).agent.seniorMode, 'off');
+    assert.strictEqual(resolveAgentOptions(['--agent'], { agent: { seniorMode: 'mature' } }).agent.seniorMode, 'mature');
+    assert.strictEqual(resolveAgentOptions(['--agent'], { agent: { seniorMode: 'unknown' } }).agent.seniorMode, 'strong');
+    assert.strictEqual(resolveAgentOptions(['--agent', '--senior'], {}).agent.seniorMode, 'mature');
+});
+
+test('agent config: configured replan budget reaches runner options', () => {
+    const opts = resolveAgentOptions(['--agent'], { agent: { maxReplans: 2 } });
+    assert.strictEqual(opts.agent.maxReplans, 2);
+
+    const clamped = resolveAgentOptions(['--agent'], { agent: { maxReplans: 99 } });
+    assert.strictEqual(clamped.agent.maxReplans, 2);
 });
 
 test('agent config: --agent overrides config false, --run is deterministic by default', () => {
@@ -891,14 +1203,49 @@ test('agent config: --agent overrides config false, --run is deterministic by de
 test('agent config labels watch mode clearly', () => {
     assert.strictEqual(labelForAgentOptions(resolveAgentOptions([], {}), false), 'generate only');
     assert.strictEqual(labelForAgentOptions(resolveAgentOptions(['--run'], {}), true), 'generate + run/validate (watch)');
-    assert.strictEqual(labelForAgentOptions(resolveAgentOptions(['--agent'], {}), true), 'agent validate (watch)');
+    assert.strictEqual(labelForAgentOptions(resolveAgentOptions(['--agent'], {}), true), 'strong senior PE agent validate (watch)');
+    assert.strictEqual(labelForAgentOptions(resolveAgentOptions(['--agent', '--senior'], {}), false), 'mature senior PE agent validate');
 });
 
 test('UI run modes map to the expected CLI flags', () => {
     assert.deepStrictEqual(flagsForRunMode('generate'), []);
     assert.deepStrictEqual(flagsForRunMode('run'), ['--run']);
     assert.deepStrictEqual(flagsForRunMode('agent'), ['--agent']);
+    assert.deepStrictEqual(flagsForRunMode('senior-agent'), ['--agent', '--senior']);
+    assert.deepStrictEqual(flagsForRunMode('agent-watch'), ['--agent', '--watch']);
     assert.deepStrictEqual(flagsForRunMode('unexpected'), []);
+});
+
+test('UI config: round-trips senior PE context without dropping existing keys', () => {
+    const existing = {
+        gemini: { apiKey: 'keep' },
+        agent: { enabled: false, maxLlmRounds: 1 },
+        run: { targetBaseUrlOverride: 'https://old.test', credentials: { password: 'secret' } },
+    };
+    const updated = uiConfig.writeConfigFromUiObject(existing, {
+        targetBaseUrl: 'https://stage.test',
+        username: 'alice',
+        password: '',
+        loadProfile: { users: '5', rampUpSec: '10', holdSec: '60' },
+        testObjective: 'checkout capacity',
+        techStack: 'React + Spring Boot + OAuth',
+        domainNotes: 'Orders must be unique and cleanup is required.',
+        slo: { p95Ms: '750', errorRatePct: '1' },
+        seniorMode: 'mature',
+    });
+    const ui = uiConfig.readConfigForUiObject(updated);
+
+    assert.strictEqual(updated.gemini.apiKey, 'keep');
+    assert.strictEqual(updated.run.credentials.password, 'secret');
+    assert.strictEqual(updated.run.testObjective, 'checkout capacity');
+    assert.deepStrictEqual(updated.run.techStack, ['React', 'Spring Boot', 'OAuth']);
+    assert.deepStrictEqual(updated.run.domainNotes, ['Orders must be unique and cleanup is required.']);
+    assert.deepStrictEqual(updated.run.slo, { p95Ms: 750, errorRatePct: 1 });
+    assert.strictEqual(updated.agent.seniorMode, 'mature');
+    assert.strictEqual(ui.testObjective, 'checkout capacity');
+    assert.strictEqual(ui.techStack, 'React, Spring Boot, OAuth');
+    assert.strictEqual(ui.domainNotes, 'Orders must be unique and cleanup is required.');
+    assert.strictEqual(ui.slo.p95Ms, 750);
 });
 
 test('java-safe JMX sanitizer strips JSR223 pre/post processors and reports them', () => {
@@ -950,6 +1297,40 @@ test('generate: shipped JMX is Java-safe for manual JMeter runs', () => {
     assert.ok(fs.existsSync(path.join(out, 'manualsafe_java_safe_generate.json')), 'should report stripped JSR223 blocks');
 });
 
+test('generate: forceNativeManagers injects native JMeter HTTP managers', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/login', {
+            resHeaders: [{ name: 'Set-Cookie', value: 'sid=abc; Path=/; HttpOnly' }],
+        }),
+        entry('GET', 'https://app.test/me', {
+            reqHeaders: [
+                { name: 'Cookie', value: 'sid=abc' },
+                { name: 'Authorization', value: 'Bearer recorded-token' },
+            ],
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'native-managers', {
+        runCfg: {
+            forceNativeManagers: {
+                cookie: true,
+                cache: true,
+                authorization: true,
+                redirects: true,
+            },
+        },
+    });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+
+    assert.match(xml, /<CookieManager\b[\s\S]*testname="HTTP Cookie Manager"/);
+    assert.match(xml, /<CacheManager\b[\s\S]*testname="HTTP Cache Manager"/);
+    assert.match(xml, /<AuthManager\b[\s\S]*testname="HTTP Authorization Manager"/);
+    assert.doesNotMatch(xml, /<stringProp name="Header\.name">Cookie<\/stringProp>/);
+    assert.ok((xml.match(/<boolProp name="HTTPSampler\.follow_redirects">true<\/boolProp>/g) || []).length >= 2);
+    assert.ok(gen.nativeManagers, 'forceNativeManagers should report the native-manager changes it applied');
+    assert.deepStrictEqual(gen.nativeManagers.applied.sort(), ['authorization', 'cache', 'cookie', 'redirects']);
+});
+
 test('generate: GraphQL query text is not parameterized as test data', () => {
     const gql = 'query GetCurrentUser { currentUser { id name } }';
     const { entries, pages } = parse(har([
@@ -965,6 +1346,147 @@ test('generate: GraphQL query text is not parameterized as test data', () => {
         const params = JSON.parse(fs.readFileSync(paramsPath, 'utf8'));
         assert.ok(!params.some(p => p.name === 'query'), 'GraphQL query/mutation documents must not be CSV-parameterized');
     }
+});
+
+test('generate: multipart upload files are discovered, staged, and mapped into JMX', () => {
+    const fixtures = tmp();
+    fs.writeFileSync(path.join(fixtures, 'sample.pdf'), 'fake-pdf');
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/edoc/temporal-file/save', {
+            reqHeaders: [{ name: 'Content-Type', value: 'multipart/form-data; boundary=----abc' }],
+            postData: {
+                mimeType: 'multipart/form-data',
+                params: [
+                    { name: 'file', fileName: 'sample.pdf', contentType: 'application/pdf' },
+                    { name: 'documentType', value: 'progress-note' },
+                ],
+            },
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'upload', { uploadSearchDirs: [fixtures] });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+
+    assert.match(xml, /<stringProp name="File\.path">test_files\/sample\.pdf<\/stringProp>/);
+    assert.ok(fs.existsSync(path.join(out, 'test_files', 'sample.pdf')), 'upload file should be staged next to the JMX');
+    assert.strictEqual(gen.uploadFiles.matched.length, 1);
+    assert.strictEqual(gen.uploadFiles.missing.length, 0);
+    assert.ok(fs.existsSync(path.join(out, 'upload_file_uploads.json')));
+});
+
+test('generate: multipart upload filename drift maps to the compatible local file', () => {
+    const fixtures = tmp();
+    fs.writeFileSync(path.join(fixtures, 'actual-upload.pdf'), 'fake-pdf');
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/edoc/temporal-file/save', {
+            reqHeaders: [{ name: 'Content-Type', value: 'multipart/form-data; boundary=----abc' }],
+            postData: {
+                mimeType: 'multipart/form-data',
+                params: [
+                    { name: 'file', fileName: 'recorded-name.pdf', contentType: 'application/pdf' },
+                ],
+            },
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'upload-drift', { uploadSearchDirs: [fixtures] });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+
+    assert.match(xml, /<stringProp name="File\.path">test_files\/actual-upload\.pdf<\/stringProp>/);
+    assert.ok(fs.existsSync(path.join(out, 'test_files', 'actual-upload.pdf')));
+    assert.strictEqual(gen.uploadFiles.matched[0].fileName, 'recorded-name.pdf');
+    assert.strictEqual(gen.uploadFiles.matched[0].stagedName, 'actual-upload.pdf');
+});
+
+test('generate: raw multipart body filename is detected and staged', () => {
+    const fixtures = tmp();
+    fs.writeFileSync(path.join(fixtures, 'PdfUpload2.pdf'), 'fake-pdf');
+    const body = [
+        '------WebKitFormBoundaryabc',
+        'Content-Disposition: form-data; name="file"; filename="PdfUpload2.pdf"',
+        'Content-Type: application/pdf',
+        '',
+        '%PDF-1.4 fake',
+        '------WebKitFormBoundaryabc--',
+        '',
+    ].join('\r\n');
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/edoc/temporal-file/save', {
+            reqHeaders: [{ name: 'Content-Type', value: 'multipart/form-data; boundary=----WebKitFormBoundaryabc' }],
+            postData: {
+                mimeType: 'multipart/form-data',
+                text: body,
+            },
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'upload-raw-multipart', { uploadSearchDirs: [fixtures] });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+
+    assert.match(xml, /<stringProp name="File\.path">test_files\/PdfUpload2\.pdf<\/stringProp>/);
+    assert.ok(fs.existsSync(path.join(out, 'test_files', 'PdfUpload2.pdf')));
+    assert.strictEqual(gen.uploadFiles.matched[0].fileName, 'PdfUpload2.pdf');
+});
+
+test('generate: ambiguous compatible upload files are reported instead of guessed', () => {
+    const fixtures = tmp();
+    fs.writeFileSync(path.join(fixtures, 'first.pdf'), 'fake-pdf-1');
+    fs.writeFileSync(path.join(fixtures, 'second.pdf'), 'fake-pdf-2');
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/edoc/temporal-file/save', {
+            reqHeaders: [{ name: 'Content-Type', value: 'multipart/form-data; boundary=----abc' }],
+            postData: {
+                mimeType: 'multipart/form-data',
+                params: [
+                    { name: 'file', fileName: 'recorded-name.pdf', contentType: 'application/pdf' },
+                ],
+            },
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'upload-ambiguous', { uploadSearchDirs: [fixtures] });
+
+    assert.strictEqual(gen.uploadFiles.matched.length, 0);
+    assert.strictEqual(gen.uploadFiles.missing[0].reason, 'ambiguous-compatible-file');
+    assert.deepStrictEqual(gen.uploadFiles.missing[0].candidateNames.sort(), ['first.pdf', 'second.pdf']);
+    assert.deepStrictEqual(gen.uploadFiles.fileMappings, {}, 'ambiguous files must not be mapped into the JMX');
+});
+
+test('upload files: missing upload does not create a file mapping', () => {
+    const { entries } = parse(har([
+        entry('POST', 'https://app.test/upload', {
+            reqHeaders: [{ name: 'Content-Type', value: 'multipart/form-data; boundary=----abc' }],
+            postData: {
+                mimeType: 'multipart/form-data',
+                params: [{ name: 'file', fileName: 'missing.pdf', contentType: 'application/pdf' }],
+            },
+        }),
+    ]));
+    const out = tmp();
+    const plan = uploadFiles.resolveAndStageUploads({ entries, searchDirs: [tmp()], outDir: out });
+
+    assert.strictEqual(plan.matched.length, 0);
+    assert.strictEqual(plan.missing[0].reason, 'not-found');
+    assert.deepStrictEqual(plan.fileMappings, {});
+});
+
+test('upload files: lone wrong-type support file is not used as upload bytes', () => {
+    const fixtures = tmp();
+    fs.writeFileSync(path.join(fixtures, 'only-document.docx'), 'not a pdf');
+    const { entries } = parse(har([
+        entry('POST', 'https://app.test/upload', {
+            reqHeaders: [{ name: 'Content-Type', value: 'multipart/form-data; boundary=----abc' }],
+            postData: {
+                mimeType: 'multipart/form-data',
+                params: [{ name: 'file', fileName: 'recorded.pdf', contentType: 'application/pdf' }],
+            },
+        }),
+    ]));
+    const plan = uploadFiles.resolveAndStageUploads({ entries, searchDirs: [fixtures], outDir: tmp() });
+
+    assert.strictEqual(plan.matched.length, 0);
+    assert.strictEqual(plan.missing[0].reason, 'not-found');
+    assert.deepStrictEqual(plan.fileMappings, {});
 });
 
 test('parameterization policy: excludes protocol/auth/session fields from CSV candidates', () => {
@@ -1016,6 +1538,44 @@ test('senior PE debrief: reconstructs objective, flow, value ledger, native mana
     assert.ok(debrief.negativeSpace.some(g => /token expiry/i.test(g.gap)));
 });
 
+test('domain knowledge: builds stack, SLO, and persistence keys from local evidence', () => {
+    const entries = [entry('POST', 'https://app.test/orders')];
+    const profile = domainKnowledge.buildDomainProfile({
+        name: 'checkout',
+        entries,
+        runCfg: {
+            techStack: ['React', 'Spring Boot', 'OAuth'],
+            domainNotes: ['Orders require cleanup after test runs.'],
+            businessCriticalSteps: ['submit/update business data'],
+            slo: { p95Ms: 750, errorRatePct: 1 },
+        },
+        verifiedLessons: [{ id: 'vls_1', stackFingerprint: [{ stack: 'OAuth/OIDC' }] }],
+    });
+
+    assert.strictEqual(profile.applicationKey, 'app.test');
+    assert.deepStrictEqual(profile.businessCriticalSteps, ['submit/update business data']);
+    assert.ok(profile.stackProfile.signals.some(s => s.stack === 'Spring Boot'));
+    assert.deepStrictEqual(profile.slo, { p95Ms: 750, errorRatePct: 1 });
+    assert.ok(profile.memoryScope.includes('app.test'));
+    assert.strictEqual(profile.verifiedLessonCount, 1);
+});
+
+test('senior PE debrief: includes mature SLO and workload readiness gates', () => {
+    const debrief = seniorPe.buildSeniorPeDebrief({
+        name: 'orders',
+        entries: [entry('POST', 'https://app.test/orders')],
+        runCfg: {
+            testObjective: 'checkout capacity',
+            slo: { p95Ms: 750, errorRatePct: 1 },
+            techStack: ['React', 'Spring Boot'],
+        },
+    });
+
+    assert.ok(debrief.domainProfile);
+    assert.ok(debrief.validityGates.some(g => g.gate === 'performance_slo' && g.status === 'review'));
+    assert.ok(debrief.negativeSpace.some(g => g.gap === 'workload model missing'));
+});
+
 test('generate: writes senior PE debrief artifacts for reviewer and AI context', () => {
     const { entries, pages } = parse(har([
         entry('GET', 'https://app.test/login', { body: '<html><input name="csrf" value="csrfRecorded1234"></html>' }),
@@ -1033,6 +1593,270 @@ test('generate: writes senior PE debrief artifacts for reviewer and AI context',
     assert.ok(fs.existsSync(path.join(out, 'senior_senior_pe_debrief.json')));
     assert.ok(fs.existsSync(path.join(out, 'senior_senior_pe_debrief.md')));
     assert.strictEqual(gen.seniorPeDebrief.objective.assumed, false);
+});
+
+test('generate: writes mature domain profile artifact when PE context is provided', () => {
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://app.test/orders'),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'domain', {
+        runCfg: {
+            testObjective: 'checkout capacity',
+            techStack: ['React', 'Spring Boot'],
+            domainNotes: ['Orders require cleanup.'],
+            slo: { p95Ms: 750, errorRatePct: 1 },
+        },
+    });
+
+    assert.ok(gen.domainProfile);
+    assert.ok(fs.existsSync(path.join(out, 'domain_domain_profile.json')));
+    assert.strictEqual(gen.domainProfile.slo.p95Ms, 750);
+});
+
+test('senior PE analysis: identifies broken business step from status drift evidence', () => {
+    const debrief = {
+        objective: { value: 'checkout capacity', assumed: false },
+        flow: {
+            narrative: 'authenticate -> submit/update business data',
+            businessSteps: [
+                { name: 'authenticate', startIndex: 0, endIndex: 1, samplers: ['Step 01 - GET /login', 'Step 02 - POST /login'] },
+                { name: 'submit/update business data', startIndex: 2, endIndex: 2, samplers: ['Step 03 - POST /orders'] },
+            ],
+        },
+        stackFingerprint: { signals: [{ stack: 'OAuth/OIDC', evidence: 'client_id parameter' }] },
+        negativeSpace: [{ gap: 'setup/teardown and data exhaustion', severity: 'high', action: 'Confirm unique orders.' }],
+        nativeManagers: [{ manager: 'HTTP Cookie Manager', decision: 'required' }],
+        validityGates: [{ gate: 'business_content_assertions', status: 'review' }],
+        coverage: { dynamicValueCoveragePct: 80 },
+    };
+    const analysis = seniorPeAnalysis.analyzeSeniorPeFailure({
+        name: 'checkout',
+        seniorPeDebrief: debrief,
+        result: {
+            statusRootCause: {
+                summary: 'Step 03 - POST /orders drifted from recorded 201 to live 403',
+                rootCauseIndex: 2,
+                rootCause: {
+                    sampler: 'Step 03 - POST /orders',
+                    expected: '201',
+                    observed: '403',
+                    category: 'status_drift',
+                    repairHint: 'Repair upstream auth/session before patching order submit.',
+                },
+            },
+        },
+        blueprintEvidence: { firstFailure: { category: 'auth_correlation_failed', sampler: 'Step 03 - POST /orders' } },
+    });
+
+    assert.strictEqual(analysis.businessJourney, 'authenticate -> submit/update business data');
+    assert.strictEqual(analysis.brokenBusinessStep.name, 'submit/update business data');
+    assert.strictEqual(analysis.upstreamCause.category, 'status_drift');
+    assert.strictEqual(analysis.recommendedNextStrategy.id, 'repair-earliest-upstream-drift');
+    assert.ok(analysis.riskGaps.some(g => /setup\/teardown/i.test(g.gap)));
+});
+
+test('senior PE analysis: classifies auth/session failures separately from business endpoint defects', () => {
+    const base = {
+        objective: { value: 'login certification', assumed: false },
+        flow: {
+            narrative: 'authenticate -> open record/detail',
+            businessSteps: [
+                { name: 'authenticate', startIndex: 0, endIndex: 1, samplers: ['Step 01 - GET /login', 'Step 02 - POST /login'] },
+                { name: 'open record/detail', startIndex: 2, endIndex: 2, samplers: ['Step 03 - GET /case/123'] },
+            ],
+        },
+        stackFingerprint: { signals: [{ stack: 'SAML SSO', evidence: 'SAMLResponse' }] },
+        negativeSpace: [],
+        nativeManagers: [],
+        validityGates: [],
+        coverage: {},
+    };
+
+    const auth = seniorPeAnalysis.analyzeSeniorPeFailure({
+        seniorPeDebrief: base,
+        result: { samples: [{ label: 'Step 02 - POST /login', success: false, responseCode: '401' }] },
+        blueprintEvidence: { firstFailure: { category: 'auth_correlation_failed', sampler: 'Step 02 - POST /login' } },
+    });
+    const business = seniorPeAnalysis.analyzeSeniorPeFailure({
+        seniorPeDebrief: base,
+        result: { samples: [{ label: 'Step 03 - GET /case/123', success: false, responseCode: '500' }] },
+        blueprintEvidence: { firstFailure: { category: 'payload_or_header_failed', sampler: 'Step 03 - GET /case/123' } },
+    });
+
+    assert.strictEqual(auth.failureClass, 'auth/session');
+    assert.strictEqual(auth.recommendedNextStrategy.id, 'auth-session-correlation');
+    assert.strictEqual(business.failureClass, 'business-endpoint');
+    assert.strictEqual(business.recommendedNextStrategy.id, 'environment-or-payload-investigation');
+});
+
+test('senior PE analysis: writes JSON and markdown artifacts', () => {
+    const out = tmp();
+    const analysis = seniorPeAnalysis.analyzeSeniorPeFailure({
+        name: 'checkout',
+        seniorPeDebrief: {
+            objective: { value: 'checkout capacity', assumed: false },
+            flow: { narrative: 'authenticate -> submit/update business data', businessSteps: [] },
+            stackFingerprint: { signals: [] },
+            negativeSpace: [],
+            nativeManagers: [],
+            validityGates: [],
+            coverage: {},
+        },
+        result: { success: true, samples: [] },
+    });
+
+    const artifacts = seniorPeAnalysis.writeSeniorPeAnalysisArtifacts(out, 'checkout', analysis);
+
+    assert.ok(fs.existsSync(artifacts.jsonPath));
+    assert.ok(fs.existsSync(artifacts.markdownPath));
+    assert.match(fs.readFileSync(artifacts.markdownPath, 'utf8'), /Senior PE Analysis/);
+});
+
+test('senior PE analysis: writes bounded AI strategy questions and citations only', () => {
+    const out = tmp();
+    const analysis = {
+        name: 'checkout',
+        businessJourney: 'authenticate -> submit/update business data',
+        failureClass: 'auth/session',
+        upstreamCause: { sampler: 'Step 02 - POST /login', summary: '401 after login' },
+        recommendedNextStrategy: { id: 'auth-session-correlation', reason: 'repair login/session first' },
+        riskGaps: [{ gap: 'workload model missing', action: 'Provide target throughput.' }],
+    };
+
+    const strategy = seniorPeAnalysis.buildAiStrategy(analysis);
+    const artifacts = seniorPeAnalysis.writeAiStrategyArtifacts(out, 'checkout', strategy);
+
+    assert.deepStrictEqual(Object.keys(strategy.allowedActions).sort(), ['askQuestions', 'citeEvidence', 'proposeStrategy'].sort());
+    assert.ok(!strategy.allowedActions.patchJmx);
+    assert.ok(fs.existsSync(artifacts.strategyPath));
+    assert.ok(fs.existsSync(artifacts.questionsPath));
+    assert.ok(fs.existsSync(artifacts.citationsPath));
+    assert.match(fs.readFileSync(artifacts.questionsPath, 'utf8'), /target throughput/i);
+});
+
+test('senior PE analysis: prefers failure forensics root cause evidence', () => {
+    const analysis = seniorPeAnalysis.analyzeSeniorPeFailure({
+        name: 'auth-flow',
+        seniorPeDebrief: { flow: { narrative: 'authenticate -> dashboard', businessSteps: [] } },
+        result: {
+            success: false,
+            statusRootCause: {
+                rootCauseIndex: 7,
+                rootCause: { sampler: 'Step 08 - GraphQL GetCurrentUser', expected: 200, observed: 401, category: 'client_error' },
+                summary: 'GraphQL failed',
+            },
+            failureForensics: {
+                rootCause: {
+                    index: 2,
+                    sampler: 'Step 03 - GET /authorize/resume',
+                    recordedStatus: 302,
+                    observedStatus: 401,
+                    category: 'auth_or_session_correlation_failed',
+                },
+                recommendedAction: { id: 'provide-test-auth-path', reason: 'Interactive auth redirect wall.' },
+                summary: 'first divergence Step 03 - GET /authorize/resume recorded 302 observed 401',
+            },
+            samples: [],
+        },
+    });
+
+    assert.strictEqual(analysis.failureClass, 'auth/session');
+    assert.strictEqual(analysis.upstreamCause.sampler, 'Step 03 - GET /authorize/resume');
+    assert.strictEqual(analysis.upstreamCause.expected, 302);
+    assert.strictEqual(analysis.upstreamCause.observed, 401);
+    assert.strictEqual(analysis.recommendedNextStrategy.id, 'provide-test-auth-path');
+});
+
+test('failure forensics: proves auth redirect divergence before downstream GraphQL symptoms', () => {
+    const entries = [
+        entry('GET', 'https://stgauth.webpt.com/authorize', { status: 302 }),
+        entry('GET', 'https://stgauth.webpt.com/authorize/resume', { status: 302 }),
+        entry('POST', 'https://stage-gateway.webpt.com/graphql', {
+            postData: { mimeType: 'application/json', text: JSON.stringify({ query: 'query GetCurrentUser { currentUser { id } }' }) },
+            status: 200,
+            body: JSON.stringify({ data: { currentUser: { id: '123' } } }),
+        }),
+    ];
+    entries[1].response.headers.push({ name: 'Set-Cookie', value: 'stgapp_sess=recorded; Path=/; HttpOnly' });
+    const samples = [
+        { label: 'Step 01 - GET /authorize', responseCode: '302', success: true },
+        { label: 'Step 02 - GET /authorize/resume', responseCode: '401', success: false },
+        { label: 'Step 03 - GraphQL query GetCurrentUser', responseCode: '401', success: false },
+    ];
+
+    const analysis = failureForensics.analyzeFailureForensics({ entries, samples });
+
+    assert.strictEqual(analysis.rootCause.index, 1);
+    assert.strictEqual(analysis.rootCause.recordedStatus, 302);
+    assert.strictEqual(analysis.rootCause.observedStatus, 401);
+    assert.strictEqual(analysis.redirects.interactiveAuthWall, true);
+    assert.deepStrictEqual(analysis.authSession.missingSessionCookies, ['stgapp_sess']);
+    assert.strictEqual(analysis.graphql.downstreamSymptoms.length, 1);
+    assert.strictEqual(analysis.graphql.downstreamSymptoms[0].rootCauseIndex, 1);
+    assert.strictEqual(analysis.recommendedAction.id, 'provide-test-auth-path');
+});
+
+test('failure forensics: classifies first 5xx divergence as environment evidence', () => {
+    const entries = [
+        entry('GET', 'https://app.test/health', { status: 200 }),
+        entry('POST', 'https://app.test/api/save', { status: 200 }),
+    ];
+    const samples = [
+        { label: 'Step 01 - GET /health', responseCode: '200', success: true },
+        { label: 'Step 02 - POST /api/save', responseCode: '503', success: false },
+    ];
+
+    const analysis = failureForensics.analyzeFailureForensics({ entries, samples });
+
+    assert.strictEqual(analysis.rootCause.index, 1);
+    assert.strictEqual(analysis.rootCause.category, 'server_error_after_replay_request');
+    assert.strictEqual(analysis.recommendedAction.id, 'fix-environment');
+    assert.match(failureForensics.renderFailureForensicsMarkdown('save-flow', analysis), /recorded 200, observed 503/);
+});
+
+test('failure forensics: auth/session 5xx remains a repair target before environment-only blocker', () => {
+    const entries = [
+        entry('GET', 'https://login.test/authorize', {
+            status: 200,
+            reqHeaders: [],
+            body: '<html>login</html>',
+        }),
+        entry('POST', 'https://login.test/u/login/password?state=recordedStateA123', {
+            status: 302,
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'state=recordedStateA123&password=secret' },
+        }),
+    ];
+    entries[0].response.headers.push({ name: 'Set-Cookie', value: 'auth0_sess=recordedCookieA123; Path=/; HttpOnly' });
+    const samples = [
+        { label: 'Step 01 - GET /authorize', code: '200', success: true, isTransaction: false },
+        { label: 'Step 02 - POST /u/login/password', code: '500', success: false, isTransaction: false },
+    ];
+
+    const analysis = failureForensics.analyzeFailureForensics({ entries, samples });
+
+    assert.strictEqual(analysis.rootCause.sampler, 'Step 02 - POST /u/login/password');
+    assert.strictEqual(analysis.recommendedAction.id, 'repair-auth-session-correlation');
+});
+
+test('failure forensics: aligns recovered JTL samples by step number, not array position', () => {
+    const entries = Array.from({ length: 13 }, (_, i) =>
+        entry('GET', `https://app.test/step-${i + 1}`, { status: 200 })
+    );
+    entries[12] = entry('GET', 'https://app.test/redirect/', { status: 302 });
+    const samples = [
+        { label: 'Step 01 - GET /', responseCode: '200', success: false },
+        { label: 'Step 02 - GET /', responseCode: '200', success: true },
+        { label: 'Step 13 - GET /redirect/', responseCode: '500', success: false },
+    ];
+
+    const analysis = failureForensics.analyzeFailureForensics({ entries, samples });
+
+    assert.strictEqual(analysis.rootCause.index, 12);
+    assert.strictEqual(analysis.rootCause.sampler, 'Step 13 - GET /redirect/');
+    assert.strictEqual(analysis.rootCause.url, 'https://app.test/redirect/');
+    assert.strictEqual(analysis.rootCause.recordedStatus, 302);
+    assert.strictEqual(analysis.rootCause.observedStatus, 500);
 });
 
 test('GraphQL auth repair: latest csrfToken producer feeds downstream X-CSRF-TOKEN headers', () => {
@@ -1296,6 +2120,26 @@ test('status analysis: traces root cause to earliest upstream recording drift be
     assert.strictEqual(statusAnalysis.traceStatusRootCause({ entries, samples: cleanSamples }), null);
 });
 
+test('status analysis: assertion-only failures do not hide later status divergence', () => {
+    const entries = Array.from({ length: 13 }, (_, i) =>
+        entry('GET', `https://app.test/step-${i + 1}`, { status: 200 })
+    );
+    entries[12] = entry('GET', 'https://app.test/redirect/', { status: 302 });
+    const samples = [
+        { label: 'Step 01 - GET /', responseCode: '200', success: false, failureMessage: 'assertion failed', isTransaction: false },
+        { label: 'Step 02 - GET /', responseCode: '200', success: true, isTransaction: false },
+        { label: 'Step 13 - GET /redirect/', responseCode: '500', success: false, isTransaction: false },
+    ];
+
+    assert.strictEqual(statusAnalysis._internal.firstStatusDivergenceIndex(entries, samples), 12);
+    const root = statusAnalysis.traceStatusRootCause({ entries, samples });
+
+    assert.strictEqual(root.rootCauseIndex, 12);
+    assert.strictEqual(root.rootCause.sampler, 'Step 13 - GET /redirect/');
+    assert.strictEqual(root.rootCause.recorded, 302);
+    assert.strictEqual(root.rootCause.observed, 500);
+});
+
 test('failure classifier: uses status root cause evidence when available', () => {
     const classified = failureClassifier.classifyFirstFailure({
         statusRootCause: {
@@ -1535,6 +2379,103 @@ test('AI fix prompt: includes blueprint lineage and first-failure evidence when 
     assert.match(built.userPrompt, /c_session/);
 });
 
+test('runner blueprint evidence: includes senior PE analysis when present', () => {
+    const ctx = blueprintContext.createBlueprintContext({
+        entries: [],
+        outDir: tmp(),
+        name: 'bp',
+        runCfg: {},
+        agentCfg: {},
+    });
+    ctx.seniorPe = { flow: { narrative: 'authenticate -> submit/update business data' }, stackFingerprint: { signals: [] }, valueLedger: [] };
+    ctx.seniorPeAnalysis = {
+        businessJourney: 'authenticate -> submit/update business data',
+        brokenBusinessStep: { name: 'submit/update business data' },
+        failureClass: 'auth/session',
+        recommendedNextStrategy: { id: 'auth-session-correlation' },
+    };
+
+    const summary = runnerInternal.summarizeBlueprintEvidence(ctx);
+
+    assert.strictEqual(summary.flowIntentAnalysis.failureClass, 'auth/session');
+    assert.strictEqual(summary.flowIntentAnalysis.recommendedNextStrategy.id, 'auth-session-correlation');
+});
+
+test('runner blueprint evidence: includes failure forensics before AI escalation', () => {
+    const ctx = blueprintContext.createBlueprintContext({
+        entries: [],
+        outDir: tmp(),
+        name: 'bp',
+        runCfg: {},
+        agentCfg: {},
+    });
+    ctx.validation.failureForensics = {
+        rootCause: {
+            sampler: 'Step 12 - GET /authorize/resume',
+            recordedStatus: 302,
+            observedStatus: 401,
+            category: 'auth_or_session_correlation_failed',
+        },
+        recommendedAction: { id: 'provide-test-auth-path', reason: 'Interactive auth redirect wall.' },
+        authSession: { missingSessionCookies: ['stgapp_sess'] },
+        graphql: { downstreamSymptoms: [{ sampler: 'GraphQL GetCurrentUser' }] },
+    };
+
+    const summary = runnerInternal.summarizeBlueprintEvidence(ctx);
+
+    assert.strictEqual(summary.failureForensics.rootCause.sampler, 'Step 12 - GET /authorize/resume');
+    assert.strictEqual(summary.failureForensics.recommendedAction.id, 'provide-test-auth-path');
+    assert.deepStrictEqual(summary.failureForensics.missingSessionCookies, ['stgapp_sess']);
+    assert.strictEqual(summary.failureForensics.downstreamGraphqlSymptoms, 1);
+});
+
+test('runner failure forensics: writes JSON and Markdown artifacts', () => {
+    const out = tmp();
+    const logs = [];
+    const result = {
+        success: false,
+        samples: [
+            { label: 'Step 01 - GET /authorize/resume', responseCode: '401', success: false },
+        ],
+    };
+    const entries = [
+        entry('GET', 'https://stgauth.webpt.com/authorize/resume', { status: 302 }),
+    ];
+
+    const analysis = runnerInternal.attachFailureForensics({
+        result,
+        entries,
+        outDir: out,
+        name: 'flow',
+        onLog: msg => logs.push(msg),
+    });
+
+    assert.strictEqual(result.failureForensics.rootCause.observedStatus, 401);
+    assert.strictEqual(analysis.rootCause.recordedStatus, 302);
+    assert.ok(fs.existsSync(path.join(out, 'flow_failure_forensics.json')));
+    assert.match(fs.readFileSync(path.join(out, 'flow_failure_forensics.md'), 'utf8'), /First divergence/);
+    assert.match(logs.join('\n'), /failure forensics: first divergence/);
+});
+
+test('AI fix prompt: includes senior PE analysis evidence when provided', () => {
+    const built = runnerInternal.buildGeminiFixPrompt({
+        failures: [{ samplerName: 'Step 03 - POST /orders', responseCode: '403', failureMessage: 'Forbidden' }],
+        jmxContent: '<HTTPSamplerProxy testname="Step 03 - POST /orders" enabled="true"></HTTPSamplerProxy><hashTree/>',
+        correlations: [],
+        blueprintEvidence: {
+            flowIntentAnalysis: {
+                businessJourney: 'authenticate -> submit/update business data',
+                brokenBusinessStep: { name: 'submit/update business data' },
+                recommendedNextStrategy: { id: 'auth-session-correlation' },
+            },
+        },
+    });
+
+    assert.match(built.userPrompt, /flowIntentAnalysis/);
+    assert.match(built.userPrompt, /auth-session-correlation/);
+    assert.match(built.userPrompt, /submit\/update business data/);
+});
+
 test('HTML report: links blueprint agent artifacts', () => {
     const out = tmp();
     fs.writeFileSync(path.join(out, 'bp_blueprint_context.json'), '{}');
@@ -1545,6 +2486,26 @@ test('HTML report: links blueprint agent artifacts', () => {
     fs.writeFileSync(path.join(out, 'bp_correlation_patches.json'), '{}');
     fs.writeFileSync(path.join(out, 'bp_senior_pe_debrief.json'), '{}');
     fs.writeFileSync(path.join(out, 'bp_senior_pe_debrief.md'), '# Senior PE');
+    fs.writeFileSync(path.join(out, 'bp_domain_profile.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_pe_analysis.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_pe_analysis.md'), '# PE Analysis');
+    fs.writeFileSync(path.join(out, 'bp_ai_strategy.json'), '{}');
+    fs.writeFileSync(path.join(out, 'bp_human_questions.md'), '# Questions');
+    fs.writeFileSync(path.join(out, 'bp_evidence_citations.json'), '[]');
+    fs.writeFileSync(path.join(out, 'bp_blockers.json'), '[]');
+    fs.writeFileSync(path.join(out, 'bp_blockers.md'), '# Blockers');
+    fs.writeFileSync(path.join(out, 'bp_failure_forensics.json'), JSON.stringify({
+        rootCause: {
+            sampler: 'Step 12 - GET /authorize/resume',
+            recordedStatus: 302,
+            observedStatus: 401,
+        },
+        authSession: { missingSessionCookies: ['stgapp_sess'] },
+        redirects: { interactiveAuthWall: true },
+        graphql: { downstreamSymptoms: [{ sampler: 'Step 13 - GraphQL GetCurrentUser' }] },
+        recommendedAction: { id: 'provide-test-auth-path' },
+    }, null, 2));
+    fs.writeFileSync(path.join(out, 'bp_failure_forensics.md'), '# Failure Forensics');
 
     const reportPath = writeHtmlReportFn(out, 'bp', {
         mode: 'agent', verdict: 'needs attention', stats: {}, samples: [],
@@ -1559,6 +2520,20 @@ test('HTML report: links blueprint agent artifacts', () => {
     assert.match(html, /bp_correlation_patches\.json/);
     assert.match(html, /bp_senior_pe_debrief\.json/);
     assert.match(html, /bp_senior_pe_debrief\.md/);
+    assert.match(html, /bp_domain_profile\.json/);
+    assert.match(html, /bp_pe_analysis\.json/);
+    assert.match(html, /bp_pe_analysis\.md/);
+    assert.match(html, /bp_ai_strategy\.json/);
+    assert.match(html, /bp_human_questions\.md/);
+    assert.match(html, /bp_evidence_citations\.json/);
+    assert.match(html, /bp_blockers\.json/);
+    assert.match(html, /bp_blockers\.md/);
+    assert.match(html, /bp_failure_forensics\.json/);
+    assert.match(html, /bp_failure_forensics\.md/);
+    assert.match(html, /Failure forensics/);
+    assert.match(html, /Step 12 - GET \/authorize\/resume/);
+    assert.match(html, /stgapp_sess/);
+    assert.match(html, /provide-test-auth-path/);
 });
 
 test('value-flow decisions: consumed outputs make a failing sampler must-fix', () => {
@@ -1681,7 +2656,8 @@ test('generate: generic browser/OIDC noise is disabled by default; app-specific 
     });
     const xmlCfg = fs.readFileSync(genCfg.jmxPath, 'utf8');
     assert.strictEqual(samplerEnabledForPath(xmlCfg, 'auth-gateway/rbac-public-key'), false);
-    assert.strictEqual(samplerEnabledForPath(xmlCfg, 'iam/callback'), false);
+    assert.strictEqual(samplerEnabledForPath(xmlCfg, 'iam/callback'), true,
+        'session callback producers stay enabled even when a broad disableCalls entry matches');
 });
 
 test('generate: step-named samplers are disabled via run.disableCalls, not by default', () => {
@@ -1704,7 +2680,41 @@ test('generate: step-named samplers are disabled via run.disableCalls, not by de
         runCfg: { disableCalls: ['Step 07 - POST /'] },
     });
     const xmlCfg = fs.readFileSync(genCfg.jmxPath, 'utf8');
-    assert.strictEqual(samplerEnabledForName(xmlCfg, 'Step 07 - POST /'), false);
+    assert.strictEqual(samplerEnabledForName(xmlCfg, 'Step 07 - POST /'), true,
+        'configured broad step disables must not remove auth/session producers');
+});
+
+test('generate: disableCalls cannot remove protected auth/session producers without unsafe override', () => {
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://stglogin.webpt.com/u/login/identifier'),
+        entry('POST', 'https://stglogin.webpt.com/u/login/password'),
+        entry('POST', 'https://stgapp.webpt.com/authorization/'),
+        entry('GET', 'https://stgauth.webpt.com/s/interceptor/authorize/'),
+        entry('GET', 'https://stgemr.webpt.com/jwt/v2/create-cookie'),
+        entry('GET', 'https://events.example.com/sdk/evalx/users/user-key'),
+    ]));
+
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'protected-disable', {
+        runCfg: {
+            disableCalls: [
+                'Step 01 - POST /u/login/identifier',
+                'Step 02 - POST /u/login/password',
+                '/authorization/',
+                '/s/interceptor/authorize/',
+                '/jwt/v2/create-cookie',
+                '/sdk/evalx',
+            ],
+        },
+    });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+
+    assert.strictEqual(samplerEnabledForPath(xml, '/u/login/identifier'), true);
+    assert.strictEqual(samplerEnabledForPath(xml, '/u/login/password'), true);
+    assert.strictEqual(samplerEnabledForPath(xml, '/authorization/'), true);
+    assert.strictEqual(samplerEnabledForPath(xml, '/s/interceptor/authorize/'), true);
+    assert.strictEqual(samplerEnabledForPath(xml, '/jwt/v2/create-cookie'), true);
+    assert.strictEqual(samplerEnabledForPath(xml, '/sdk/evalx'), false);
 });
 
 function samplerEnabledForPath(xml, pathPart) {
@@ -1756,6 +2766,336 @@ test('ingest groups: dual-HAR pair + JMX+sidecar + single HAR', () => {
     const pair = units.find(u => u.kind === 'dual-har');
     assert.strictEqual(pair.primary, '/in/foo__run1.har');
     assert.strictEqual(pair.secondary, '/in/foo__run2.har');
+});
+
+test('ingest groups: two similar HAR recordings are treated as a dual-recording pair', () => {
+    const files = [
+        '/in/Batch_Print_Recording1_May15_Filtered.har',
+        '/in/Batch_Print_Recording2_May15_Filtered.har',
+    ];
+    const units = groupInputs(files);
+    assert.strictEqual(units.length, 1);
+    assert.strictEqual(units[0].kind, 'dual-har');
+    assert.strictEqual(units[0].primary, files[0]);
+    assert.strictEqual(units[0].secondary, files[1]);
+});
+
+test('ingest groups: loose HAR names do not override incompatible content', () => {
+    const dir = tmp();
+    const one = path.join(dir, 'Batch_Print_Recording1_May15_Filtered.har');
+    const two = path.join(dir, 'Batch_Print_Recording2_May15_Filtered.har');
+    fs.writeFileSync(one, JSON.stringify(har([
+        entry('GET', 'https://batch.test/login'),
+        entry('POST', 'https://batch.test/print'),
+    ])));
+    fs.writeFileSync(two, JSON.stringify(har([
+        entry('GET', 'https://payments.test/login'),
+        entry('POST', 'https://payments.test/transfer'),
+    ])));
+
+    const analysis = analyzeInputFiles([one, two]);
+
+    assert.deepStrictEqual(analysis.units.map(u => u.kind), ['har', 'har']);
+    assert.ok(analysis.issues.some(i =>
+        i.code === 'unpaired_similar_recordings' &&
+        /similar file names/.test(i.message) &&
+        /different request flows/.test(i.message)
+    ));
+});
+
+test('ingest groups: same-flow HARs with user-dependent request drift still pair', () => {
+    const dir = tmp();
+    const one = path.join(dir, 'Batch_Print_Recording1_May15_Filtered.har');
+    const two = path.join(dir, 'Batch_Print_Recording2_May15_Filtered.har');
+    const commonFlow = [
+        ['GET', 'https://devperfapp.webpt.com/'],
+        ['POST', 'https://devperfapp.webpt.com/service/authenticate.json'],
+        ['GET', 'https://devperfapp.webpt.com/dashboard.php'],
+        ['GET', 'https://devperfapp.webpt.com/patient/display/'],
+        ['POST', 'https://devperfapp.webpt.com/patient/display/getpatients'],
+        ['GET', 'https://devperfapp.webpt.com/patientChart.php'],
+        ['GET', 'https://devperfapp.webpt.com/patient/outbounddocument/faxoutbound'],
+        ['GET', 'https://devperfapp.webpt.com/batchPrint.php'],
+        ['GET', 'https://devperfapp.webpt.com/patientExtDoc.php'],
+        ['POST', 'https://devperfapp.webpt.com/edoc/edoc/getdocumentspercase'],
+        ['POST', 'https://devperfapp.webpt.com/edoc/edoc/getalldocuments'],
+        ['GET', 'https://devperfapp.webpt.com/physician/search/search-physicians'],
+        ['POST', 'https://devperfapp.webpt.com/edoc/temporal-file/save'],
+        ['POST', 'https://devperfapp.webpt.com/patientExtDoc.php'],
+        ['GET', 'https://devperfapp.webpt.com/viewExtDoc.php'],
+        ['GET', 'https://devperfapp.webpt.com/user/logout'],
+    ];
+    const firstRun = [
+        ...commonFlow.slice(0, 2),
+        ['GET', 'https://devperfapp.webpt.com/favicon.ico'],
+        ['POST', 'https://devperfdelegator.webpt.com/rb_bf77075baf'],
+        ...commonFlow.slice(2, 12),
+        ['GET', 'https://devperfapp.webpt.com/menu/index/inbox'],
+        ['GET', 'https://devperfapp.webpt.com/menu/index/getclinicactions/'],
+        ...commonFlow.slice(12),
+    ];
+    const secondRun = [
+        ...commonFlow.slice(0, 2),
+        ['POST', 'https://devperfdelegator.webpt.com/rb_bf77075baf'],
+        ...commonFlow.slice(2, 7),
+        ['GET', 'https://devperfapp.webpt.com/menu/index/getclinicactions/'],
+        ...commonFlow.slice(7, 13),
+        ['POST', 'https://devperfdelegator.webpt.com/rb_bf77075baf'],
+        ['POST', 'https://devperfdelegator.webpt.com/rb_bf77075baf'],
+        ...commonFlow.slice(13),
+    ];
+    fs.writeFileSync(one, JSON.stringify(har(firstRun.map(([method, url]) => entry(method, url)))));
+    fs.writeFileSync(two, JSON.stringify(har(secondRun.map(([method, url]) => entry(method, url)))));
+
+    const analysis = analyzeInputFiles([one, two]);
+
+    assert.strictEqual(analysis.units.length, 1);
+    assert.strictEqual(analysis.units[0].kind, 'dual-har');
+    assert.deepStrictEqual(analysis.issues, []);
+});
+
+test('ingest groups: two HARs with different names pair by content fingerprint', () => {
+    const dir = tmp();
+    const one = path.join(dir, 'alpha.har');
+    const two = path.join(dir, 'completely-different-name.har');
+    fs.writeFileSync(one, JSON.stringify(har([
+        entry('GET', 'https://app.test/login'),
+        entry('POST', 'https://app.test/upload'),
+    ])));
+    fs.writeFileSync(two, JSON.stringify(har([
+        entry('GET', 'https://app.test/login'),
+        entry('POST', 'https://app.test/upload'),
+    ])));
+
+    const units = groupInputs([one, two]);
+
+    assert.strictEqual(units.length, 1);
+    assert.strictEqual(units[0].kind, 'dual-har');
+    assert.strictEqual(units[0].primary, one);
+    assert.strictEqual(units[0].secondary, two);
+});
+
+test('ingest analysis: malformed and orphaned inputs produce precise issues', () => {
+    const dir = tmp();
+    const badHar = path.join(dir, 'bad.har');
+    const badJmx = path.join(dir, 'bad.jmx');
+    const orphanJtl = path.join(dir, 'lonely.jtl');
+    fs.writeFileSync(badHar, '{"log":{}}');
+    fs.writeFileSync(badJmx, '<xml>not jmeter</xml>');
+    fs.writeFileSync(orphanJtl, '<testResults version="1.2"></testResults>');
+
+    const analysis = analyzeInputFiles([badHar, badJmx, orphanJtl]);
+    const issues = analysis.issues.map(i => i.code).sort();
+
+    assert.deepStrictEqual(issues, ['invalid_har', 'invalid_jmx', 'orphan_sidecar']);
+    assert.ok(analysis.issues.some(i => /bad\.har/.test(i.message)));
+    assert.ok(analysis.issues.some(i => /lonely\.jtl/.test(i.message)));
+});
+
+test('ingest analysis: fingerprints recordings with business urls, uploads, and timestamps', () => {
+    const dir = tmp();
+    const rec = path.join(dir, 'flow.har');
+    const first = entry('GET', 'https://app.test/login');
+    const second = entry('POST', 'https://app.test/edoc/temporal-file/save', {
+        reqHeaders: [{ name: 'Content-Type', value: 'multipart/form-data; boundary=----abc' }],
+        postData: {
+            mimeType: 'multipart/form-data',
+            params: [{ name: 'file', fileName: 'recorded-name.pdf', contentType: 'application/pdf' }],
+        },
+    });
+    first.startedDateTime = '2026-01-01T00:00:00.000Z';
+    second.startedDateTime = '2026-01-01T00:00:03.000Z';
+    fs.writeFileSync(rec, JSON.stringify(har([first, second])));
+
+    const analysis = analyzeInputFiles([rec]);
+    const fp = analysis.inventory[0].fingerprint;
+
+    assert.strictEqual(fp.requestCount, 2);
+    assert.deepStrictEqual(fp.sequence, ['GET /login', 'POST /edoc/temporal-file/save']);
+    assert.deepStrictEqual(fp.hosts, ['app.test']);
+    assert.strictEqual(fp.firstBusinessUrl, 'https://app.test/login');
+    assert.strictEqual(fp.lastBusinessUrl, 'https://app.test/edoc/temporal-file/save');
+    assert.deepStrictEqual(fp.referencedFilenames, ['recorded-name.pdf']);
+    assert.strictEqual(fp.uploadEndpoints[0].path, '/edoc/temporal-file/save');
+    assert.strictEqual(fp.timestamps.first, '2026-01-01T00:00:00.000Z');
+    assert.strictEqual(fp.timestamps.last, '2026-01-01T00:00:03.000Z');
+});
+
+test('ingest groups: two JMX files with same sampler sequence pair by content', () => {
+    const dir = tmp();
+    const one = path.join(dir, 'first-export.jmx');
+    const two = path.join(dir, 'second-capture.jmx');
+    fs.writeFileSync(one, jmxXml([
+        { method: 'GET', domain: 'app.test', path: '/login' },
+        { method: 'POST', domain: 'app.test', path: '/orders' },
+    ]));
+    fs.writeFileSync(two, jmxXml([
+        { method: 'GET', domain: 'app.test', path: '/login' },
+        { method: 'POST', domain: 'app.test', path: '/orders' },
+    ]));
+
+    const units = groupInputs([one, two]);
+
+    assert.strictEqual(units.length, 1);
+    assert.strictEqual(units[0].kind, 'dual-jmx');
+    assert.strictEqual(units[0].primary, one);
+    assert.strictEqual(units[0].secondary, two);
+});
+
+test('ingest groups: same-flow JMXs with user-dependent drift pair with recording sidecars', () => {
+    const dir = tmp();
+    const one = path.join(dir, 'Batch_Print_Recording1_May15_Filtered.jmx');
+    const two = path.join(dir, 'Batch_Print_Recording2_May15_Filtered.jmx');
+    const sidecarOne = path.join(dir, 'Batch_Print_Recording1_May15_Filtered.recording.xml');
+    const sidecarTwo = path.join(dir, 'Batch_Print_Recording2_May15_Filtered.recording.xml');
+    const commonFlow = [
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/' },
+        { method: 'POST', domain: 'devperfapp.webpt.com', path: '/service/authenticate.json' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/dashboard.php' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/patient/display/' },
+        { method: 'POST', domain: 'devperfapp.webpt.com', path: '/patient/display/getpatients' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/patientChart.php' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/patient/outbounddocument/faxoutbound' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/batchPrint.php' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/patientExtDoc.php' },
+        { method: 'POST', domain: 'devperfapp.webpt.com', path: '/edoc/edoc/getdocumentspercase' },
+        { method: 'POST', domain: 'devperfapp.webpt.com', path: '/edoc/edoc/getalldocuments' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/physician/search/search-physicians' },
+        { method: 'POST', domain: 'devperfapp.webpt.com', path: '/edoc/temporal-file/save' },
+        { method: 'POST', domain: 'devperfapp.webpt.com', path: '/patientExtDoc.php' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/viewExtDoc.php' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/user/logout' },
+    ];
+    const firstRun = [
+        ...commonFlow.slice(0, 2),
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/favicon.ico' },
+        { method: 'POST', domain: 'devperfdelegator.webpt.com', path: '/rb_bf77075baf' },
+        ...commonFlow.slice(2, 12),
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/menu/index/inbox' },
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/menu/index/getclinicactions/' },
+        ...commonFlow.slice(12),
+    ];
+    const secondRun = [
+        ...commonFlow.slice(0, 2),
+        { method: 'POST', domain: 'devperfdelegator.webpt.com', path: '/rb_bf77075baf' },
+        ...commonFlow.slice(2, 7),
+        { method: 'GET', domain: 'devperfapp.webpt.com', path: '/menu/index/getclinicactions/' },
+        ...commonFlow.slice(7, 13),
+        { method: 'POST', domain: 'devperfdelegator.webpt.com', path: '/rb_bf77075baf' },
+        { method: 'POST', domain: 'devperfdelegator.webpt.com', path: '/rb_bf77075baf' },
+        ...commonFlow.slice(13),
+    ];
+    fs.writeFileSync(one, jmxXml(firstRun));
+    fs.writeFileSync(two, jmxXml(secondRun));
+    fs.writeFileSync(sidecarOne, jtlXml(firstRun.map(r => ({ ...r, url: `https://${r.domain}${r.path}` }))));
+    fs.writeFileSync(sidecarTwo, jtlXml(secondRun.map(r => ({ ...r, url: `https://${r.domain}${r.path}` }))));
+
+    const analysis = analyzeInputFiles([one, two, sidecarOne, sidecarTwo]);
+
+    assert.strictEqual(analysis.units.length, 1);
+    assert.strictEqual(analysis.units[0].name, 'batch_print_recording_may15_filtered');
+    assert.strictEqual(analysis.units[0].kind, 'dual-jmx');
+    assert.strictEqual(analysis.units[0].primary, one);
+    assert.strictEqual(analysis.units[0].secondary, two);
+    assert.strictEqual(analysis.units[0].sidecars.primary, sidecarOne);
+    assert.strictEqual(analysis.units[0].sidecars.secondary, sidecarTwo);
+    assert.deepStrictEqual(analysis.issues, []);
+});
+
+test('ingest analysis: JMX sidecar can match by request sequence instead of filename', () => {
+    const dir = tmp();
+    const jmx = path.join(dir, 'exported-plan.jmx');
+    const jtl = path.join(dir, 'recording-from-proxy.jtl');
+    fs.writeFileSync(jmx, jmxXml([
+        { method: 'GET', domain: 'app.test', path: '/login' },
+        { method: 'POST', domain: 'app.test', path: '/orders' },
+    ]));
+    fs.writeFileSync(jtl, jtlXml([
+        { method: 'GET', url: 'https://app.test/login' },
+        { method: 'POST', url: 'https://app.test/orders' },
+    ]));
+
+    const analysis = analyzeInputFiles([jmx, jtl]);
+
+    assert.strictEqual(analysis.units.length, 1);
+    assert.strictEqual(analysis.units[0].kind, 'jmx');
+    assert.strictEqual(analysis.units[0].secondary, jtl);
+    assert.deepStrictEqual(analysis.issues, []);
+});
+
+test('ingest analysis: paired JMX sidecars are not orphaned when paths use mixed separators', () => {
+    const dir = tmp();
+    const jmxOne = path.join(dir, 'LOGI_Performance_STG_0004User_20May.jmx');
+    const jmxTwo = path.join(dir, 'LOGI_Performance_STG_0006User_20May.jmx');
+    const sidecarOne = path.join(dir, 'LOGI_Performance_STG_0004User_20May.xml');
+    const sidecarTwo = path.join(dir, 'LOGI_Performance_STG_0006User_20May.xml');
+    fs.writeFileSync(jmxOne, jmxXml([
+        { method: 'GET', domain: 'stgadmin.webpt.com', path: '/' },
+        { method: 'GET', domain: 'stgauth.webpt.com', path: '/authorize' },
+        { method: 'GET', domain: 'stgauth.webpt.com', path: '/authorize/resume' },
+    ]));
+    fs.writeFileSync(jmxTwo, jmxXml([
+        { method: 'GET', domain: 'stgadmin.webpt.com', path: '/' },
+        { method: 'GET', domain: 'stgauth.webpt.com', path: '/authorize' },
+        { method: 'GET', domain: 'stgauth.webpt.com', path: '/authorize/resume' },
+    ]));
+    fs.writeFileSync(sidecarOne, jtlXml([
+        { method: 'GET', url: 'https://stgadmin.webpt.com/' },
+        { method: 'GET', url: 'https://stgauth.webpt.com/authorize' },
+        { method: 'GET', url: 'https://stgauth.webpt.com/authorize/resume' },
+    ]));
+    fs.writeFileSync(sidecarTwo, jtlXml([
+        { method: 'GET', url: 'https://stgadmin.webpt.com/' },
+        { method: 'GET', url: 'https://stgauth.webpt.com/authorize' },
+        { method: 'GET', url: 'https://stgauth.webpt.com/authorize/resume' },
+    ]));
+    const mixed = [jmxOne, sidecarOne, jmxTwo, sidecarTwo].map(f => f.replace(/\\/g, '/'));
+
+    const analysis = analyzeInputFiles(mixed);
+
+    assert.strictEqual(analysis.units.length, 1);
+    assert.strictEqual(analysis.units[0].kind, 'dual-jmx');
+    assert.ok(!analysis.issues.some(i => i.code === 'orphan_sidecar'));
+});
+
+test('ingest analysis: ambiguous similar HARs ask for an exact pair', () => {
+    const dir = tmp();
+    const files = ['run-a.har', 'run-b.har', 'run-c.har'].map(name => path.join(dir, name));
+    for (const f of files) {
+        fs.writeFileSync(f, JSON.stringify(har([
+            entry('GET', 'https://app.test/login'),
+            entry('POST', 'https://app.test/orders'),
+        ])));
+    }
+
+    const analysis = analyzeInputFiles(files);
+
+    assert.ok(analysis.issues.some(i =>
+        i.code === 'ambiguous_recording_pair' &&
+        /Found 3 similar HARs/.test(i.message) &&
+        /exactly two runs/.test(i.message)
+    ));
+});
+
+test('ingest analysis: writes per-flow inventory JSON and markdown report', () => {
+    const dir = tmp();
+    const rec = path.join(dir, 'checkout.har');
+    fs.writeFileSync(rec, JSON.stringify(har([
+        entry('GET', 'https://app.test/login'),
+        entry('POST', 'https://app.test/orders'),
+    ])));
+    const analysis = analyzeInputFiles([rec]);
+    const out = tmp();
+
+    const artifacts = writeIntakeArtifacts(out, analysis);
+
+    assert.ok(fs.existsSync(path.join(out, 'checkout_input_inventory.json')));
+    assert.ok(fs.existsSync(path.join(out, 'checkout_intake_report.md')));
+    assert.strictEqual(artifacts.length, 1);
+    const report = fs.readFileSync(path.join(out, 'checkout_intake_report.md'), 'utf8');
+    assert.match(report, /# Intake Report: checkout/);
+    assert.match(report, /GET \/login/);
+    assert.match(report, /POST \/orders/);
 });
 
 test('orphan filtering: CSV-defined vars are not auto-repaired (no JSR223 dump)', () => {
@@ -1830,7 +3170,10 @@ test('wrapPollingInWhileController: wraps consecutive same-endpoint samplers', (
     const out = wrapPollingInWhileController(fakeXml, [{ endpoint: 'GET /status', count: 3, startOrder: 1 }]);
     assert.strictEqual(out.wrapped, 1);
     assert.match(out.xml, /<WhileController/);
-    assert.match(out.xml, /Polling: GET \/status/);
+    // The controller name must stay a clean __jm__ variable ("Poll_1");
+    // the human-readable endpoint lives in the comments prop.
+    assert.match(out.xml, /testname="Poll_1"/);
+    assert.match(out.xml, /Elastic polling: GET \/status/);
 });
 
 test('ghost synthesizer: refuses HMAC/signing-key fields (no fake generation)', () => {
@@ -1946,6 +3289,29 @@ test('baseline diff: returns empty drift when no JTL is present', () => {
     assert.strictEqual(r.drift.length, 0);
 });
 
+test('baseline diff: uses fast JTL rows so malformed bodies do not hide status drift', () => {
+    const out = tmp();
+    const iter = path.join(out, 'iteration_1');
+    fs.mkdirSync(iter, { recursive: true });
+    fs.writeFileSync(path.join(iter, 'results.jtl'), `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /" rc="200" s="false"><responseData>raw & broken html</responseData></httpSample>
+  <httpSample lb="Step 02 - GET /" rc="200" s="true"/>
+  <httpSample lb="Step 13 - GET /redirect/" rc="500" s="false"/>
+</testResults>`);
+    const flatEntries = Array.from({ length: 13 }, (_, i) =>
+        entry('GET', `https://app.test/step-${i + 1}`, { status: 200 })
+    );
+    flatEntries[12] = entry('GET', 'https://app.test/redirect/', { status: 302 });
+
+    const diff = diffRunAgainstRecording({ outDir: out, flatEntries });
+
+    assert.strictEqual(diff.samplesCompared, 3);
+    const statusDrift = diff.drift.find(d => d.index === 12);
+    assert.ok(statusDrift, 'Step 13 status drift should not be hidden by parser/body issues');
+    assert.strictEqual(statusDrift.issues[0].observed, 500);
+});
+
 test('verifier fast JTL summary treats httpSample as a request even with a plain label', () => {
     const dir = tmp();
     const jtl = path.join(dir, 'results.jtl');
@@ -1959,6 +3325,29 @@ test('verifier fast JTL summary treats httpSample as a request even with a plain
 
     assert.strictEqual(samples.find(s => s.label === 'Login').isTransaction, true);
     assert.strictEqual(samples.find(s => s.label === 'Submit Form').isTransaction, false);
+});
+
+test('verifier fast JTL summary preserves assertion failure messages for HTTP 200 failures', () => {
+    const dir = tmp();
+    const jtl = path.join(dir, 'results.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /" rc="200" rm="OK" s="false">
+    <assertionResult>
+      <name>Stable text present</name>
+      <failure>true</failure>
+      <error>false</error>
+      <failureMessage>Test failed: text expected something using /Ghost Tools/</failureMessage>
+    </assertionResult>
+  </httpSample>
+</testResults>`);
+
+    const samples = summarizeJtlFast(jtl);
+
+    assert.strictEqual(samples[0].success, false);
+    assert.strictEqual(samples[0].code, '200');
+    assert.match(samples[0].failureMessage, /Ghost Tools/);
+    assert.match(samples[0].responseMessage, /assertion/i);
 });
 
 /* ─────────── Fix-pass tests (dual-JMX, load profile, cookie domain, patcher) ─────────── */
@@ -2402,6 +3791,7 @@ test('runner: verified correlation repair applies proven hypothesis before LLM e
     const port = server.address().port;
     const out = tmp();
     const jmxPath = path.join(out, 'flow.jmx');
+    let reverifyMaxIterations = null;
     fs.writeFileSync(jmxPath, `<jmeterTestPlan><hashTree>
       <HTTPSamplerProxy testname="Step 01 - GET /auth" enabled="true"><stringProp name="HTTPSampler.path">/auth</stringProp></HTTPSamplerProxy><hashTree/>
       <HTTPSamplerProxy testname="Step 02 - GET /me" enabled="true"><stringProp name="HTTPSampler.path">/me</stringProp></HTTPSamplerProxy><hashTree>
@@ -2416,7 +3806,7 @@ test('runner: verified correlation repair applies proven hypothesis before LLM e
                 samples: [{ label: 'Step 02 - GET /me', index: 1, success: false, responseCode: '401', isTransaction: false }],
             },
             jmxPath,
-            config: { targetBaseUrl: `http://127.0.0.1:${port}`, timeoutMs: 5000 },
+            config: { targetBaseUrl: `http://127.0.0.1:${port}`, timeoutMs: 5000, maxIterations: 3 },
             gen: {
                 flat: [
                     entry('GET', 'http://recorded.test/auth', { body: JSON.stringify({ sessionToken: recordedToken }) }),
@@ -2426,7 +3816,8 @@ test('runner: verified correlation repair applies proven hypothesis before LLM e
             outDir: out,
             name: 'flow',
             onLog: () => {},
-            feedbackLoop: async ({ jmxPath: patchedJmxPath }) => {
+            feedbackLoop: async ({ jmxPath: patchedJmxPath, maxIterations }) => {
+                reverifyMaxIterations = maxIterations;
                 const patched = fs.readFileSync(patchedJmxPath, 'utf8');
                 assert.match(patched, /JSONPostProcessor\.referenceNames">sessionToken/);
                 assert.match(patched, /\$\{sessionToken\}/);
@@ -2436,6 +3827,7 @@ test('runner: verified correlation repair applies proven hypothesis before LLM e
 
         assert.strictEqual(repair.success, true);
         assert.strictEqual(repair.successfulFixes.length, 2);
+        assert.strictEqual(reverifyMaxIterations, 3);
         assert.ok(fs.existsSync(path.join(out, 'flow_correlation_hypotheses.json')));
     } finally {
         await closeServer(server);
@@ -2489,10 +3881,16 @@ test('HTML report: load profile + correlation table + dual-recording panel rende
     const reportPath = writeHtmlReportFn(out, 'demo', {
         mode: 'generate only (har)', verdict: 'generated',
         stats: { samplers: 2, correlations: 1 },
-        samples: [],
+        samples: [{ label: 'Step 01 - GET /', success: true, isTransaction: false, code: '200', message: 'OK from JTL' }],
         correlations: [{
             variableName: 'token', sourceUrl: 'POST /auth', targetUrl: 'GET /me',
             extractorType: 'json', confidence: 0.93,
+        }, {
+            variableName: 'csrf', sourceRequestIndex: 0, targetRequestIndex: 1,
+            extractorType: 'regex', confidence: 0.85,
+        }, {
+            variableName: 'cookie_id', producer: 1, consumer: 2,
+            extractorType: 'cookie', confidence: 0.9,
         }],
         dualHar: {
             run2File: 'foo__run2.har', dynamicValueCount: 1,
@@ -2506,8 +3904,14 @@ test('HTML report: load profile + correlation table + dual-recording panel rende
     assert.match(html, /25 users/);
     assert.match(html, /ramp-up 30s/);
     assert.match(html, /hold 120s/);
-    assert.match(html, /Correlations \(1\)/);
+    assert.match(html, /200/);
+    assert.match(html, /OK from JTL/);
+    assert.match(html, /Correlations \(3\)/);
     assert.match(html, /token/);
+    assert.match(html, /Step 01/);
+    assert.match(html, /Step 02/);
+    assert.match(html, /Step 03/);
+    assert.doesNotMatch(html, /<td>\?<\/td>/);
     assert.match(html, /Dual-recording dynamics/);
     assert.match(html, /csrf/);
     assert.match(html, /Reasoning/);
@@ -2520,6 +3924,64 @@ test('assertion miner: stringProp names are stable (assert_0, assert_1) — no M
     const r2 = injectAssertionsFromMined(fakeXml, [e]);
     assert.strictEqual(r1.xml, r2.xml, 'two runs over the same input should produce identical XML');
     assert.match(r1.xml, /name="assert_0"/);
+});
+
+test('polling while: cap survives java-safe (native __jm__ idx, no JSR223 counter)', () => {
+    const fakeXml = `
+        <HTTPSamplerProxy testname="Step 01 - GET /s"></HTTPSamplerProxy><hashTree/>
+        <HTTPSamplerProxy testname="Step 02 - GET /s"></HTTPSamplerProxy><hashTree/>
+        <HTTPSamplerProxy testname="Step 03 - GET /s"></HTTPSamplerProxy><hashTree/>`;
+    const out = wrapPollingInWhileController(fakeXml, [{ endpoint: 'GET /s', count: 3, startOrder: 0 }]);
+    assert.strictEqual(out.wrapped, 1);
+    assert.doesNotMatch(out.xml, /JSR223PostProcessor/, 'a JSR223 counter would be stripped by java-safe → infinite loop');
+    assert.match(out.xml, /__jm__Poll_1__idx.*&lt; 12|__jm__Poll_1__idx.*< 12/, 'native While idx caps the loop at count*4');
+    // java-safe pass leaves the cap intact
+    const safe = sanitizeJavaUnsafeJmx(out.xml);
+    assert.match(safe.changed ? safe.xml : out.xml, /__jm__Poll_1__idx/, 'cap survives the java-safe strip');
+    // terminator is COMBINED with the cap, not a replacement that can hang
+    const terminated = wrapPollingInWhileController(fakeXml, [{ endpoint: 'GET /s', count: 3, startOrder: 0, terminator: '${__jexl3(vars.get("status") != "PENDING")}' }]);
+    assert.ok(terminated.xml.includes('vars.get(&quot;status&quot;)'), 'terminator kept');
+    assert.match(terminated.xml, /__jm__Poll_1__idx/, 'safety cap still present alongside the terminator');
+});
+
+test('disable patterns: full step labels match testnames EXACTLY (no cross-flow contamination)', () => {
+    const { samplerPatternMatches } = require('../src/transforms');
+    // The live bug: createtask's "Step 07 - POST /" disabled logi's login POST.
+    assert.strictEqual(samplerPatternMatches('Step 07 - POST /', 'Step 07 - POST /u/login/identifier', 'x Step 07 - POST /u/login/identifier'), false);
+    assert.strictEqual(samplerPatternMatches('Step 07 - POST /', 'Step 07 - POST /', 'login.example.com/ Step 07 - POST /'), true);
+    // Path patterns keep substring semantics.
+    assert.strictEqual(samplerPatternMatches('/_next/data/', 'Step 42 - GET /_next/data/abc/tasks.json', 'app.test/_next/data/abc/tasks.json Step 42 - GET /_next/data/abc/tasks.json'), true);
+    const xml = `<HTTPSamplerProxy testname="Step 07 - POST /u/login/identifier" enabled="true"><stringProp name="HTTPSampler.path">/u/login/identifier</stringProp></HTTPSamplerProxy><hashTree/>`;
+    const { disableSamplersByPattern } = require('../src/transforms');
+    const out = disableSamplersByPattern(xml, ['Step 07 - POST /']);
+    assert.strictEqual(out.disabled, 0, "another flow's login must not be disabled by a step-label pattern");
+    // Business guard applies the same rule to operator overrides.
+    const guard = businessGuard.buildBusinessGuard({
+        xml, flowName: 'logi', runCfg: { disableCalls: ['Step 07 - POST /'] },
+    });
+    assert.ok(guard.protectedNames.has('Step 07 - POST /u/login/identifier'), 'login stays protected — the step-label override belongs to a different flow');
+});
+
+test('form correlation cap: most-consumed inputs win, the rest are reported not wired', () => {
+    const page = (fields) => `<html><form method="POST" action="/next">${fields.map(([n, v]) => `<input type="hidden" name="${n}" value="${v}"/>`).join('')}</form></html>`;
+    const fields = Array.from({ length: 6 }, (_, k) => [`field_${k}`, `VALUE_${k}_abcdefgh`]);
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/form', headers: [] }, response: { status: 200, content: { text: page(fields) } } },
+        // field_0 consumed by THREE later requests, others by one each.
+        { request: { method: 'POST', url: 'https://app.test/next', headers: [], postData: { text: fields.map(([n, v]) => `${n}=${v}`).join('&') } }, response: { status: 200, content: { text: '' } } },
+        { request: { method: 'POST', url: 'https://app.test/again?f0=VALUE_0_abcdefgh', headers: [], postData: { text: 'f0=VALUE_0_abcdefgh' } }, response: { status: 200, content: { text: '' } } },
+    ];
+    const xml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /form" enabled="true"><stringProp name="HTTPSampler.path">/form</stringProp></HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - POST /next" enabled="true"><stringProp name="HTTPSampler.path">/next</stringProp><stringProp name="Argument.value">${fields.map(([n, v]) => `${n}=${v}`).join('&amp;')}</stringProp></HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 03 - POST /again" enabled="true"><stringProp name="HTTPSampler.path">/again?f0=VALUE_0_abcdefgh</stringProp></HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const { correlateFormHiddenInputs } = require('../src/transforms');
+    const out = correlateFormHiddenInputs(xml, entries, { maxVars: 2 });
+    assert.strictEqual(out.wired.length, 2, 'cap respected');
+    assert.strictEqual(out.wired[0].input, 'field_0', 'most-consumed field wired first');
+    assert.strictEqual(out.skippedByCap.length, 4);
+    assert.ok(out.skippedByCap.every(s => s.consumers >= 1));
 });
 
 test('polling while: when terminator is provided, it overrides the counter condition', () => {

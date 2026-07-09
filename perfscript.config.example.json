@@ -22,6 +22,8 @@
     "_comment": "Safe bounded agent mode. AI returns JSON suggestions only; the app applies approved patch types and re-runs JMeter.",
     "enabled": false,
     "maxLlmRounds": 1,
+    "maxReplans": 0,
+    "seniorMode": "strong",
     "javaSafeMode": true
   },
 
@@ -34,9 +36,11 @@
   },
 
   "inputState": {
-    "_comment": "Tracks processed input files by path/size/modified time so unchanged JMX/HAR/XML files are skipped across agent restarts.",
+    "_comment": "Tracks processed input files by path/size/modified time. GREEN/generated-success inputs are skipped; failed Validate/Agent runs are retried across launches up to maxFailedAttempts.",
     "enabled": true,
-    "storePath": ".perfscript-state/processed-inputs.json"
+    "storePath": ".perfscript-state/processed-inputs.json",
+    "maxFailedAttempts": 3,
+    "retryFailed": true
   },
 
   "successArchive": {
@@ -51,11 +55,24 @@
     "targetBaseUrlOverride": "",
     "_testObjective_comment": "Required for senior PE judgment. Examples: single-scenario certification, stress/capacity, soak/endurance, search/cache-behavior, spike. If blank, the agent assumes mixed-load capacity and reports that assumption.",
     "testObjective": "",
+    "_senior_context_comment": "Optional mature PE context. These improve business-flow analysis, reports, and AI evidence; they do not bypass deterministic safety gates.",
+    "techStack": ["React", "Spring Boot", "OAuth"],
+    "domainNotes": ["Orders must use unique data", "Cleanup test-created records after load runs"],
+    "businessCriticalSteps": ["submit/update business data"],
+    "slo": { "p95Ms": 750, "errorRatePct": 1 },
     "credentials": { "username": "", "password": "" },
     "dataFiles": [],
+    "uploadSearchDirs": ["input", "bin"],
+    "dashboard": {
+      "_comment": "Optional JMeter HTML dashboard. Disabled by default because jmeter -g can hang on large/XML JTLs and should not block agent verdicts.",
+      "enabled": false,
+      "timeoutMs": 30000
+    },
 
     "_disableCalls_comment": "App/flow-specific samplers to disable, matched by testname/path substring. Generic browser telemetry and standard OIDC plumbing (/authorize/resume, /oauth/token, /logout) are disabled by default in code; put YOUR app's vendor callback paths or step-numbered noise here.",
     "disableCalls": [],
+    "_allowUnsafeDisableProtected_comment": "Default false. Keep false so disableCalls cannot remove login/session/business producers. Set true only when a senior PE deliberately wants to bypass that safety guard for a known disposable sampler.",
+    "allowUnsafeDisableProtected": false,
 
     "_oauth_comment": "dropBareStateNonce: opt-in per flow. When true, bare state/nonce correlations are removed and the recorded literals stay in /authorize. Leave false for standard OAuth flows that need fresh state threaded.",
     "oauth": { "dropBareStateNonce": false },

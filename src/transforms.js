@@ -90,33 +90,31 @@ function wrapPollingInWhileController(xml, polling) {
 
         const safeCount = Math.max(p.count, 3);
         const cap = safeCount * 4;
-        // Terminator strategy: prefer the per-cluster `terminator` hint when
-        // the detector gave us one (typically a JMeter __jexl3 expression that
-        // checks a response field). Fall back to a capped counter incremented
-        // by a tiny JSR223 PostProcessor inside the loop — deterministic and
-        // doesn't depend on response-body shape we can't always parse.
-        const counterVar = `__pollCount_${wrapped + 1}`;
-        const counterCondition = `${"${__jexl3(vars.get('"+counterVar+"') == null || Integer.parseInt(vars.get('"+counterVar+"')) < "+cap+")}"}`;
-        const whileCondition = p.terminator || counterCondition;
-
-        const counterScript = `def n = vars.get("${counterVar}"); vars.put("${counterVar}", (n == null ? 1 : Integer.parseInt(n) + 1).toString())`;
-        const counterBlock = `
-        <JSR223PostProcessor guiclass="TestBeanGUI" testclass="JSR223PostProcessor" testname="Polling counter ${wrapped + 1}" enabled="true">
-          <stringProp name="cacheKey">true</stringProp>
-          <stringProp name="filename"></stringProp>
-          <stringProp name="parameters"></stringProp>
-          <stringProp name="script">${escXmlAttr(counterScript)}</stringProp>
-          <stringProp name="scriptLanguage">groovy</stringProp>
-        </JSR223PostProcessor>
-        <hashTree/>`;
+        // The loop cap must survive the java-safe strip. The old JSR223
+        // counter got REMOVED by that pass, leaving `vars.get(counter)` null
+        // forever → an INFINITE While loop (seen live: rdChart2.aspx polled
+        // until the 4-minute ceiling killed the run). JMeter natively exposes
+        // the While iteration index as ${__jm__<testname>__idx} — zero
+        // scripting, nothing to strip. A terminator hint, when present, is
+        // COMBINED with the cap (a terminator that never matches live must
+        // not hang the test either).
+        const whileName = `Poll_${wrapped + 1}`;
+        const capExpr = `\${__jm__${whileName}__idx} < ${cap}`;
+        let whileCondition = `\${__jexl3(${capExpr})}`;
+        if (p.terminator) {
+            const inner = String(p.terminator).match(/^\s*\$\{__jexl3\(([\s\S]*)\)\}\s*$/);
+            whileCondition = inner
+                ? `\${__jexl3((${inner[1]}) && ${capExpr})}`
+                : p.terminator; // unknown expression shape — honor as-is
+        }
 
         const wrappedBlock = `
-        <WhileController guiclass="WhileControllerGui" testclass="WhileController" testname="Polling: ${escXmlAttr(p.endpoint)} (cap ${cap})" enabled="true">
+        <WhileController guiclass="WhileControllerGui" testclass="WhileController" testname="${whileName}" enabled="true">
           <stringProp name="WhileController.condition">${escXmlAttr(whileCondition)}</stringProp>
+          <stringProp name="TestPlan.comments">Elastic polling: ${escXmlAttr(p.endpoint)} — recorded ${p.count}x, capped at ${cap} iterations via native __jm__${whileName}__idx</stringProp>
         </WhileController>
         <hashTree>
 ${block}
-${counterBlock}
         </hashTree>`;
 
         result = result.substring(0, blockStart) + wrappedBlock + result.substring(lastHashTreeEnd);
@@ -728,21 +726,41 @@ function applyLoadProfile(xml, profile = {}) {
  *
  * @returns {{ xml, disabled, hits: string[] }}
  */
-function disableSamplersByPattern(xml, patterns) {
+/**
+ * A pattern that IS a full step label ("Step 07 - POST /") is recording-
+ * specific: it must match the testname EXACTLY. Substring matching let a
+ * createtask-era "Step 07 - POST /" disable a DIFFERENT flow's
+ * "Step 07 - POST /u/login/identifier" — the agent disabled that flow's
+ * login. Non-step patterns (paths, hosts) keep substring semantics.
+ */
+const STEP_LABEL_PATTERN_RE = /^Step \d+ - [A-Z]+ \S*$/;
+function samplerPatternMatches(pattern, name, hay) {
+    if (STEP_LABEL_PATTERN_RE.test(String(pattern))) return name === pattern;
+    return hay.includes(pattern);
+}
+
+function disableSamplersByPattern(xml, patterns, opts = {}) {
     if (!Array.isArray(patterns) || patterns.length === 0) return { xml, disabled: 0, hits: [] };
-    let disabled = 0; const hits = [];
+    const protect = typeof opts.protect === 'function' ? opts.protect : null;
+    let disabled = 0; const hits = []; const skippedProtected = [];
     const out = xml.replace(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g, (m, attrs, inner) => {
         const path = (inner.match(/<stringProp name="HTTPSampler\.path">([^<]*)</) || [])[1] || '';
         const domain = (inner.match(/<stringProp name="HTTPSampler\.domain">([^<]*)</) || [])[1] || '';
+        const method = (inner.match(/<stringProp name="HTTPSampler\.method">([^<]*)</) || [])[1] || '';
         const name = (attrs.match(/testname="([^"]*)"/) || [])[1] || '';
         const hay = `${domain}${path} ${name}`;
-        if (patterns.some(p => hay.includes(p)) && /enabled="true"/.test(attrs)) {
+        if (patterns.some(p => samplerPatternMatches(p, name, hay)) && /enabled="true"/.test(attrs)) {
+            const sampler = { name, path, domain, method, body: inner };
+            if (protect && protect(sampler)) {
+                skippedProtected.push((name || path).slice(0, 80));
+                return m;
+            }
             disabled++; hits.push((name || path).slice(0, 60));
             return `<HTTPSamplerProxy${attrs.replace('enabled="true"', 'enabled="false"')}>${inner}</HTTPSamplerProxy>`;
         }
         return m;
     });
-    return { xml: out, disabled, hits };
+    return { xml: out, disabled, hits, skippedProtected };
 }
 
 /* ─────────────────────────────────────────────────────────────────
@@ -772,9 +790,10 @@ function disableSamplersByPattern(xml, patterns) {
  * @param {Array}  flatEntries HAR-shape entries in sampler order
  * @returns {{ xml: string, wired: Array<{var:string,input:string,producerSampler:string,substitutions:number}> }}
  */
-function correlateFormHiddenInputs(xml, flatEntries) {
+function correlateFormHiddenInputs(xml, flatEntries, opts = {}) {
     const entries = flatEntries || [];
-    if (!xml || entries.length === 0) return { xml, wired: [] };
+    const maxVars = Number.isFinite(Number(opts.maxVars)) ? Math.max(1, Number(opts.maxVars)) : 15;
+    if (!xml || entries.length === 0) return { xml, wired: [], skippedByCap: [] };
 
     // 1. Producers: hidden inputs with substantial values in HTML responses.
     const candidates = [];
@@ -796,22 +815,28 @@ function correlateFormHiddenInputs(xml, flatEntries) {
     }
     if (!candidates.length) return { xml, wired: [] };
 
-    // 2. Keep only values a LATER entry actually consumes.
-    const consumed = candidates.filter(c => {
+    // 2. Keep only values a LATER entry actually consumes — and COUNT the
+    //    consumers, because form-heavy apps (Logi, WebForms) carry dozens of
+    //    echoed hidden fields per page. Each wired var costs a CSS DOM parse
+    //    per response at runtime; ~60 of them made a live run crawl. Cap at
+    //    the most-consumed maxVars (run.formCorrelation.maxVars to raise) and
+    //    report what the cap skipped so a human can widen it deliberately.
+    const withConsumers = candidates.map(c => {
+        let consumers = 0;
         for (let j = c.entryIndex + 1; j < entries.length; j++) {
             const req = entries[j]?.request || {};
-            if ((req.url || '').includes(c.value)) return true;
-            if ((req.postData?.text || '').includes(c.value)) return true;
-            for (const p of req.postData?.params || []) {
-                if (String(p.value || '').includes(c.value)) return true;
-            }
-            for (const h of req.headers || []) {
-                if (String(h.value || '').includes(c.value)) return true;
+            if ((req.url || '').includes(c.value) ||
+                (req.postData?.text || '').includes(c.value) ||
+                (req.postData?.params || []).some(p => String(p.value || '').includes(c.value)) ||
+                (req.headers || []).some(h => String(h.value || '').includes(c.value))) {
+                consumers++;
             }
         }
-        return false;
-    });
-    if (!consumed.length) return { xml, wired: [] };
+        return { ...c, consumers };
+    }).filter(c => c.consumers > 0).sort((a, b) => b.consumers - a.consumers);
+    const consumed = withConsumers.slice(0, maxVars);
+    const skippedByCap = withConsumers.slice(maxVars).map(c => ({ input: c.input, consumers: c.consumers }));
+    if (!consumed.length) return { xml, wired: [], skippedByCap };
 
     let out = xml;
     const wired = [];
@@ -876,7 +901,7 @@ function correlateFormHiddenInputs(xml, flatEntries) {
             substitutions,
         });
     }
-    return { xml: out, wired };
+    return { xml: out, wired, skippedByCap };
 }
 
 /** Map a flat-entry index onto its sampler order, tolerating filtered/renamed lists. */
@@ -940,6 +965,7 @@ function stripGuiListenersForRun(xml, jtlPath) {
 
 module.exports = {
     disableSamplersByPattern,
+    samplerPatternMatches,
     wrapPollingInWhileController,
     injectGhostSynthesizers,
     rewireClientMintedOauthVars,

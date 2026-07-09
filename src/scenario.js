@@ -105,27 +105,26 @@ function insertPacingTimers(xml, { perHour, durationSec }) {
           <intProp name="ActionProcessor.target">0</intProp>
           <stringProp name="ActionProcessor.duration">0</stringProp>
         </TestAction>
-        <hashTree>
-          <PreciseThroughputTimer guiclass="TestBeanGUI" testclass="PreciseThroughputTimer" testname="Pacing ${Math.round(perHour)}/hour (scenario)" enabled="true">
-            <intProp name="exactLimit">0</intProp>
-            <doubleProp>
-              <name>allowedThroughputSurplus</name>
-              <value>0.0</value>
-              <savedValue>0.0</savedValue>
-            </doubleProp>
-            <intProp name="batchSize">1</intProp>
-            <intProp name="batchThreadDelay">0</intProp>
-            <longProp name="duration">${Math.max(60, Math.round(durationSec))}</longProp>
-            <longProp name="randomSeed">0</longProp>
-            <doubleProp>
-              <name>throughput</name>
-              <value>${(perHour / 3600).toFixed(6)}</value>
-              <savedValue>0.0</savedValue>
-            </doubleProp>
-            <intProp name="throughputPeriod">1</intProp>
-          </PreciseThroughputTimer>
-          <hashTree/>
-        </hashTree>`;
+        <hashTree/>
+        <PreciseThroughputTimer guiclass="TestBeanGUI" testclass="PreciseThroughputTimer" testname="Pacing ${Math.round(perHour)}/hour (scenario)" enabled="true">
+          <intProp name="exactLimit">0</intProp>
+          <doubleProp>
+            <name>allowedThroughputSurplus</name>
+            <value>0.0</value>
+            <savedValue>0.0</savedValue>
+          </doubleProp>
+          <intProp name="batchSize">1</intProp>
+          <intProp name="batchThreadDelay">0</intProp>
+          <longProp name="duration">${Math.max(60, Math.round(durationSec))}</longProp>
+          <longProp name="randomSeed">0</longProp>
+          <doubleProp>
+            <name>throughput</name>
+            <value>${(perHour / 3600).toFixed(6)}</value>
+            <savedValue>0.0</savedValue>
+          </doubleProp>
+          <intProp name="throughputPeriod">1</intProp>
+        </PreciseThroughputTimer>
+        <hashTree/>`;
     const out = xml.replace(/(<ThreadGroup\b[^>]*enabled="true"[\s\S]*?<\/ThreadGroup>)(\s*<hashTree>)/g, (_m, tg, open) => {
         inserted++;
         return tg + open + block;

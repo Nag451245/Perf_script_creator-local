@@ -1,0 +1,125 @@
+'use strict';
+/**
+ * replanner.js — change APPROACH mid-job, not just parameters.
+ *
+ * When every repair round has failed, a human senior does not keep patching
+ * the same script — they step back and rebuild it differently: "stop
+ * correlating bare state, replay it literal", "those failing beacons feed
+ * nothing, fold them", "loosen the mined assertions and see what's really
+ * broken". Each strategy here is exactly that: a RE-GENERATION with a
+ * different runCfg, selected by the run's failure evidence, tried at most
+ * once, verified like any other attempt, and recorded in the attempt log.
+ *
+ * Strategies are evidence-gated — a strategy that the evidence doesn't
+ * support is never proposed — and the operator's explicit config is never
+ * overridden (a knob the config sets stays set).
+ */
+
+/**
+ * @param {Object} args
+ * @param {Object} args.result        final (failed) run result
+ * @param {Object} args.runCfg        effective run config of the failed attempt
+ * @param {Object} args.valueFlow     classifySamplerDisableDecisions output
+ * @param {Object} args.classification classifyFirstFailure output (may be null)
+ * @param {Object} args.seniorPeAnalysis structured senior PE analysis (may be null)
+ * @param {string[]} args.tried       strategy ids already attempted
+ * @returns {null | {id, reason, evidence, runCfgPatch}}
+ */
+function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classification = null, seniorPeAnalysis = null, tried = [] } = {}) {
+    const strategies = [];
+    const reqs = (result.samples || []).filter(s => !s.isTransaction);
+    const failing = reqs.filter(s => s.success === false);
+    if (!failing.length) return null;
+
+    const nativePatch = nativeManagerPatch(seniorPeAnalysis);
+    if (nativePatch) {
+        strategies.push({
+            id: 'native-manager-correction',
+            reason: 'senior PE analysis found native HTTP state that should be owned by JMeter managers before more extractor patching',
+            evidence: nativePatch.evidence,
+            runCfgPatch: { forceNativeManagers: nativePatch.forceNativeManagers },
+        });
+    }
+
+    if (seniorPeAnalysis && (seniorPeAnalysis.recommendedNextStrategy || {}).id === 'scenario-gap-warning') {
+        strategies.push({
+            id: 'scenario-gap-warning',
+            reason: 'senior PE analysis found workload/SLO/data-model gaps; record the warning and keep deterministic repair knobs unchanged',
+            evidence: (seniorPeAnalysis.riskGaps || []).map(g => `${g.gap}: ${g.action || ''}`).slice(0, 4).join('; '),
+            runCfgPatch: {},
+        });
+    }
+
+    // 1. Auth-state strategy: the first failure sits in the auth/login
+    //    segment → flip how bare OAuth state/nonce are handled. Whichever way
+    //    the last generation went, try the other — unless the operator pinned
+    //    it in config (explicit oauth config wins, we only flip the effective
+    //    value when it came from a default/playbook).
+    const authFailure = failing.some(s => /login|authorize|callback|identifier|password|oauth|iam/i.test(String(s.label || s.name || ''))) ||
+        (classification && /auth|session|redirect/i.test(String(classification.category || '')));
+    if (authFailure && !(runCfg.oauth && runCfg.oauth._operatorPinned)) {
+        const current = !!(runCfg.oauth && runCfg.oauth.dropBareStateNonce);
+        strategies.push({
+            id: current ? 'correlate-bare-state-nonce' : 'drop-bare-state-nonce',
+            reason: current
+                ? 'auth segment still failing with state/nonce replayed as recorded literals — regenerate WITH bare state/nonce correlation'
+                : 'auth segment failing with correlated state/nonce — regenerate replaying the recorded literals (some IdPs validate server-side session, not the echoed value)',
+            evidence: `failing auth-segment sampler(s): ${failing.filter(s => /login|authorize|callback|identifier|password|oauth|iam/i.test(String(s.label || s.name || ''))).map(s => s.label || s.name).slice(0, 3).join(', ') || classification && classification.category}`,
+            runCfgPatch: { oauth: { ...(runCfg.oauth || {}), dropBareStateNonce: !current } },
+        });
+    }
+
+    // 2. Fold-disposables strategy: value-flow analysis marked failing
+    //    samplers as disposable plumbing (nothing downstream consumes their
+    //    output) → regenerate with them disabled from the start.
+    const disposable = valueFlow && Array.isArray(valueFlow.byIndex)
+        ? valueFlow.byIndex.filter(d => d.decision === 'disposable_plumbing' && d.failed).map(d => d.sampler)
+        : [];
+    if (disposable.length) {
+        strategies.push({
+            id: 'fold-disposable-plumbing',
+            reason: `${disposable.length} failing sampler(s) produce nothing any later request consumes — fold them and re-verify the business flow without the noise`,
+            evidence: disposable.slice(0, 5).join(', '),
+            runCfgPatch: { disableCalls: [...new Set([...(runCfg.disableCalls || []), ...disposable])] },
+        });
+    }
+
+    // 3. Assertion-relief strategy: every failing sampler returned 2xx/3xx —
+    //    the flow may be healthy and the mined assertions wrong. Regenerate
+    //    without mined assertions so the NEXT run separates "text drifted"
+    //    from "flow broken". (Outcome probe and guard still stand watch.)
+    const allSoft = failing.every(s => /^(2|3)\d\d$/.test(String(s.responseCode || s.code || '')));
+    if (allSoft && runCfg.mineAssertions !== false) {
+        strategies.push({
+            id: 'assertion-relief',
+            reason: 'every failing sampler returned 2xx/3xx — likely mined-assertion strictness, not flow breakage; regenerate without mined assertions to isolate it (outcome probe + business guard remain)',
+            evidence: failing.slice(0, 4).map(s => `${s.label || s.name}=${s.responseCode || s.code}`).join(', '),
+            runCfgPatch: { mineAssertions: false },
+        });
+    }
+
+    return strategies.find(s => !tried.includes(s.id)) || null;
+}
+
+function nativeManagerPatch(analysis) {
+    if (!analysis) return null;
+    const requested = (analysis.recommendedNextStrategy || {}).id === 'native-manager-correction';
+    const findings = analysis.nativeManagerFindings || [];
+    const required = findings.filter(m => ['required', 'recommended'].includes(m.decision));
+    if (!requested && !required.length) return null;
+    const forceNativeManagers = {};
+    for (const finding of required) {
+        const manager = String(finding.manager || '').toLowerCase();
+        if (manager.includes('cookie')) forceNativeManagers.cookie = true;
+        if (manager.includes('cache')) forceNativeManagers.cache = true;
+        if (manager.includes('authorization')) forceNativeManagers.authorization = true;
+        if (manager.includes('redirect')) forceNativeManagers.redirects = true;
+    }
+    if (!Object.keys(forceNativeManagers).length && requested) forceNativeManagers.cookie = true;
+    return {
+        forceNativeManagers,
+        evidence: required.map(m => `${m.manager}:${m.decision}`).join(', ') || (analysis.recommendedNextStrategy && analysis.recommendedNextStrategy.evidence) || '',
+    };
+}
+
+module.exports = { proposeReplan, _internal: { nativeManagerPatch } };

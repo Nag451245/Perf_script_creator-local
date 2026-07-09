@@ -23,6 +23,17 @@ const { jtlParser } = require('./engine');
 
 const DEFAULT_LENGTH_DRIFT_PCT = 30; // > +/- 30% body-length change worth flagging
 
+function killProcessTree(pid) {
+    if (!pid) return;
+    if (process.platform === 'win32') {
+        try {
+            spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+            return;
+        } catch { /* fall through */ }
+    }
+    try { process.kill(pid, 'SIGKILL'); } catch { /* ignore */ }
+}
+
 function safeJsonShape(text) {
     if (!text || typeof text !== 'string') return null;
     let parsed;
@@ -58,9 +69,13 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
     const jtlPath = findLastJtl(outDir);
     if (!jtlPath) return { jtlPath: null, samplesCompared: 0, drift: [] };
 
-    let jtl;
-    try { jtl = jtlParser.parseJtlBuffer(fs.readFileSync(jtlPath)); }
-    catch { return { jtlPath, samplesCompared: 0, drift: [{ reason: 'jtl-parse-failed' }] }; }
+    const xml = fs.readFileSync(jtlPath, 'utf8');
+    const fastSamples = summarizeJtlFast(jtlPath).filter(s => !s.isTransaction);
+    let parsedEntries = [];
+    try {
+        const jtl = jtlParser.parseJtlBuffer(Buffer.from(xml));
+        parsedEntries = jtl.entries || [];
+    } catch { /* fast status comparison still works on malformed saved bodies */ }
 
     // Pair JTL samples to recording entries in document order, only using
     // entries the engine kept (filtered) -- those are the ones JMeter ran.
@@ -73,14 +88,15 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
         bodyLen: Number(e.response?.content?.size || (e.response?.content?.text || '').length || 0),
         shape: safeJsonShape(e.response?.content?.text || ''),
     }));
-    const jtlEntries = jtl.entries || [];
-    const compareLen = Math.min(recBy.length, jtlEntries.length);
-    for (let i = 0; i < compareLen; i++) {
+    const pairs = alignRecordingSamples(flatEntries || [], fastSamples);
+    for (const pair of pairs) {
+        const i = pair.entryIndex;
         const r = recBy[i];
-        const j = jtlEntries[i];
-        const jStatus = Number(j.response?.status || 0);
-        const jBodyLen = Number(j.response?.content?.size || (j.response?.content?.text || '').length || 0);
-        const jShape = safeJsonShape(j.response?.content?.text || '');
+        if (!r) continue;
+        const parsed = parsedEntries[pair.sampleIndex] || {};
+        const jStatus = Number(pair.sample.responseCode || pair.sample.code || pair.sample.status || parsed.response?.status || 0);
+        const jBodyLen = Number(parsed.response?.content?.size || (parsed.response?.content?.text || '').length || 0);
+        const jShape = safeJsonShape(parsed.response?.content?.text || '');
         const issues = [];
         // Recorded 3xx that replays 2xx is not drift: the recording stored the
         // RAW redirect hop while JMeter (follow_redirects) reports the
@@ -111,14 +127,43 @@ function diffRunAgainstRecording({ outDir, flatEntries, thresholdPct = DEFAULT_L
     }
     const rootCause = statusAnalysis.traceStatusRootCause({
         entries: flatEntries,
-        samples: jtlEntries.map((j, i) => ({
-            label: j.label || j.name || (flatEntries[i] ? `${recBy[i].method} ${recBy[i].url}` : ''),
-            code: j.response && j.response.status,
-            success: Number(j.response && j.response.status || 0) < 400,
-            isTransaction: false,
-        })),
+        samples: fastSamples,
     });
-    return { jtlPath, samplesCompared: compareLen, drift, folded, rootCause };
+    return { jtlPath, samplesCompared: pairs.length, drift, folded, rootCause };
+}
+
+function alignRecordingSamples(entries, samples) {
+    const pairs = [];
+    const usedSampleIndexes = new Set();
+    const usedEntryIndexes = new Set();
+
+    for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+        const sample = samples[sampleIndex] || {};
+        const stepNumber = stepNumberFromLabel(sample.label || sample.name);
+        if (!stepNumber) continue;
+        const entryIndex = stepNumber - 1;
+        if (entryIndex < 0 || entryIndex >= entries.length || usedEntryIndexes.has(entryIndex)) continue;
+        pairs.push({ entryIndex, sampleIndex, sample });
+        usedEntryIndexes.add(entryIndex);
+        usedSampleIndexes.add(sampleIndex);
+    }
+
+    let fallbackEntryIndex = 0;
+    for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+        if (usedSampleIndexes.has(sampleIndex)) continue;
+        while (fallbackEntryIndex < entries.length && usedEntryIndexes.has(fallbackEntryIndex)) fallbackEntryIndex++;
+        if (fallbackEntryIndex >= entries.length) break;
+        pairs.push({ entryIndex: fallbackEntryIndex, sampleIndex, sample: samples[sampleIndex] || {} });
+        usedEntryIndexes.add(fallbackEntryIndex);
+        fallbackEntryIndex++;
+    }
+
+    return pairs.sort((a, b) => a.entryIndex - b.entryIndex || a.sampleIndex - b.sampleIndex);
+}
+
+function stepNumberFromLabel(label) {
+    const match = /^Step\s+0*(\d+)\b/i.exec(String(label || '').trim());
+    return match ? Number(match[1]) : 0;
 }
 
 /**
@@ -150,7 +195,7 @@ function generateHtmlDashboard({ jmeterBinPath, jtlPath, outDir, onLog = () => {
         // node process sits forever (we hit this exact bug — the whole --run
         // looked "stuck" after a clean iteration finished).
         const timer = setTimeout(() => {
-            try { child.kill('SIGKILL'); } catch { /* ignore */ }
+            killProcessTree(child.pid);
             onLog(`dashboard timed out after ${timeoutMs}ms; killed`);
             finish({ ok: false, error: `jmeter -g timed out after ${timeoutMs}ms` });
         }, timeoutMs);
@@ -175,7 +220,7 @@ function generateHtmlDashboard({ jmeterBinPath, jtlPath, outDir, onLog = () => {
  * irrelevant — fast and unbreakable. Sub-sample (redirect) hops `<label>-N` are
  * folded into their parent, matching the engine's summarizeSamples shape.
  *
- * @returns {Array<{label,code,success,isTransaction}>}
+ * @returns {Array<{label,code,success,isTransaction,responseMessage?,failureMessage?}>}
  */
 function summarizeJtlFast(jtlPath) {
     if (!jtlPath || !fs.existsSync(jtlPath)) return [];
@@ -187,20 +232,68 @@ function summarizeJtlFast(jtlPath) {
     while ((m = re.exec(xml)) !== null) {
         const tag = m[1];
         const a = m[2];
-        const lb = (a.match(/\blb="([^"]*)"/) || [])[1] || '';
+        const lb = unescapeXml((a.match(/\blb="([^"]*)"/) || [])[1] || '');
         if (!lb) continue;
-        const rc = (a.match(/\brc="([^"]*)"/) || [])[1] || '';
+        const rc = unescapeXml((a.match(/\brc="([^"]*)"/) || [])[1] || '');
+        const rm = unescapeXml((a.match(/\brm="([^"]*)"/) || [])[1] || '');
         const s = /\bs="true"/.test(a);
-        raw.push({ tag, lb, rc, s });
+        const body = extractTagBody(xml, re.lastIndex, tag);
+        const failureMessage = firstAssertionFailure(body);
+        raw.push({ tag, lb, rc, rm, s, failureMessage });
         labels.add(lb);
     }
     const out = [];
     for (const r of raw) {
         const sub = /^(.+)-\d+$/.exec(r.lb);
         if (sub && labels.has(sub[1])) continue; // fold redirect hops
-        out.push({ label: r.lb, code: r.rc, success: r.s, isTransaction: r.tag === 'sample' });
+        out.push({
+            label: r.lb,
+            code: r.rc,
+            responseCode: r.rc,
+            success: r.s,
+            isTransaction: r.tag === 'sample',
+            responseMessage: r.failureMessage ? `JMeter assertion failed: ${r.failureMessage}` : r.rm,
+            failureMessage: r.failureMessage,
+        });
     }
     return out;
 }
 
-module.exports = { diffRunAgainstRecording, generateHtmlDashboard, findLastJtl, summarizeJtlFast, _internal: { safeJsonShape } };
+function extractTagBody(xml, offset, tag) {
+    const token = new RegExp(`<(/?)${tag}\\b[^>]*>`, 'g');
+    token.lastIndex = offset;
+    let depth = 1;
+    let match;
+    while ((match = token.exec(xml)) !== null) {
+        if (match[1]) {
+            depth--;
+            if (depth === 0) return xml.slice(offset, match.index);
+        } else if (!/\/>$/.test(match[0])) {
+            depth++;
+        }
+    }
+    return '';
+}
+
+function firstAssertionFailure(body) {
+    const assertionRe = /<assertionResult\b[^>]*>([\s\S]*?)<\/assertionResult>/g;
+    let match;
+    while ((match = assertionRe.exec(body || '')) !== null) {
+        const block = match[1] || '';
+        if (!/<(?:failure|error)>\s*true\s*<\/(?:failure|error)>/i.test(block)) continue;
+        const message = (block.match(/<failureMessage>([\s\S]*?)<\/failureMessage>/i) || [])[1] || '';
+        return unescapeXml(message.trim());
+    }
+    return '';
+}
+
+function unescapeXml(value) {
+    return String(value || '')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+}
+
+module.exports = { diffRunAgainstRecording, generateHtmlDashboard, findLastJtl, summarizeJtlFast, _internal: { safeJsonShape, killProcessTree } };

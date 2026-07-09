@@ -23,11 +23,45 @@ function deriveBlockers({
     entries = [],
     hasSecondRecording = true,
     ghostsRefused = 0,
+    uploadFiles = null,
 } = {}) {
     const blockers = [];
     const reqs = (result.samples || []).filter(s => !s.isTransaction);
     const failing = reqs.filter(s => s.success === false);
     const codeOf = (s) => String(s.responseCode || s.code || '');
+    const forensic = result.failureForensics || null;
+
+    if (forensic && forensic.rootCause) {
+        const root = forensic.rootCause;
+        const recorded = root.recordedStatus ?? root.expected;
+        const observed = root.observedStatus ?? root.observed;
+        const missingCookies = forensic.authSession && forensic.authSession.missingSessionCookies || [];
+        const downstreamGraphql = forensic.graphql && forensic.graphql.downstreamSymptoms || [];
+        const authEvidence = forensic.redirects && forensic.redirects.interactiveAuthWall ||
+            missingCookies.length ||
+            /auth|session|cookie|csrf|token/i.test(root.category || '') ||
+            /^(401|403)$/.test(String(observed || ''));
+        if (authEvidence) {
+            blockers.push({
+                id: 'auth-session-forensics',
+                blocker: `${root.sampler} diverged first: recorded ${recorded}, observed ${observed}`,
+                ask: 'Provide a test-friendly login path: a non-MFA account, browser-captured session fallback, or API token for this environment. Do not keep guessing extractors against downstream API/GraphQL symptoms until this auth/session producer is proven live.',
+                evidence: [
+                    missingCookies.length ? `missing session cookie(s): ${missingCookies.join(', ')}` : null,
+                    forensic.redirects && forensic.redirects.interactiveAuthWall ? 'interactive auth redirect wall detected' : null,
+                    downstreamGraphql.length ? `${downstreamGraphql.length} GraphQL downstream symptom(s)` : null,
+                ].filter(Boolean).join('; ') || forensic.summary || root.category || '',
+            });
+        }
+        if (Number(observed) >= 500) {
+            blockers.push({
+                id: 'environment-forensics',
+                blocker: `${root.sampler} diverged first: recorded ${recorded}, observed ${observed}`,
+                ask: 'Validate staging manually for this exact endpoint before script repair. If a logged-in browser or curl gets the same 5xx, fix the environment first.',
+                evidence: forensic.summary || `category=${root.category || 'server_error'}`,
+            });
+        }
+    }
 
     // 1. Login rejected and we have no operator credentials to try.
     const authFail = failing.find(s => LOGIN_LABEL_RE.test(String(s.label || s.name || '')) && /^(401|403)$/.test(codeOf(s)));
@@ -87,6 +121,25 @@ function deriveBlockers({
             blocker: `${ghostsRefused} client-minted value(s) look signed (HMAC/JWT-like) — the signing key never appears in traffic`,
             ask: 'Ask the dev team for the signing logic/key for these values, or confirm their consumers are safe to disable. See the ghosts section of the reasoning report for names.',
             evidence: `ghostsRefused=${ghostsRefused}`,
+        });
+    }
+
+    const missingUploads = uploadFiles && Array.isArray(uploadFiles.missing) ? uploadFiles.missing : [];
+    if (missingUploads.length) {
+        const names = [...new Set(missingUploads.map(u => u.fileName).filter(Boolean))];
+        const ambiguous = missingUploads.filter(u => u.reason === 'ambiguous-compatible-file' && Array.isArray(u.candidateNames) && u.candidateNames.length);
+        const candidateNames = [...new Set(ambiguous.flatMap(u => u.candidateNames).filter(Boolean))];
+        blockers.push({
+            id: 'upload-file',
+            blocker: ambiguous.length
+                ? `${names.length} upload file reference(s) have multiple compatible local candidates`
+                : `${names.length} upload file(s) referenced by the recording were not found locally`,
+            ask: ambiguous.length
+                ? `Choose the correct file for ${names.slice(0, 5).join(', ')} from these candidates: ${candidateNames.slice(0, 8).join(', ')}. Keep only the intended file in input/, bin/, or configured upload dirs and rerun.`
+                : `Place ${names.slice(0, 5).join(', ')} in input/, bin/, or configured upload dirs and rerun. JMeter cannot replay multipart upload steps without the original file bytes.`,
+            evidence: missingUploads.slice(0, 3).map(u =>
+                `${u.samplerLabel || 'upload sampler'} field=${u.fieldName || 'file'} file=${u.fileName}`
+            ).join('; '),
         });
     }
 

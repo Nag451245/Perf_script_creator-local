@@ -1,6 +1,7 @@
 'use strict';
 
 const statusAnalysis = require('./status-analysis');
+const peNaming = require('./pe-naming');
 
 const AUTH_PATH_RE = /\/(?:authorize(?:\/resume)?|iam\/callback|redirect|authorization|login|u\/login|oauth|saml|sso)\b/i;
 
@@ -292,8 +293,7 @@ function alignEntrySamplePairs(entries, samples) {
 }
 
 function stepNumberFromLabel(label) {
-    const match = /^Step\s+0*(\d+)\b/i.exec(String(label || '').trim());
-    return match ? Number(match[1]) : 0;
+    return peNaming.stepNumberFromLabel(label);
 }
 
 function cookieNamesFromEntries(entries) {

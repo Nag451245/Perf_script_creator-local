@@ -61,6 +61,11 @@ const uploadFiles = require('../src/upload-files');
 const runProgress = require('../src/run-progress');
 const runEvidence = require('../src/run-evidence');
 const samplerDecision = require('../src/sampler-decision');
+const peNaming = require('../src/pe-naming');
+const outputOrganizer = require('../src/output-organizer');
+const postRunAdjudicator = require('../src/post-run-adjudicator');
+const uiInputs = require('../src/ui-inputs');
+const uiProcessControl = require('../src/ui-process-control');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
 function listenLocal(server) {
@@ -213,26 +218,120 @@ test('HTML report: renders verified learning matches and learned lessons', () =>
     assert.match(html, /learn_learned_lessons\.json/);
 });
 
-test('HTML report: renders friendly decision labels for core flow samplers', () => {
+test('HTML report: renders request adjudication labels and artifact links', () => {
     const out = tmp();
+    fs.writeFileSync(path.join(out, 'decisions_request_adjudication.json'), JSON.stringify({
+        name: 'decisions',
+        iterations: [{
+            summary: { disable: 1, protect: 2, ignore: 1, stop: 0, blocked: 1 },
+            decisions: [
+                { samplerLabel: 'Step 01 - GET /jwt/v2/create-cookie', category: 'dead_plumbing', action: 'disable' },
+                { samplerLabel: 'Step 02 - GET /dashboard', category: 'business_request', action: 'protect' },
+            ],
+        }],
+    }, null, 2));
     const reportPath = writeHtmlReport(out, 'decisions', {
         mode: 'agent',
         verdict: 'GREEN',
         stats: {},
-        samples: [{ label: 'Step 01 - POST /edoc/temporal-file/save', success: true, isTransaction: false, code: '200' }],
-        disableDecisions: {
-            bySampler: {
-                'Step 01 - POST /edoc/temporal-file/save': {
-                    samplerLabel: 'Step 01 - POST /edoc/temporal-file/save',
-                    decision: 'must_fix',
-                },
-            },
-        },
+        samples: [
+            { label: 'Step 01 - GET /jwt/v2/create-cookie', success: false, isTransaction: false, code: '400' },
+            { label: 'Step 02 - GET /dashboard', success: true, isTransaction: false, code: '200' },
+        ],
     });
     const html = fs.readFileSync(reportPath, 'utf8');
 
-    assert.match(html, /Core flow/);
+    assert.match(html, /Request adjudication/);
+    assert.match(html, /Dead plumbing/);
+    assert.match(html, /Business request/);
+    assert.match(html, /decisions_request_adjudication\.json/);
     assert.doesNotMatch(html, /must_fix/);
+});
+
+test('PE naming: builds spreadsheet-style transaction and request labels with step alignment', () => {
+    const entries = [
+        entry('GET', 'https://app.test/authorization/'),
+        entry('POST', 'https://app.test/user/login'),
+        entry('GET', 'https://app.test/patientChart.php?id=123'),
+    ];
+
+    const model = peNaming.buildPeNamingModel({ entries, flowName: 'add_physicians' });
+
+    assert.strictEqual(model.scenarioCode, 'SC01');
+    assert.match(model.labelByIndex.get(0).peLabel, /^SC01_T01_\/authorization\/-001$/);
+    assert.match(model.labelByIndex.get(1).peLabel, /^SC01_T02_\/user\/login-002$/);
+    assert.match(model.labelByIndex.get(2).peLabel, /^SC01_T03_\/patientChart\.php-003$/);
+    assert.match(model.labelByIndex.get(0).transactionLabel, /^SC01_T01_Add_Physicians_/);
+    assert.strictEqual(model.labelByIndex.get(2).originalLabel, 'Step 03 - GET /patientChart.php');
+});
+
+test('PE naming: generated JMX uses prefixed sampler labels and writes label map', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/authorization/'),
+        entry('POST', 'https://app.test/user/login'),
+        entry('GET', 'https://app.test/patientChart.php?id=123'),
+    ]));
+    const out = tmp();
+
+    const gen = generate(entries, pages, out, 'add_physicians');
+    const jmx = fs.readFileSync(gen.jmxPath, 'utf8');
+    const labelMapPath = path.join(out, 'add_physicians_label_map.json');
+    const labelMap = JSON.parse(fs.readFileSync(labelMapPath, 'utf8'));
+
+    assert.match(jmx, /TransactionController[^>]+testname="SC01_T01_Add_Physicians_/);
+    assert.match(jmx, /HTTPSamplerProxy[^>]+testname="SC01_T01_\/authorization\/-001"/);
+    assert.match(jmx, /HTTPSamplerProxy[^>]+testname="SC01_T02_\/user\/login-002"/);
+    assert.match(jmx, /HTTPSamplerProxy[^>]+testname="SC01_T03_\/patientChart\.php-003"/);
+    assert.strictEqual(labelMap.requests.length, 3);
+    assert.strictEqual(labelMap.requests[2].originalLabel, 'Step 03 - GET /patientChart.php');
+    assert.strictEqual(labelMap.requests[2].stepNumber, 3);
+    assert.strictEqual(gen.peNaming.requests.length, 3);
+});
+
+test('PE naming: run evidence aligns PE suffixed JTL labels to original recording steps', () => {
+    const evidence = runEvidence.buildRunEvidence({
+        entries: [
+            entry('GET', 'https://app.test/authorization/'),
+            entry('POST', 'https://app.test/user/login'),
+            entry('GET', 'https://app.test/patientChart.php?id=123'),
+        ],
+        samples: [
+            { label: 'SC01_T03_/patientChart.php-003', success: true, responseCode: '200', finalUrl: 'https://app.test/patientChart.php?id=123' },
+            { label: 'SC01_T01_/authorization/-001', success: true, responseCode: '200', finalUrl: 'https://app.test/authorization/' },
+            { label: 'SC01_T02_/user/login-002', success: true, responseCode: '200', finalUrl: 'https://app.test/user/login' },
+        ],
+    });
+
+    assert.deepStrictEqual(evidence.rows.map(row => row.entryIndex), [0, 1, 2]);
+    assert.strictEqual(evidence.rows[0].label, 'SC01_T01_/authorization/-001');
+    assert.strictEqual(evidence.rows[2].recordedUrl, 'https://app.test/patientChart.php?id=123');
+});
+
+test('output organizer: creates compatibility subfolders and manifest without removing root files', () => {
+    const out = tmp();
+    fs.writeFileSync(path.join(out, 'demo.jmx'), '<jmeterTestPlan/>');
+    fs.writeFileSync(path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx'), '<jmeterTestPlan/>');
+    fs.writeFileSync(path.join(out, 'demo_report.html'), '<!doctype html>');
+    fs.writeFileSync(path.join(out, 'final.jtl'), '<testResults/>');
+    fs.writeFileSync(path.join(out, 'demo_label_map.json'), '{"requests":[]}');
+
+    const manifest = outputOrganizer.organizeOutput({
+        outDir: out,
+        name: 'demo',
+        verdict: 'GREEN',
+        finalJmxPath: path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx'),
+        reportPath: path.join(out, 'demo_report.html'),
+        currentJtlPath: path.join(out, 'final.jtl'),
+    });
+
+    assert.ok(fs.existsSync(path.join(out, 'demo.jmx')), 'root generated JMX should stay in place');
+    assert.ok(fs.existsSync(path.join(out, 'scripts', '00_USE_THIS_FINAL_VALIDATED_demo.jmx')));
+    assert.ok(fs.existsSync(path.join(out, 'reports', 'demo_report.html')));
+    assert.ok(fs.existsSync(path.join(out, 'results', 'final.jtl')));
+    assert.ok(fs.existsSync(path.join(out, 'evidence', 'demo_label_map.json')));
+    assert.ok(fs.existsSync(path.join(out, 'output_manifest.json')));
+    assert.strictEqual(manifest.verdict, 'GREEN');
+    assert.strictEqual(manifest.whatToOpen.finalJmx, 'scripts/00_USE_THIS_FINAL_VALIDATED_demo.jmx');
 });
 
 test('LLM escalation: clean no-op without a Gemini key', async () => {
@@ -781,6 +880,40 @@ test('baseline diff: recorded 3xx replaying as 2xx is redirect folding, not drif
     assert.strictEqual(diff.drift[0].issues[0].kind, 'statusDiff');
 });
 
+test('steering: file channel round-trip, command parsing, cursor semantics', () => {
+    const steeringMod = require('../src/steering');
+    const out = tmp();
+    const file = path.join(out, 'steering-test.json');
+    // Parse: protect / disable / question / guidance.
+    assert.deepStrictEqual(steeringMod.parseCommand('protect POST /tasks'), { kind: 'protect', pattern: 'POST /tasks', text: 'protect POST /tasks' });
+    assert.strictEqual(steeringMod.parseCommand('disable /bf?').kind, 'disable');
+    assert.strictEqual(steeringMod.parseCommand('fold Step 09 - GET /noise').pattern, 'Step 09 - GET /noise');
+    assert.strictEqual(steeringMod.parseCommand('why did you disable step 9?').kind, 'question');
+    assert.strictEqual(steeringMod.parseCommand('the export download is business critical').kind, 'guidance');
+    // Round-trip with cursor: runner only sees NEW messages.
+    steeringMod.appendMessage(file, { text: 'protect POST /tasks' });
+    const chan = steeringMod.createSteeringChannel({ file, onLog: () => {} });
+    assert.strictEqual(chan.active, true);
+    const first = chan.poll();
+    assert.strictEqual(first.length, 1);
+    assert.strictEqual(first[0].kind, 'protect');
+    assert.deepStrictEqual(chan.poll(), [], 'cursor advanced — no re-delivery');
+    steeringMod.appendMessage(file, { text: 'disable /bf?' });
+    steeringMod.appendMessage(file, { text: 'focus on the login chain first' });
+    const next = chan.poll();
+    assert.deepStrictEqual(next.map(c => c.kind), ['disable', 'guidance']);
+    // Inactive channel (no file) is a clean no-op.
+    const idle = steeringMod.createSteeringChannel({});
+    assert.strictEqual(idle.active, false);
+    assert.deepStrictEqual(idle.poll(), []);
+});
+
+test('run flags: iterations honor the new max of 6', () => {
+    const { flagsForRunRequest } = require('../src/ui-run-mode');
+    assert.ok(flagsForRunRequest({ mode: 'agent', iterations: 6 }).join(' ').includes('--iterations 6'));
+    assert.ok(flagsForRunRequest({ mode: 'agent', iterations: 9 }).join(' ').includes('--iterations 6'), 'above max clamps to 6');
+});
+
 test('AI provider label prefers OpenAI over Gemini when both are configured', () => {
     assert.strictEqual(runnerInternal.llmProviderLabel({ OPENAI_API_KEY: 'openai-key', GOOGLE_API_KEY: 'google-key' }), 'OpenAI');
     assert.strictEqual(runnerInternal.llmProviderLabel({ GOOGLE_API_KEY: 'google-key' }), 'Gemini');
@@ -890,6 +1023,28 @@ test('runner learning config: defaults to local verified memory with confidence 
     assert.strictEqual(disabled.storePath, 'custom.json');
 });
 
+test('runner learning: verified adjudicator disables become reusable safe fixes', () => {
+    const green = {
+        success: true,
+        requestAdjudication: {
+            iterations: [{
+                actions: {
+                    disable: [
+                        { samplerLabel: 'Step 09 - GET /s/interceptor/authorize/', category: 'redirect_hop' },
+                        { samplerLabel: 'Step 10 - POST /scheduler/index/data/T/d', category: 'downstream_casualty' },
+                    ],
+                },
+            }],
+        },
+    };
+    const failed = { ...green, success: false };
+
+    assert.deepStrictEqual(runnerInternal.adjudicatedDisableFixes(green), [
+        { kind: 'setSamplerEnabled', sampler: 'Step 09 - GET /s/interceptor/authorize/', enabled: false },
+    ]);
+    assert.deepStrictEqual(runnerInternal.adjudicatedDisableFixes(failed), []);
+});
+
 test('runner agent config: preserves bounded replan budget', () => {
     const cfg = runnerInternal.normalizeAgentCfg({ enabled: true, maxReplans: 2 });
     assert.strictEqual(cfg.enabled, true);
@@ -932,6 +1087,48 @@ test('replanner: senior PE scenario gap warning does not mutate JMX strategy kno
     assert.strictEqual(strategy.id, 'scenario-gap-warning');
     assert.deepStrictEqual(strategy.runCfgPatch, {});
     assert.match(strategy.reason, /workload/i);
+});
+
+test('replanner: prefers adjudicator-approved dead plumbing disables', () => {
+    const result = {
+        success: false,
+        samples: [{ label: 'Step 01 - GET /jwt/v2/create-cookie', success: false, responseCode: '400' }],
+        requestAdjudication: {
+            iterations: [{
+                actions: {
+                    disable: [{ samplerLabel: 'Step 01 - GET /jwt/v2/create-cookie', category: 'dead_plumbing' }],
+                },
+            }],
+        },
+    };
+
+    const strategy = replanner.proposeReplan({ result, runCfg: { disableCalls: [] }, tried: [] });
+
+    assert.strictEqual(strategy.id, 'post-run-fold-dead-plumbing');
+    assert.deepStrictEqual(strategy.runCfgPatch.disableCalls, ['Step 01 - GET /jwt/v2/create-cookie']);
+});
+
+test('replanner: auth-wall adjudication stops downstream replan chasing', () => {
+    const result = {
+        success: false,
+        samples: [
+            { label: 'Step 01 - GET /authorize/resume', success: false, responseCode: '401' },
+            { label: 'Step 02 - POST /scheduler/index/data/T/d', success: false, responseCode: '401' },
+        ],
+        requestAdjudication: {
+            iterations: [{
+                actions: {
+                    stop: [{ samplerLabel: 'Step 01 - GET /authorize/resume', category: 'auth_wall' }],
+                    disable: [{ samplerLabel: 'Step 02 - POST /scheduler/index/data/T/d', category: 'downstream_casualty' }],
+                },
+            }],
+        },
+    };
+
+    const strategy = replanner.proposeReplan({ result, runCfg: {}, tried: [] });
+
+    assert.strictEqual(strategy.id, 'auth-wall-stop');
+    assert.deepStrictEqual(strategy.runCfgPatch, {});
 });
 
 test('Gemini model resolver: defaults to 3.5 Flash and supports 3.1 Pro switch', () => {
@@ -1240,6 +1437,27 @@ test('UI run modes map to the expected CLI flags', () => {
     assert.deepStrictEqual(flagsForRunMode('unexpected'), []);
 });
 
+test('UI run requests include selected inputs and rerun controls as CLI flags', () => {
+    const { flagsForRunRequest } = require('../src/ui-run-mode');
+
+    assert.deepStrictEqual(flagsForRunRequest({
+        mode: 'agent',
+        selectedInputs: ['orders', 'login.jmx'],
+        force: true,
+        iterations: 4,
+        retryFailed: 6,
+        geminiPro: true,
+    }), [
+        '--agent',
+        '--force',
+        '--iterations', '4',
+        '--retry-failed', '6',
+        '--gemini-pro',
+        '--input', 'orders',
+        '--input', 'login.jmx',
+    ]);
+});
+
 test('UI config: round-trips senior PE context without dropping existing keys', () => {
     const existing = {
         gemini: { apiKey: 'keep' },
@@ -1270,6 +1488,62 @@ test('UI config: round-trips senior PE context without dropping existing keys', 
     assert.strictEqual(ui.techStack, 'React, Spring Boot, OAuth');
     assert.strictEqual(ui.domainNotes, 'Orders must be unique and cleanup is required.');
     assert.strictEqual(ui.slo.p95Ms, 750);
+});
+
+test('UI inputs: projects folder files into selectable logical run units', () => {
+    const dir = tmp();
+    const harPath = path.join(dir, 'orders.har');
+    const jmxPath = path.join(dir, 'login.jmx');
+    const sidecarPath = path.join(dir, 'login.recording.xml');
+    fs.writeFileSync(harPath, JSON.stringify(har([
+        entry('GET', 'https://app.test/orders'),
+        entry('POST', 'https://app.test/orders'),
+    ])));
+    fs.writeFileSync(jmxPath, jmxXml([{ method: 'GET', path: '/login' }]));
+    fs.writeFileSync(sidecarPath, jtlXml([{ method: 'GET', url: 'https://app.test/login' }]));
+
+    const model = uiInputs.buildInputModel(dir);
+
+    assert.deepStrictEqual(model.units.map(u => u.name).sort(), ['login', 'orders']);
+    const login = model.units.find(u => u.name === 'login');
+    assert.strictEqual(login.kind, 'jmx');
+    assert.strictEqual(login.files.find(f => f.role === 'primary').name, 'login.jmx');
+    assert.strictEqual(login.files.find(f => f.role === 'sidecar').name, 'login.recording.xml');
+    assert.strictEqual(login.runnable, true);
+    const orders = model.units.find(u => u.name === 'orders');
+    assert.deepStrictEqual(orders.hosts, ['app.test']);
+    assert.strictEqual(orders.requestCount, 2);
+});
+
+test('UI inputs: selection matches unit ids, names, and filenames', () => {
+    const units = [
+        { id: 'har-orders-orders_har', name: 'orders', primary: '/in/orders.har', files: [{ name: 'orders.har' }] },
+        { id: 'jmx-login-login_jmx', name: 'login', primary: '/in/login.jmx', secondary: '/in/login.recording.xml', files: [{ name: 'login.jmx' }, { name: 'login.recording.xml' }] },
+    ];
+
+    const byName = uiInputs.selectUnits(units, ['orders']);
+    assert.deepStrictEqual(byName.selected.map(u => u.name), ['orders']);
+    assert.deepStrictEqual(byName.missing, []);
+
+    const byFile = uiInputs.selectUnits(units, ['login.recording.xml']);
+    assert.deepStrictEqual(byFile.selected.map(u => u.name), ['login']);
+
+    const missing = uiInputs.selectUnits(units, ['missing.har']);
+    assert.deepStrictEqual(missing.selected, []);
+    assert.deepStrictEqual(missing.missing, ['missing.har']);
+});
+
+test('UI process control: cancel uses a Windows process-tree kill command', () => {
+    assert.deepStrictEqual(uiProcessControl.killPlanForPid(4242, 'win32'), {
+        command: 'taskkill',
+        args: ['/pid', '4242', '/T', '/F'],
+        signal: null,
+    });
+    assert.deepStrictEqual(uiProcessControl.killPlanForPid(4242, 'linux'), {
+        command: null,
+        args: [],
+        signal: 'SIGTERM',
+    });
 });
 
 test('java-safe JMX sanitizer strips JSR223 pre/post processors and reports them', () => {
@@ -2615,6 +2889,314 @@ test('sampler decision: explicit evidence separates foldable plumbing from must-
     assert.strictEqual(decisions.byIndex[3].decision, 'must_fix');
 });
 
+test('post-run adjudicator: unconsumed jwt create-cookie 400 is dead plumbing and disabled', () => {
+    const entries = [
+        entry('GET', 'https://stgapp.webpt.com/dashboard.php'),
+        entry('GET', 'https://stgemr.webpt.com/jwt/v2/create-cookie'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /dashboard.php', responseCode: '200', success: true, finalUrl: 'https://stgapp.webpt.com/dashboard.php' },
+            { label: 'Step 02 - GET /jwt/v2/create-cookie', responseCode: '400', success: false, finalUrl: 'https://stgemr.webpt.com/jwt/v2/create-cookie' },
+        ],
+    });
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries,
+        failures: [{ index: 1, samplerLabel: 'Step 02 - GET /jwt/v2/create-cookie', responseCode: '400' }],
+    });
+
+    const adjudication = postRunAdjudicator.adjudicateRequests({
+        entries,
+        evidence,
+        valueFlow,
+        failureReport: { samplersToDisable: [{ samplerLabel: 'Step 02 - GET /jwt/v2/create-cookie', responseCode: '400' }] },
+    });
+
+    assert.strictEqual(adjudication.byIndex[1].category, 'dead_plumbing');
+    assert.strictEqual(adjudication.byIndex[1].action, 'disable');
+    assert.deepStrictEqual(adjudication.actions.disable.map(item => item.samplerLabel), ['Step 02 - GET /jwt/v2/create-cookie']);
+});
+
+test('post-run adjudicator: consumed jwt create-cookie is a protected session producer', () => {
+    const jwt = entry('GET', 'https://stgemr.webpt.com/jwt/v2/create-cookie');
+    jwt.response.headers = [{ name: 'Set-Cookie', value: 'LOGI_SESS=abc123session; Path=/; HttpOnly' }];
+    const entries = [
+        jwt,
+        entry('GET', 'https://stgemr.webpt.com/dashboard', {
+            reqHeaders: [{ name: 'Cookie', value: 'LOGI_SESS=abc123session' }],
+        }),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /jwt/v2/create-cookie', responseCode: '400', success: false, finalUrl: 'https://stgemr.webpt.com/jwt/v2/create-cookie' },
+            { label: 'Step 02 - GET /dashboard', responseCode: '401', success: false, finalUrl: 'https://stgemr.webpt.com/dashboard' },
+        ],
+    });
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries,
+        failures: [{ index: 0, samplerLabel: 'Step 01 - GET /jwt/v2/create-cookie', responseCode: '400' }],
+    });
+
+    const adjudication = postRunAdjudicator.adjudicateRequests({ entries, evidence, valueFlow });
+
+    assert.strictEqual(adjudication.byIndex[0].category, 'session_producer');
+    assert.strictEqual(adjudication.byIndex[0].action, 'protect');
+    assert.deepStrictEqual(adjudication.actions.disable, []);
+});
+
+test('post-run adjudicator: authorize resume auth wall is not safe plumbing', () => {
+    const entries = [
+        entry('GET', 'https://stglogin.webpt.com/authorize/resume?state=recorded', { status: 302 }),
+        entry('GET', 'https://stgapp.webpt.com/dashboard.php'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /authorize/resume', responseCode: '401', success: false, finalUrl: 'https://stglogin.webpt.com/authorize/resume?state=recorded' },
+            { label: 'Step 02 - GET /dashboard.php', responseCode: '401', success: false, finalUrl: 'https://stglogin.webpt.com/u/login/identifier' },
+        ],
+    });
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries,
+        failures: [{ index: 0, samplerLabel: 'Step 01 - GET /authorize/resume', responseCode: '401' }],
+    });
+
+    const adjudication = postRunAdjudicator.adjudicateRequests({
+        entries,
+        evidence,
+        valueFlow,
+        failureForensics: {
+            rootCause: { index: 0, sampler: 'Step 01 - GET /authorize/resume', category: 'redirect_flow_drift', recordedStatus: 302, observedStatus: 401 },
+            redirects: { interactiveAuthWall: true },
+            recommendedAction: { id: 'provide-test-auth-path' },
+        },
+    });
+
+    assert.strictEqual(adjudication.byIndex[0].category, 'auth_wall');
+    assert.strictEqual(adjudication.byIndex[0].action, 'stop');
+    assert.deepStrictEqual(adjudication.actions.disable, []);
+});
+
+test('post-run adjudicator: interceptor authorize without session material folds despite noisy value-flow consumers', () => {
+    const entries = [
+        entry('GET', 'https://stgapp.webpt.com/s/interceptor/authorize/', { status: 302 }),
+        entry('GET', 'https://stgapp.webpt.com/patientChart.php'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            {
+                label: 'Step 01 - GET /s/interceptor/authorize/',
+                responseCode: '200',
+                success: true,
+                finalUrl: 'https://stgauth.webpt.com/redirect/',
+                responseHeaders: [{ name: 'Content-Type', value: 'text/html' }],
+            },
+            { label: 'Step 02 - GET /patientChart.php', responseCode: '200', success: true },
+        ],
+    });
+    const adjudication = postRunAdjudicator.adjudicateRequests({
+        entries,
+        evidence,
+        valueFlow: {
+            byIndex: {
+                0: {
+                    samplerLabel: 'Step 01 - GET /s/interceptor/authorize/',
+                    consumedOutputCount: 180,
+                    consumerIndexes: [1],
+                },
+            },
+        },
+        failureForensics: {
+            rootCause: { index: 0, sampler: 'Step 01 - GET /s/interceptor/authorize/', category: 'auth_redirect_bounce', recordedStatus: 302, observedStatus: 200 },
+            redirects: { interactiveAuthWall: true },
+        },
+    });
+
+    assert.strictEqual(adjudication.byIndex[0].category, 'redirect_hop');
+    assert.strictEqual(adjudication.byIndex[0].action, 'disable');
+    assert.deepStrictEqual(adjudication.actions.disable.map(item => item.samplerLabel), ['Step 01 - GET /s/interceptor/authorize/']);
+});
+
+test('post-run adjudicator: downstream scheduler 401 after auth bounce is casualty, not direct repair', () => {
+    const entries = [
+        entry('GET', 'https://stgadmin.webpt.com/', { status: 302 }),
+        entry('POST', 'https://stgapp.webpt.com/scheduler/index/data/T/d'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /', responseCode: '200', success: true, finalUrl: 'https://stglogin.webpt.com/u/login/identifier' },
+            { label: 'Step 02 - POST /scheduler/index/data/T/d', responseCode: '401', success: false, finalUrl: 'https://stgapp.webpt.com/scheduler/index/data/T/d' },
+        ],
+    });
+
+    const adjudication = postRunAdjudicator.adjudicateRequests({
+        entries,
+        evidence,
+        valueFlow: valueFlowDecisions.classifySamplerDisableDecisions({ entries }),
+        failureForensics: {
+            rootCause: { index: 0, sampler: 'Step 01 - GET /', category: 'auth_redirect_bounce', recordedStatus: 302, observedStatus: 200 },
+            divergences: [
+                { index: 0, sampler: 'Step 01 - GET /', category: 'auth_redirect_bounce' },
+                { index: 1, sampler: 'Step 02 - POST /scheduler/index/data/T/d', category: 'auth_or_session_correlation_failed' },
+            ],
+        },
+    });
+
+    assert.strictEqual(adjudication.byIndex[1].category, 'downstream_casualty');
+    assert.strictEqual(adjudication.byIndex[1].action, 'ignore');
+    assert.deepStrictEqual(adjudication.actions.disable, []);
+});
+
+test('runner adjudication filter adds proven disables and blocks protected producers', () => {
+    const entries = [
+        entry('GET', 'https://stgemr.webpt.com/jwt/v2/create-cookie'),
+        entry('POST', 'https://stgapp.webpt.com/scheduler/index/data/T/d'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /jwt/v2/create-cookie', responseCode: '400', success: false },
+            { label: 'Step 02 - POST /scheduler/index/data/T/d', responseCode: '401', success: false },
+        ],
+    });
+    const guard = { enabled: true, protectedNames: new Set(['Step 02 - POST /scheduler/index/data/T/d']) };
+    const failureReport = {
+        samplersToDisable: [
+            { samplerLabel: 'Step 02 - POST /scheduler/index/data/T/d', responseCode: '401', reason: 'engine guess' },
+        ],
+    };
+
+    const filtered = runnerInternal.guardFailureReportWithAdjudication({
+        failureReport,
+        entries,
+        evidence,
+        guard,
+        valueFlow: valueFlowDecisions.classifySamplerDisableDecisions({
+            entries,
+            failures: [{ index: 0, samplerLabel: 'Step 01 - GET /jwt/v2/create-cookie', responseCode: '400' }],
+        }),
+    });
+
+    assert.deepStrictEqual(filtered.blocked.map(item => item.samplerLabel), ['Step 02 - POST /scheduler/index/data/T/d']);
+    assert.deepStrictEqual(filtered.report.samplersToDisable.map(item => item.samplerLabel), ['Step 01 - GET /jwt/v2/create-cookie']);
+    assert.strictEqual(filtered.adjudication.byIndex[0].category, 'dead_plumbing');
+});
+
+test('runner adjudication artifacts are written per iteration and aggregated', () => {
+    const out = tmp();
+    const records = [];
+    const adjudication = {
+        summary: { disable: 1, protect: 1, ignore: 0, stop: 0, blocked: 0 },
+        actions: {
+            disable: [{ samplerLabel: 'Step 01 - GET /jwt/v2/create-cookie', category: 'dead_plumbing' }],
+            protect: [{ samplerLabel: 'Step 02 - GET /dashboard', category: 'business_request' }],
+            ignore: [],
+            stop: [],
+            blocked: [],
+        },
+        byIndex: {
+            0: { samplerLabel: 'Step 01 - GET /jwt/v2/create-cookie', category: 'dead_plumbing', action: 'disable' },
+        },
+    };
+
+    runnerInternal.writeRequestAdjudicationArtifacts({ outDir: out, name: 'bp', iteration: 1, adjudication, records });
+
+    assert.ok(fs.existsSync(path.join(out, 'bp_request_adjudication_iter_1.json')));
+    const aggregate = JSON.parse(fs.readFileSync(path.join(out, 'bp_request_adjudication.json'), 'utf8'));
+    assert.strictEqual(aggregate.iterations.length, 1);
+    assert.strictEqual(aggregate.iterations[0].summary.disable, 1);
+});
+
+test('runner adjudication auth wall continues bounded iterations with no-op JMX', () => {
+    const out = tmp();
+    const jmxPath = path.join(out, 'flow.jmx');
+    fs.writeFileSync(jmxPath, '<jmeterTestPlan/>');
+
+    const patchResult = runnerInternal.continueWithNoopPatch({
+        jmxPath,
+        iteration: 1,
+        reason: 'auth wall recorded',
+    });
+
+    assert.ok(patchResult.patchedJmxPath);
+    assert.notStrictEqual(path.resolve(patchResult.patchedJmxPath), path.resolve(jmxPath));
+    assert.strictEqual(fs.readFileSync(patchResult.patchedJmxPath, 'utf8'), '<jmeterTestPlan/>');
+    assert.strictEqual(patchResult.patchSummary[0].type, 'SKIPPED');
+});
+
+test('runner fold probe accepts plumbing disable when protected flow does not worsen', () => {
+    const pending = [{
+        samplerLabel: 'Step 09 - GET /s/interceptor/authorize/',
+        category: 'redirect_hop',
+        protectedFailuresBefore: [],
+        failureCountBefore: 2,
+    }];
+    const result = runnerInternal.evaluateFoldProbes({
+        pending,
+        failureReport: {
+            brokenSamplers: [{ samplerLabel: 'Step 99 - GET /favicon.ico' }],
+        },
+        guard: { protectedNames: new Set(['Step 36 - GET /patientChart.php']) },
+    });
+
+    assert.deepStrictEqual(result.accepted.map(item => item.samplerLabel), ['Step 09 - GET /s/interceptor/authorize/']);
+    assert.deepStrictEqual(result.rejected, []);
+    assert.deepStrictEqual(result.pending, []);
+});
+
+test('runner fold probe rejects and suppresses disable when protected flow worsens', () => {
+    const pending = [{
+        samplerLabel: 'Step 09 - GET /s/interceptor/authorize/',
+        category: 'redirect_hop',
+        protectedFailuresBefore: [],
+        failureCountBefore: 1,
+    }];
+    const result = runnerInternal.evaluateFoldProbes({
+        pending,
+        failureReport: {
+            brokenSamplers: [{ samplerLabel: 'Step 36 - GET /patientChart.php' }],
+            samplersToDisable: [
+                { samplerLabel: 'Step 09 - GET /s/interceptor/authorize/' },
+                { samplerLabel: 'Step 99 - GET /favicon.ico' },
+            ],
+        },
+        guard: { protectedNames: new Set(['Step 36 - GET /patientChart.php']) },
+    });
+    const filtered = runnerInternal.suppressRejectedProbeDisables({
+        samplersToDisable: [
+            { samplerLabel: 'Step 09 - GET /s/interceptor/authorize/' },
+            { samplerLabel: 'Step 99 - GET /favicon.ico' },
+        ],
+    }, result.rejected);
+
+    assert.deepStrictEqual(result.rejected.map(item => item.samplerLabel), ['Step 09 - GET /s/interceptor/authorize/']);
+    assert.deepStrictEqual(filtered.samplersToDisable.map(item => item.samplerLabel), ['Step 99 - GET /favicon.ico']);
+});
+
+test('runner fold probe rollback re-enables rejected sampler in JMX', () => {
+    const out = tmp();
+    const jmxPath = path.join(out, 'flow.jmx');
+    fs.writeFileSync(jmxPath, `<jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 09 - GET /s/interceptor/authorize/" enabled="false">
+        <stringProp name="HTTPSampler.path">/s/interceptor/authorize/</stringProp>
+      </HTTPSamplerProxy>
+    </hashTree></jmeterTestPlan>`);
+
+    const rolledBack = runnerInternal.rollbackRejectedFoldProbes({
+        jmxPath,
+        iteration: 2,
+        rejected: [{ samplerLabel: 'Step 09 - GET /s/interceptor/authorize/' }],
+    });
+    const xml = fs.readFileSync(rolledBack, 'utf8');
+
+    assert.notStrictEqual(path.resolve(rolledBack), path.resolve(jmxPath));
+    assert.match(xml, /testname="Step 09 - GET \/s\/interceptor\/authorize\/" enabled="true"/);
+});
+
 test('business guard: value-flow evidence overrides heuristic protection for unconsumed plumbing', () => {
     const xml = `<jmeterTestPlan><hashTree>
       <HTTPSamplerProxy testname="Step 01 - GET /tasks.json" enabled="true">
@@ -2824,8 +3406,10 @@ function samplerEnabledForDomain(xml, domainPart) {
 }
 
 function samplerEnabledForName(xml, samplerName) {
+    const wantedStep = peNaming.stepNumberFromLabel(samplerName);
     for (const m of xml.matchAll(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g)) {
-        if (!m[1].includes(`testname="${samplerName}"`)) continue;
+        const label = ((m[1] || '').match(/\btestname="([^"]*)"/) || [])[1] || '';
+        if (label !== samplerName && (!wantedStep || peNaming.stepNumberFromLabel(label) !== wantedStep)) continue;
         return /enabled="true"/.test(m[1]);
     }
     return null;
@@ -3570,6 +4154,30 @@ test('run evidence: aligns recording with JTL and preserves observed body and fi
     assert.strictEqual(evidence.rows[0].finalUrl, 'https://auth.test/login');
     assert.match(evidence.rows[0].observedBody, /Login/);
     assert.match(evidence.rows[0].recordedBody, /Dashboard/);
+});
+
+test('run evidence: preserves response headers and redirect Location without saving bodies', () => {
+    const dir = tmp();
+    const jtl = path.join(dir, 'results.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /authorize" rc="302" rm="Found" s="false">
+    <responseHeader class="java.lang.String">HTTP/1.1 302 Found
+Location: https://auth.test/login?state=fresh
+Set-Cookie: AUTH_STATE=fresh; Path=/; HttpOnly
+</responseHeader>
+    <java.net.URL>https://app.test/authorize</java.net.URL>
+  </httpSample>
+</testResults>`);
+
+    const evidence = runEvidence.buildRunEvidence({
+        entries: [entry('GET', 'https://app.test/authorize', { status: 302 })],
+        jtlPath: jtl,
+    });
+
+    assert.strictEqual(evidence.rows[0].observedLocation, 'https://auth.test/login?state=fresh');
+    assert.deepStrictEqual(evidence.rows[0].observedHeaderValues['set-cookie'], ['AUTH_STATE=fresh; Path=/; HttpOnly']);
+    assert.strictEqual(evidence.rows[0].observedBody, '');
 });
 
 test('status analysis treats 200 auth-host landing as upstream auth bounce', () => {

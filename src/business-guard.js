@@ -1,5 +1,7 @@
 'use strict';
 
+const peNaming = require('./pe-naming');
+
 const FIRST_PARTY_HINT = /(?:^|\.)webpt\.com$|stage|stg|gateway|auth|app|tasks|emr/i;
 const THIRD_PARTY_NOISE = /gstatic|google|beacon|domainreliability|analytics|dynatrace|newrelic|pendo|launchdarkly|sentry|ruxit|gravatar/i;
 const NOISE_PATH = /\/(?:ohttp_gateway|domainreliability\/upload|favicon\.ico|robots\.txt)|\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff2?)(?:\?|$)/i;
@@ -160,7 +162,10 @@ function protectionCategory(s, goalTerms, valueFlow = null) {
 
 function valueFlowDecisionFor(s, valueFlowDecisions) {
     if (!s || !valueFlowDecisions) return null;
-    return valueFlowDecisions.bySampler && valueFlowDecisions.bySampler[s.name] || null;
+    if (valueFlowDecisions.bySampler && valueFlowDecisions.bySampler[s.name]) return valueFlowDecisions.bySampler[s.name];
+    const step = peNaming.stepNumberFromLabel(s.name);
+    if (step && Array.isArray(valueFlowDecisions.byIndex)) return valueFlowDecisions.byIndex[step - 1] || null;
+    return null;
 }
 
 function goalTermsFor(flowName, runCfg) {

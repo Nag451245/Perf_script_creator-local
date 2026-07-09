@@ -31,6 +31,17 @@ function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classificat
     const failing = reqs.filter(s => s.success === false);
     if (!failing.length) return null;
 
+    const authStops = adjudicationActions(result, 'stop').filter(item => item.category === 'auth_wall');
+    if (authStops.length) {
+        if (tried.includes('auth-wall-stop')) return null;
+        return {
+            id: 'auth-wall-stop',
+            reason: 'post-run adjudication proved an auth/session wall; stop instead of chasing downstream casualties under strict GREEN policy',
+            evidence: authStops.map(item => item.samplerLabel).slice(0, 5).join(', '),
+            runCfgPatch: {},
+        };
+    }
+
     const nativePatch = nativeManagerPatch(seniorPeAnalysis);
     if (nativePatch) {
         strategies.push({
@@ -47,6 +58,19 @@ function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classificat
             reason: 'senior PE analysis found workload/SLO/data-model gaps; record the warning and keep deterministic repair knobs unchanged',
             evidence: (seniorPeAnalysis.riskGaps || []).map(g => `${g.gap}: ${g.action || ''}`).slice(0, 4).join('; '),
             runCfgPatch: {},
+        });
+    }
+
+    const adjudicatedDisables = adjudicationActions(result, 'disable')
+        .filter(item => ['dead_plumbing', 'safe_browser_plumbing', 'redirect_hop'].includes(item.category))
+        .map(item => item.samplerLabel || item.sampler)
+        .filter(Boolean);
+    if (adjudicatedDisables.length) {
+        strategies.push({
+            id: 'post-run-fold-dead-plumbing',
+            reason: `${adjudicatedDisables.length} sampler(s) were approved by post-run adjudication for folding; use the evidence-approved list instead of broad path patterns`,
+            evidence: adjudicatedDisables.slice(0, 5).join(', '),
+            runCfgPatch: { disableCalls: [...new Set([...(runCfg.disableCalls || []), ...adjudicatedDisables])] },
         });
     }
 
@@ -109,6 +133,16 @@ function decisionRows(valueFlow) {
         : Object.values(valueFlow.byIndex).filter(Boolean);
 }
 
+function adjudicationActions(result, action) {
+    const out = [];
+    const iterations = result && result.requestAdjudication && result.requestAdjudication.iterations || [];
+    for (const iter of iterations) {
+        const rows = iter && iter.actions && iter.actions[action] || [];
+        if (Array.isArray(rows)) out.push(...rows);
+    }
+    return out;
+}
+
 function nativeManagerPatch(analysis) {
     if (!analysis) return null;
     const requested = (analysis.recommendedNextStrategy || {}).id === 'native-manager-correction';
@@ -130,4 +164,4 @@ function nativeManagerPatch(analysis) {
     };
 }
 
-module.exports = { proposeReplan, _internal: { nativeManagerPatch, decisionRows } };
+module.exports = { proposeReplan, _internal: { nativeManagerPatch, decisionRows, adjudicationActions } };

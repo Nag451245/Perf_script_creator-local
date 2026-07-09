@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const peNaming = require('./pe-naming');
 
 function buildRunEvidence({ entries = [], jtlPath = '', samples = [] } = {}) {
     const observedSamples = samples.length ? samples.map(normalizeSample) : summarizeJtlFast(jtlPath);
@@ -11,6 +12,8 @@ function buildRunEvidence({ entries = [], jtlPath = '', samples = [] } = {}) {
         const observedBody = sample.responseBody || sample.body || '';
         const recordedUrl = entry.request && entry.request.url || '';
         const finalUrl = sample.finalUrl || sample.url || (sample.urls && sample.urls.length ? sample.urls[sample.urls.length - 1] : '');
+        const observedResponseHeaders = sample.responseHeaders || [];
+        const observedHeaderValues = headerValuesByName(observedResponseHeaders);
         return {
             entryIndex: pair.entryIndex,
             sampleIndex: pair.sampleIndex,
@@ -21,6 +24,9 @@ function buildRunEvidence({ entries = [], jtlPath = '', samples = [] } = {}) {
             subUrls: sample.urls || [],
             recordedStatus: Number(entry.response && entry.response.status || 0),
             observedStatus: Number(sample.responseCode || sample.code || sample.status || 0),
+            observedResponseHeaders,
+            observedHeaderValues,
+            observedLocation: firstHeaderValue(observedResponseHeaders, 'location'),
             recordedBody,
             observedBody,
             recordedBodyLength: String(recordedBody || '').length,
@@ -58,7 +64,8 @@ function summarizeJtlXml(xml) {
         const failureMessage = firstAssertionFailure(body);
         const urls = urlsFromSampleBody(body);
         const responseBody = responseDataFromSampleBody(body);
-        raw.push({ tag, label, responseCode, responseMessage, success, failureMessage, urls, responseBody });
+        const responseHeaders = responseHeadersFromSampleBody(body);
+        raw.push({ tag, label, responseCode, responseMessage, success, failureMessage, urls, responseBody, responseHeaders });
         labels.add(label);
     }
 
@@ -78,6 +85,7 @@ function summarizeJtlXml(xml) {
             finalUrl: sample.urls.length ? sample.urls[sample.urls.length - 1] : '',
             urls: sample.urls,
             responseBody: sample.responseBody,
+            responseHeaders: sample.responseHeaders,
         }));
 }
 
@@ -93,6 +101,7 @@ function normalizeSample(sample = {}) {
         finalUrl: sample.finalUrl || sample.url || (urls.length ? urls[urls.length - 1] : ''),
         urls,
         responseBody: sample.responseBody || sample.body || '',
+        responseHeaders: normalizeHeaders(sample.responseHeaders || sample.headers || []),
         failureMessage: sample.failureMessage || '',
     };
 }
@@ -127,8 +136,7 @@ function alignRecordingSamples(entries, samples) {
 }
 
 function stepNumberFromLabel(label) {
-    const match = /^Step\s+0*(\d+)\b/i.exec(String(label || '').trim());
-    return match ? Number(match[1]) : 0;
+    return peNaming.stepNumberFromLabel(label);
 }
 
 function samplerLabel(entry, index) {
@@ -188,6 +196,63 @@ function responseDataFromSampleBody(body) {
     return values.length ? values[values.length - 1] : '';
 }
 
+function responseHeadersFromSampleBody(body) {
+    const values = [];
+    const re = /<responseHeader\b[^>]*>([\s\S]*?)<\/responseHeader>/g;
+    let match;
+    while ((match = re.exec(body || '')) !== null) {
+        const value = unescapeXml(match[1] || '');
+        if (value.trim()) values.push(value);
+    }
+    return values.length ? parseHttpHeaderBlock(values[values.length - 1]) : [];
+}
+
+function parseHttpHeaderBlock(block) {
+    const headers = [];
+    for (const line of String(block || '').split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || /^HTTP\/\d(?:\.\d)?\s+/i.test(trimmed)) continue;
+        const colon = trimmed.indexOf(':');
+        if (colon <= 0) continue;
+        const name = trimmed.slice(0, colon).trim();
+        const value = trimmed.slice(colon + 1).trim();
+        if (name) headers.push({ name, value });
+    }
+    return headers;
+}
+
+function normalizeHeaders(headers) {
+    if (Array.isArray(headers)) {
+        return headers
+            .map(header => {
+                if (Array.isArray(header)) return { name: String(header[0] || ''), value: String(header[1] || '') };
+                return { name: String(header && header.name || ''), value: String(header && header.value || '') };
+            })
+            .filter(header => header.name);
+    }
+    if (typeof headers === 'string') return parseHttpHeaderBlock(headers);
+    return [];
+}
+
+function headerValuesByName(headers) {
+    const values = {};
+    for (const header of headers || []) {
+        const key = String(header.name || '').toLowerCase();
+        if (!key) continue;
+        if (!values[key]) values[key] = [];
+        values[key].push(String(header.value || ''));
+    }
+    return values;
+}
+
+function firstHeaderValue(headers, name) {
+    const key = String(name || '').toLowerCase();
+    for (const header of headers || []) {
+        if (String(header.name || '').toLowerCase() === key) return String(header.value || '');
+    }
+    return '';
+}
+
 function unescapeXml(value) {
     return String(value || '')
         .replace(/&quot;/g, '"')
@@ -208,6 +273,9 @@ module.exports = {
         firstAssertionFailure,
         urlsFromSampleBody,
         responseDataFromSampleBody,
+        responseHeadersFromSampleBody,
+        parseHttpHeaderBlock,
+        headerValuesByName,
         unescapeXml,
     },
 };

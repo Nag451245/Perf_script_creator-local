@@ -8,6 +8,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const peNaming = require('./pe-naming');
 
 const esc = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -20,6 +21,7 @@ const ARTIFACTS = [
     ['_parameters.json', 'Parameterization candidates'],
     ['_ghosts.json', 'Client-side (ghost) values'],
     ['_polling.json', 'Detected polling loops'],
+    ['_label_map.json', 'PE sampler label map (SC/T prefixes back to Step NN)'],
     ['_file_uploads.json', 'Multipart upload files detected, staged, or missing'],
     ['_llm_suggestions.json', 'LLM fix suggestions'],
     ['_java_safe_generate.json', 'Generated JMX Java-safe compatibility report'],
@@ -27,6 +29,7 @@ const ARTIFACTS = [
     ['_baseline_diff.json', 'Baseline vs test diff (status / length / shape)'],
     ['_failure_forensics.json', 'Failure forensics ledger and recommended action'],
     ['_failure_forensics.md', 'Failure forensics summary (Markdown)'],
+    ['_request_adjudication.json', 'Post-run request adjudication decisions'],
     ['_final_green_gate.json', 'Final green gate verdict'],
     ['_senior_pe_debrief.json', 'Senior performance engineering debrief'],
     ['_senior_pe_debrief.md', 'Senior performance engineering debrief (Markdown)'],
@@ -82,7 +85,9 @@ function writeHtmlReport(outDir, name, data = {}) {
     const passed = reqs.filter(s => s.success).length;
     const failures = reqs.filter(s => s.success === false);
     const failureForensics = data.failureForensics || readJsonIfExists(path.join(outDir, `${name}_failure_forensics.json`));
-    const decisionBySampler = buildDecisionMap(disableDecisions || data.samplerDecisions || (data.lineage && data.lineage.disableDecisions));
+    const requestAdjudication = data.requestAdjudication || readJsonIfExists(path.join(outDir, `${name}_request_adjudication.json`));
+    const labelMap = data.peNaming || readJsonIfExists(path.join(outDir, `${name}_label_map.json`));
+    const decisionBySampler = buildDecisionMap(requestAdjudication || disableDecisions || data.samplerDecisions || (data.lineage && data.lineage.disableDecisions));
 
     const verdictClass = verdict === 'GREEN' ? 'ok' : (verdict === 'generated' ? 'neutral' : 'bad');
 
@@ -123,7 +128,17 @@ function writeHtmlReport(outDir, name, data = {}) {
         .sort()
         .map(file => `<li><a href="${esc(file)}">${esc(file)}</a> — ${file.endsWith('.jmx') ? 'Final JMX to open in JMeter' : 'Read this first'}</li>`)
         .join('');
-    const artifactItems = pointerItems + ARTIFACTS
+    const explicitArtifacts = [
+        ['final.jtl', 'Current validation JTL'],
+        [`evidence/${name}_label_map.json`, 'PE label map copy'],
+        [`reports/${name}_report.html`, 'HTML report copy'],
+        [`results/final.jtl`, 'Current JTL copy'],
+    ].map(([file, desc]) => fs.existsSync(path.join(outDir, file)) ? `<li><a href="${esc(file)}">${esc(file)}</a> — ${esc(desc)}</li>` : '')
+        .filter(Boolean).join('');
+    const manifestItems = ['00_OUTPUT_INDEX.md', 'output_manifest.json']
+        .map(file => fs.existsSync(path.join(outDir, file)) ? `<li><a href="${esc(file)}">${esc(file)}</a> — Output folder index and manifest</li>` : '')
+        .filter(Boolean).join('');
+    const artifactItems = pointerItems + manifestItems + explicitArtifacts + ARTIFACTS
         .map(([suffix, desc]) => {
             const file = suffix === 'log.txt' ? 'log.txt' : `${name}${suffix}`;
             const full = path.join(outDir, file);
@@ -242,6 +257,8 @@ function writeHtmlReport(outDir, name, data = {}) {
             <p class="muted">Full evidence: <a href="${esc(name)}_failure_forensics.json">JSON</a> · <a href="${esc(name)}_failure_forensics.md">Markdown</a></p>`;
     }
 
+    const requestAdjudicationSection = renderRequestAdjudicationSection(requestAdjudication, name, outDir);
+
     let learningSection = '';
     const matchRows = Array.isArray(memoryMatches) && memoryMatches.length
         ? memoryMatches.slice(0, 25).map(m => `<tr><td>${esc(m.lessonId)}</td><td>${esc(m.confidence)}</td><td>${esc(m.contextPattern && m.contextPattern.samplerPattern)}</td><td><code>${esc(m.fix && m.fix.kind)}</code></td></tr>`).join('')
@@ -259,6 +276,8 @@ function writeHtmlReport(outDir, name, data = {}) {
             <table><thead><tr><th>Lesson</th><th>Confidence</th><th>Pattern</th><th>Fix</th></tr></thead><tbody>${learnedRows}</tbody></table>` : ''}
             ${emptyMessage}`;
     }
+
+    const transactionSummarySection = renderTransactionSummary(labelMap);
 
     const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -297,6 +316,8 @@ function writeHtmlReport(outDir, name, data = {}) {
 
   ${businessSection}
 
+  ${requestAdjudicationSection}
+
   <h2>Request results</h2>
   <table><thead><tr><th></th><th>Sampler</th><th>Code</th><th>Decision</th><th>Message</th></tr></thead>
   <tbody>${reqRows}</tbody></table>
@@ -314,6 +335,8 @@ function writeHtmlReport(outDir, name, data = {}) {
   ${driftSection}
 
   ${learningSection}
+
+  ${transactionSummarySection}
 
   <h2>Artifacts</h2>
   <ul>${artifactItems || '<li class="muted">none</li>'}</ul>
@@ -337,32 +360,128 @@ function renderBusinessSamplerList(protectedSamplers) {
         renderGroup('Required dependency samplers', dependencies);
 }
 
+function renderTransactionSummary(labelMap) {
+    const transactions = labelMap && Array.isArray(labelMap.transactions) ? labelMap.transactions : [];
+    if (!transactions.length) return '';
+    const rows = transactions.slice(0, 50).map(tx => `
+        <tr>
+            <td>${esc(tx.transactionCode || '')}</td>
+            <td>${esc(tx.transactionLabel || tx.transactionName || '')}</td>
+            <td>${esc(tx.semanticTransactionLabel || '')}</td>
+            <td>${esc(tx.requestCount || 0)}</td>
+        </tr>`).join('');
+    const note = transactions.length > 50 ? `<p class="muted">Showing first 50 of ${esc(transactions.length)} transaction group(s).</p>` : '';
+    return `<h2>Transaction summary</h2>
+      <table><thead><tr><th>Code</th><th>PE transaction name</th><th>Semantic role</th><th>Requests</th></tr></thead>
+      <tbody>${rows}</tbody></table>${note}
+      <p class="muted">Child HTTP samplers remain visible in JTL results; use the label map to trace SC/T labels back to original Step NN recording order.</p>`;
+}
+
+function renderRequestAdjudicationSection(requestAdjudication, name, outDir) {
+    const iterations = requestAdjudication && Array.isArray(requestAdjudication.iterations) ? requestAdjudication.iterations : [];
+    if (!iterations.length) return '';
+    const last = iterations[iterations.length - 1] || {};
+    const summary = last.summary || {};
+    const decisions = requestAdjudicationRows(requestAdjudication).slice(0, 12);
+    const rows = decisions.map(d => `
+        <tr>
+            <td>${esc(d.samplerLabel || d.sampler || '')}</td>
+            <td>${esc(decisionLabel(d.category || d.decision || d.sourceDecision || ''))}</td>
+            <td>${esc(d.action || '')}</td>
+            <td>${esc(d.reason || '')}</td>
+        </tr>`).join('');
+    const more = requestAdjudicationRows(requestAdjudication).length > 12
+        ? `<p class="muted">Showing first 12 of ${esc(requestAdjudicationRows(requestAdjudication).length)} decision(s).</p>`
+        : '';
+    const artifact = `${name}_request_adjudication.json`;
+    const artifactLink = fs.existsSync(path.join(outDir, artifact))
+        ? `<p class="muted">Full evidence: <a href="${esc(artifact)}">${esc(artifact)}</a></p>`
+        : '';
+    return `<h2>Request adjudication</h2>
+        <p>Disabled ${esc(summary.disable || 0)} dead/safe plumbing sampler(s), protected ${esc(summary.protect || 0)} session/business sampler(s), ignored ${esc(summary.ignore || 0)} downstream casualty sampler(s), blocked ${esc(summary.blocked || 0)} unsafe disable(s).</p>
+        <table><thead><tr><th>Sampler</th><th>Category</th><th>Action</th><th>Evidence</th></tr></thead><tbody>${rows || '<tr><td colspan="4" class="muted">No sampler-level adjudication rows.</td></tr>'}</tbody></table>
+        ${more}${artifactLink}`;
+}
+
 function buildDecisionMap(disableDecisions) {
     const map = new Map();
     if (!disableDecisions) return map;
-    const rows = disableDecisions.bySampler
-        ? Object.values(disableDecisions.bySampler)
-        : (Array.isArray(disableDecisions.byIndex) ? disableDecisions.byIndex : Object.values(disableDecisions.byIndex || {}));
+    const rows = requestAdjudicationRows(disableDecisions);
     for (const row of rows.filter(Boolean)) {
         const label = row.samplerLabel || row.sampler || row.label;
-        if (label) map.set(String(label).trim(), row.decision || row.sourceDecision || '');
+        const decision = row.category || row.decision || row.sourceDecision || '';
+        if (label) {
+            const normalized = String(label).trim();
+            map.set(normalized, decision);
+            const step = peNaming.stepNumberFromLabel(normalized);
+            if (step) map.set(`step:${step}`, decision);
+        }
     }
     return map;
 }
 
+function requestAdjudicationRows(value) {
+    if (!value) return [];
+    if (Array.isArray(value.iterations)) {
+        const rows = [];
+        for (const iter of value.iterations) {
+            if (Array.isArray(iter.decisions)) rows.push(...iter.decisions);
+            for (const list of Object.values(iter.actions || {})) {
+                if (Array.isArray(list)) rows.push(...list);
+            }
+        }
+        return dedupeRows(rows);
+    }
+    if (value.bySampler) return Object.values(value.bySampler);
+    if (Array.isArray(value.byIndex)) return value.byIndex;
+    return Object.values(value.byIndex || {});
+}
+
+function dedupeRows(rows) {
+    const seen = new Set();
+    const out = [];
+    for (const row of rows.filter(Boolean)) {
+        const key = `${row.samplerLabel || row.sampler || row.label || ''}|${row.category || row.decision || ''}|${row.action || ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(row);
+    }
+    return out;
+}
+
 function decisionForSampler(decisionBySampler, label) {
-    return decisionLabel(decisionBySampler.get(String(label || '').trim()));
+    const normalized = String(label || '').trim();
+    const direct = decisionBySampler.get(normalized);
+    if (direct) return decisionLabel(direct);
+    const step = peNaming.stepNumberFromLabel(normalized);
+    return decisionLabel(step ? decisionBySampler.get(`step:${step}`) : '');
 }
 
 function decisionLabel(decision) {
     switch (decision) {
         case 'must_fix':
-            return 'Core flow';
+            return 'Business request';
         case 'foldable_plumbing':
         case 'disposable_plumbing':
             return 'Safe to fold';
         case 'unsafe_to_disable':
             return 'Protected';
+        case 'session_producer':
+            return 'Session producer';
+        case 'business_request':
+            return 'Business request';
+        case 'redirect_hop':
+            return 'Redirect hop';
+        case 'dead_plumbing':
+            return 'Dead plumbing';
+        case 'safe_browser_plumbing':
+            return 'Safe browser plumbing';
+        case 'downstream_casualty':
+            return 'Downstream casualty';
+        case 'blocked_disable':
+            return 'Blocked disable';
+        case 'auth_wall':
+            return 'Auth wall';
         case 'unknown':
             return 'Unclassified';
         default:

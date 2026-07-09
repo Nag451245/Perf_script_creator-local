@@ -1,5 +1,7 @@
 'use strict';
 
+const peNaming = require('./pe-naming');
+
 function statusFamily(code) {
     const n = Number(code);
     if (!Number.isFinite(n) || n <= 0) return 'unknown';
@@ -314,8 +316,7 @@ function alignEntrySamplePairs(entries, samples) {
 }
 
 function stepNumberFromLabel(label) {
-    const match = /^Step\s+0*(\d+)\b/i.exec(String(label || '').trim());
-    return match ? Number(match[1]) : 0;
+    return peNaming.stepNumberFromLabel(label);
 }
 
 module.exports = {

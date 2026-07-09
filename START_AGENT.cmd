@@ -1,8 +1,6 @@
 @echo off
-rem Start the always-on PerfScript Agent.
-rem Drop HAR/JMX/recording XML files into input\ while this window stays open.
-rem The agent groups fresh files, generates the JMX, validates with JMeter,
-rem and asks Gemini for safe bounded fixes when deterministic repair gets stuck.
+rem PerfScript single launcher: starts the local browser control center.
+rem Use the UI for Generate, Validate, Agent, multi-run, rerun, watch, and stop.
 setlocal
 set "APP_DIR=%~dp0"
 set "NODE_EXE="
@@ -20,24 +18,18 @@ if "%NODE_EXE%"=="" (
 if not exist "%APP_DIR%input" mkdir "%APP_DIR%input"
 if not exist "%APP_DIR%output" mkdir "%APP_DIR%output"
 
+start "" cmd /c "timeout /t 2 >nul & start "" http://localhost:7070"
 echo ============================================================
-echo PerfScript Agent is starting in watch mode.
+echo PerfScript Agent Launcher
 echo.
-echo 1. Drop your files into:
-echo    %APP_DIR%input
-echo.
-echo 2. Supported groups:
-echo    flow__run1.har + flow__run2.har
-echo    flow__run1.jmx + flow__run1.recording.xml
-echo    flow__run2.jmx + flow__run2.recording.xml
-echo.
-echo 3. Keep this window open. Close it to stop the agent.
+echo Your browser will open http://localhost:7070
+echo Use the left panel to select HAR/JMX/XML inputs and run the agent.
+echo Keep this window open. Close it to stop the UI server.
 echo ============================================================
 echo.
-start "" "%APP_DIR%input"
-"%NODE_EXE%" "%APP_DIR%index.js" --agent --watch %*
+"%NODE_EXE%" "%APP_DIR%src\ui-server.js" %*
 set "RC=%ERRORLEVEL%"
 echo.
-echo Agent stopped ^(exit %RC%^). Results are in the output\ folder.
+echo PerfScript UI stopped ^(exit %RC%^).
 pause
 exit /b %RC%

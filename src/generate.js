@@ -38,6 +38,7 @@ const scenario = require('./scenario');
 const outcomeProbe = require('./outcome-probe');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
+const peNaming = require('./pe-naming');
 const {
     wrapPollingInWhileController,
     injectGhostSynthesizers,
@@ -460,15 +461,15 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     uniquifyVariableNames(corrs); // disambiguate name collisions (state x7, nonce x3, id x9)
     placementFixer.fix(corrs, flat);
 
-    // 3. Group into transactions by pageref.
-    const order = []; const gbp = new Map();
-    const pageById = new Map((pages || []).map(p => [p.id, p]));
-    for (const e of flat) {
-        const pid = e.pageref || '__u';
-        if (!gbp.has(pid)) { gbp.set(pid, []); order.push(pid); }
-        gbp.get(pid).push(e);
-    }
-    const groups = order.map(pid => ({ name: (pageById.get(pid)?.title) || 'Transaction', type: 'transaction', entries: gbp.get(pid) }));
+    // 3. Group into PE-readable business transactions while preserving request
+    // order and Step NN alignment through the label map.
+    const peModel = peNaming.buildPeNamingModel({ entries: flat, pages, flowName: name });
+    const groups = peModel.groups;
+    fs.writeFileSync(path.join(outDir, `${name}_label_map.json`), JSON.stringify(peNaming.labelMapForArtifact(peModel), null, 2));
+    if (peModel.requests.length) note('pe-naming',
+        `${peModel.requests.length} request sampler label(s) mapped to ${peModel.scenarioCode}_Txx_* names`,
+        `${peModel.groups.length} transaction controller group(s) named as PE deliverables`,
+        `original Step NN alignment preserved in ${name}_label_map.json`);
 
     // Ghost sources (blueprint #2): client-minted values (UUID/timestamp/trace/
     // cache-buster) with no server origin. The JMeter renderer ALREADY rewrites
@@ -877,6 +878,13 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             'left JSR223 blocks intact; validate with a compatible JMeter/Java runtime');
     }
 
+    const peRenamed = peNaming.renameHttpSamplerLabels(xml, peModel);
+    xml = peRenamed.xml;
+    if (peRenamed.renamed) note('pe-naming',
+        `${peRenamed.renamed} HTTP sampler testname(s) rewritten with semantic prefixes`,
+        `labels use SCxx_Txx_<request>-<step> format for PE spreadsheet readability`,
+        `troubleshooting alignment remains available through ${name}_label_map.json`);
+
     // Re-validate after our edits so reported stats reflect what we ship.
     // The engine validator's look-back misses CSV/UDV-supplied variables, so
     // filter those out the same way the repair path does — stats.orphans must
@@ -938,6 +946,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         scenario: scenarioPlan,
         uploadFiles: uploadPlan,
         nativeManagers,
+        peNaming: peNaming.labelMapForArtifact(peModel),
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
             correlations: corrs.length, parameterized: params.length,

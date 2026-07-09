@@ -58,74 +58,80 @@ run it against your test environment to see pass/fail.
 
 ## A. Start The Agent From The Folder
 
-Use this when you want it to behave like an agent, not a one-time command.
+Use this when you want one clean launcher instead of choosing between scripts.
 
 1. Double-click **`START_AGENT.cmd`**.
-2. Keep the console window open.
-3. Drop one of these into `input\`:
+2. Keep the console window open. Your browser opens **http://localhost:7070**.
+3. Drag recordings into the UI or put them in `input\`:
    - `flow__run1.har` + `flow__run2.har`
    - `flow__run1.jmx` + `flow__run1.recording.xml`
    - `flow__run2.jmx` + `flow__run2.recording.xml`
-4. The agent automatically groups fresh files, generates the JMX, validates it,
-   monitors failures, asks OpenAI/Gemini only when deterministic repair is stuck, applies
-   safe JSON patches, and re-runs JMeter.
-5. Open `output\<flow>\<flow>_report.html` first, then download/open the final
-   `.jmx`.
+4. Select one or many logical scripts in the left panel.
+5. Choose **Senior AI Agent**, **Mature PE Agent**, **Generate + Validate**,
+   **Generate only**, or **Watch input folder**.
+6. Watch the right-side live log. Use **Stop** to cancel the active run, **Rerun
+   last** to repeat the previous script, or **Force rerun selected** when the
+   input-state cache would otherwise skip unchanged files.
+7. Open the report first, then download/open the final `.jmx`.
 
 Existing files in `input\` are processed once, then tracked in
 `.perfscript-state\processed-inputs.json`. If the same JMX/HAR/XML files are
 unchanged when the agent restarts, they are skipped. If you replace or edit a
 file, its size/modified time changes and the agent processes it again.
 
-Close the console window to stop watching.
+Close the console window to stop the UI server.
 
 ---
 
-## B. Using the UI
+## B. Configure and Run
 
-1. **Launch:** double-click **`perfscript-ui.cmd`** (or the **PerfScript UI**
-   desktop shortcut). A console window opens and your browser goes to
-   **http://localhost:7070**. *Keep the console open; close it to stop the UI.*
+1. **Add recordings** — drag files onto the drop zone, click to browse, or place
+   them in `input\`. See **§D** for what files to record and how to name them.
 
-2. **Add recordings** — drag your files onto the drop zone (or click to browse).
-   See **§D** for what files to record and how to name them.
-
-3. *(Only if you'll Validate)* **Settings** — fill in:
+2. *(Only if you'll Validate or use Agent mode)* **Settings** — fill in:
    - **Target URL** — the environment to test, e.g. `https://stage.example.com`
    - **Username / Password** — a valid test login (password is write-only)
    - **Users / Ramp-up / Hold** — load profile (leave blank for a 1-user smoke run)
+   - **Business objective / tech stack / domain notes / SLO** — optional mature
+     PE context that improves the report and repair strategy.
 
    Click **Save settings**.
 
-4. **Run:**
-   - **Generate** — correlate and build the `.jmx` (no execution).
-   - **Generate + Validate (JMeter)** — also runs it and reports pass/fail.
-   - **Senior AI Agent** — runs validation, uses OpenAI/Gemini only for unresolved
+3. **Run:**
+   - **Generate only** — correlate and build the `.jmx` with no execution.
+   - **Generate + Validate** — also runs it and reports pass/fail.
+   - **Senior AI Agent** — validates, uses OpenAI/Gemini only for unresolved
      failures, applies safe JSON patches, and re-runs JMeter.
+   - **Mature PE Agent** — adds deeper objective, stack, domain, SLO, and
+     business-flow reasoning.
+   - **Watch input folder** — keeps the agent running for new files.
 
-   Watch the **live log**. Use **Cancel** to stop a run.
+   Watch the right-side **live log**. Use **Stop** to cancel a run.
 
-5. **Results** — each output appears in the list with a **GREEN / needs-attention**
-   badge and links to **report** (open first) and **.jmx** (download).
+4. **Results** — each output appears with a **GREEN / needs-attention** badge,
+   report link, final `.jmx` download, and **Rerun this** action.
 
 ---
 
-## C. Using the CLI / one-click launchers (otherwise)
+## C. Using the CLI
 
-Double-click a launcher, or run from a terminal in the project folder:
+Run from a terminal in the project folder:
 
-| Do this | Launcher (double-click) | Terminal |
-|---|---|---|
-| Generate only | `perfscript.cmd` | `node index.js` |
-| Generate **+ Validate** | `perfscript-run.cmd` | `node index.js --run` |
-| One-shot Senior AI agent | `perfscript-agent.cmd` | `node index.js --agent` or `npm run agent` |
-| Always-on Senior AI agent | `START_AGENT.cmd` | `node index.js --agent --watch` or `npm run agent:watch` |
-| Watch input\ and generate only | — | `node index.js --watch` |
-| Start the web UI | `perfscript-ui.cmd` | `npm run ui` |
-| Export verified lessons | — | `node index.js --memory-export memory/team-lessons.json` |
-| Import teammate lessons | — | `node index.js --memory-import memory/team-lessons.json` |
+| Do this | Terminal |
+|---|---|
+| Generate only | `node index.js` |
+| Generate + Validate | `node index.js --run` |
+| One-shot Senior AI agent | `node index.js --agent` or `npm run agent` |
+| Mature PE agent | `node index.js --agent --senior` |
+| Process selected scripts only | `node index.js --agent --input Batch_Print --input login.jmx --force` |
+| Always-on Senior AI agent | `node index.js --agent --watch` or `npm run agent:watch` |
+| Watch input\ and generate only | `node index.js --watch` |
+| Start the web UI | `npm run ui` or double-click `START_AGENT.cmd` |
+| Export verified lessons | `node index.js --memory-export memory/team-lessons.json` |
+| Import teammate lessons | `node index.js --memory-import memory/team-lessons.json` |
 
-Useful flags: `--iterations N` (auto-fix loop budget, default 3), `--agent`
+Useful flags: `--input NAME` (process only matching logical input units/files),
+`--iterations N` (auto-fix loop budget, default 3), `--agent`
 (bounded AI diagnose/patch/re-verify when a key is configured), `--fast-loop`
 (quick Node pre-flight without JMeter), `--gemini-pro` (use Gemini 3.1 Pro
 Preview instead of default Gemini 3.5 Flash), `--force` (reprocess unchanged

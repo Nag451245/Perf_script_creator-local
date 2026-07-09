@@ -94,35 +94,21 @@ npm install
 
 ## How To Run
 
-Start the always-on folder agent:
+Start the single launcher:
 
 ```powershell
 START_AGENT.cmd
 ```
 
-Then drop supported file groups into `input\`. The agent will keep watching,
-process each fresh group, validate with JMeter, and ask OpenAI/Gemini for safe bounded
-fixes only when deterministic repair leaves unresolved failures.
+Your browser opens the local control center. Drop supported file groups into the
+UI or `input\`, select one or many logical scripts, then choose Generate,
+Generate + Validate, Senior AI Agent, Mature PE Agent, or Watch input folder. The
+right side shows live logs, and the Stop button cancels the active run.
 
 Input files are tracked by path, size, and modified time. Existing files are
 processed once, then skipped on future restarts unless they are edited/replaced.
 Successful GREEN runs are also zipped into `output\successful\`; the normal
 `output\<flow>\` folder stays readable by default.
-
-Or start the web UI:
-
-```powershell
-perfscript-ui.cmd
-```
-
-Then:
-
-1. Drop two HAR files, or two JMX files plus their `.recording.xml` files.
-2. Fill Settings with target URL and credentials.
-3. Click one of:
-   - `Generate`: build the correlated JMX only.
-   - `Generate + Validate (JMeter)`: run deterministic validation.
-   - `Senior AI Agent`: validate, ask OpenAI/Gemini only for unresolved failures, apply safe JSON patches, and re-run JMeter.
 
 CLI alternatives:
 
@@ -131,6 +117,7 @@ node index.js
 node index.js --run
 node index.js --agent
 node index.js --agent --gemini-pro
+node index.js --agent --input Batch_Print --force
 node index.js --agent --watch
 node index.js --memory-export memory/team-lessons.json
 node index.js --memory-import memory/team-lessons.json

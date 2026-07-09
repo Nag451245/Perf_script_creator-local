@@ -16,48 +16,30 @@ generation, the feedback loop) — it does not copy or modify the current app.
 
 ## Usage
 
-**Start Agent (folder button):** double-click **`START_AGENT.cmd`**. It opens
-`input\` and watches it. Drop a pair of HAR files, or the JMX files plus their
-matching `.recording.xml` files, and the agent automatically groups the files,
-generates the JMX, validates it with JMeter, and asks OpenAI/Gemini for bounded
-safe fixes whenever deterministic repair still leaves failures. Keep the console
-window open; close it to stop the agent. Files are tracked by path, size, and
-  modified time. Inputs that reached GREEN/generated-success are skipped on
-  future restarts unless they change; failed Validate/Agent runs are retried up
-  to the configured failed-attempt cap.
+**Single Agent Launcher (Windows):** double-click **`START_AGENT.cmd`**. Your
+browser opens `http://localhost:7070` with one control center for everything:
+drag-drop recordings, see logical HAR/JMX/XML script groups, select one or many
+scripts, run Generate / Validate / Senior Agent / Mature PE Agent / Watch mode,
+rerun the last script, force rerun selected scripts, stop the active run, and
+watch live logs beside the controls. Keep the launcher console open; close it to
+stop the UI server. The port auto-falls back if 7070 is busy.
 
-**Simple UI (Windows):** double-click **`perfscript-ui.cmd`** (or the *PerfScript
-UI* desktop shortcut). Your browser opens `http://localhost:7070` where you can
-drag-drop recordings, edit run settings (target / credentials / load profile),
-press **Generate**, **Generate + Validate**, **Senior AI Agent (one-shot)**,
-**Mature PE Agent**, or **Start Watch Agent**, watch the live log, cancel/stop a run, and open the report
-/ download the `.jmx`. Keep the console window open; close it to stop the
-server. (Port auto-falls-back if 7070 is busy.)
-
-**One-click validate:** double-click **`perfscript-run.cmd`** = generate + run
-through local JMeter in one shot.
-
-**One-click agent:** double-click **`perfscript-agent.cmd`** = generate + validate
-through local JMeter, then use OpenAI/Gemini for unresolved failures when configured.
-This is one-shot. Use **`START_AGENT.cmd`** when you want the folder to keep
-watching for new inputs.
-
-**CLI (Windows):** double-click `perfscript.cmd`, or from a terminal:
+**CLI (terminal only):**
 ```bat
-perfscript            :: generate scripts from every HAR in input\
-perfscript --run      :: also validate with local JMeter
-perfscript --agent    :: validate + bounded AI diagnose/patch/re-verify
-perfscript --agent --senior :: mature PE mode (adds deeper business/stack/SLO evidence)
-perfscript --agent --gemini-pro :: use Gemini 3.1 Pro Preview for agent fixes
-perfscript --agent --watch :: keep watching input\ and agent-process new files
-perfscript --agent --force :: reprocess unchanged input files after code/prompt changes
-perfscript --agent --retry-failed 5 :: retry unchanged failed inputs up to 5 failed attempts
-perfscript --watch    :: process files as they appear in generate-only mode
-perfscript --memory-export memory\team-lessons.json :: export sanitized lessons
-perfscript --memory-import memory\team-lessons.json :: import teammate lessons
+node index.js            :: generate scripts from every HAR/JMX unit in input\
+node index.js --run      :: also validate with local JMeter
+node index.js --agent    :: validate + bounded AI diagnose/patch/re-verify
+node index.js --agent --senior :: mature mode with deeper business/stack/SLO evidence
+node index.js --agent --gemini-pro :: use Gemini 3.1 Pro Preview for agent fixes
+node index.js --agent --watch :: keep watching input\ and agent-process new files
+node index.js --agent --force :: reprocess unchanged input files
+node index.js --agent --input Batch_Print :: process only a selected logical script
+node index.js --agent --retry-failed 5 :: retry unchanged failed inputs up to 5 failed attempts
+node index.js --memory-export memory\team-lessons.json :: export sanitized lessons
+node index.js --memory-import memory\team-lessons.json :: import teammate lessons
 ```
-The launcher finds Node automatically (PATH or common install locations) — no
-setup needed if Node is installed anywhere typical.
+`START_AGENT.cmd` finds Node automatically (PATH or common install locations), so
+normal users do not need PATH setup.
 
 **Or call Node directly:**
 ```bash
@@ -77,13 +59,16 @@ node index.js --agent --gemini-pro --iterations 3
 # 3c) Mature PE mode — add deeper objective, stack, domain, and SLO reasoning
 node index.js --agent --senior --iterations 3
 
-# 4) Watch mode — process files as they land in input/
+# 4) Process only selected logical inputs/files from input/
+node index.js --agent --input Batch_Print --input login.jmx --force
+
+# 5) Watch mode — process files as they land in input/
 node index.js --watch
 
-# 5) Always-on agent — what START_AGENT.cmd runs
+# 6) Always-on agent
 node index.js --agent --watch
 
-# 6) Team-share verified learning memory
+# 7) Team-share verified learning memory
 node index.js --memory-export memory/team-lessons.json
 node index.js --memory-import memory/team-lessons.json
 ```
@@ -228,7 +213,7 @@ or `git config core.hooksPath githooks`). CI runs it too — see
 check out the engine).
 
 ## Distribution
-`perfscript.cmd` is the supported way to run without PATH setup. A fully
+`START_AGENT.cmd` is the supported way to run without PATH setup. A fully
 standalone single `.exe` (Node SEA) is **not** provided because the app requires
 the engine checkout (`backend/` + its `node_modules`) at runtime by design — an
 `.exe` would still need those on disk, so it adds build complexity without

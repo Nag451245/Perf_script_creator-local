@@ -13,7 +13,8 @@ const fs = require('fs');
 const path = require('path');
 const { jmeterDetector, ENGINE_ROOT } = require('./engine');
 const { generate } = require('./generate');
-const { stripGuiListenersForRun } = require('./transforms');
+const { stripGuiListenersForRun, disableSamplersByPattern: disableByPatternTransform } = require('./transforms');
+const steeringModule = require('./steering');
 const { diffRunAgainstRecording, generateHtmlDashboard, findLastJtl, summarizeJtlFast } = require('./verifier');
 const { applyLlmPatches, validateLlmPatches } = require('./llm-patcher');
 const { sanitizeJavaUnsafeJmx } = require('./java-safe');
@@ -25,6 +26,7 @@ const { classifyFirstFailure } = require('./failure-classifier');
 const valueFlowDecisions = require('./value-flow-decisions');
 const samplerDecision = require('./sampler-decision');
 const runEvidence = require('./run-evidence');
+const postRunAdjudicator = require('./post-run-adjudicator');
 const responseEvidence = require('./response-evidence');
 const fastRepairLoop = require('./fast-repair-loop');
 const correlationHypotheses = require('./correlation-hypotheses');
@@ -389,9 +391,42 @@ function isAmbiguousRootSamplerName(sampler) {
     return /^Step\s+\d+\s+-\s+(GET|POST|PUT|PATCH|DELETE)\s+\/$/i.test(String(sampler || '').trim());
 }
 
-function guardedApplyPatch({ guard, blockedDisables, onLog }) {
+function guardedApplyPatch({ guard, blockedDisables, onLog, valueFlow = null, stableJtl = '', outDir = '', name = '', adjudicationRecords = [] }) {
+    let pendingFoldProbes = [];
     return async (jmxPath, failureReport, harEntries, options = {}) => {
-        const filtered = businessGuard.filterProtectedDisables(failureReport, guard);
+        const probeResult = evaluateFoldProbes({ pending: pendingFoldProbes, failureReport, guard });
+        pendingFoldProbes = probeResult.pending;
+        if (probeResult.accepted.length) {
+            onLog(`fold probe: accepted ${probeResult.accepted.length} plumbing disable(s): ${probeResult.accepted.map(p => p.samplerLabel).slice(0, 4).join(', ')}`);
+        }
+        if (probeResult.rejected.length) {
+            onLog(`fold probe: rolling back ${probeResult.rejected.length} disable(s) that harmed protected flow: ${probeResult.rejected.map(p => p.samplerLabel).slice(0, 4).join(', ')}`);
+            jmxPath = rollbackRejectedFoldProbes({ jmxPath, rejected: probeResult.rejected, iteration: options.iteration || 0 });
+        }
+        const evidence = buildAttemptRunEvidence({ entries: harEntries, stableJtl, outDir, onLog });
+        const forensics = buildPatchFailureForensics({ entries: harEntries, evidence, onLog });
+        const filtered = guardFailureReportWithAdjudication({
+            failureReport,
+            entries: harEntries,
+            evidence,
+            valueFlow,
+            guard,
+            failureForensics: forensics,
+        });
+        filtered.report = suppressRejectedProbeDisables(filtered.report, probeResult.rejected);
+        if (probeResult.accepted.length || probeResult.rejected.length) {
+            filtered.adjudication.foldProbe = {
+                accepted: probeResult.accepted,
+                rejected: probeResult.rejected,
+            };
+        }
+        writeRequestAdjudicationArtifacts({
+            outDir,
+            name,
+            iteration: options.iteration || 0,
+            adjudication: filtered.adjudication,
+            records: adjudicationRecords,
+        });
         if (filtered.blocked.length) {
             blockedDisables.push(...filtered.blocked.map(item => ({
                 sampler: item.samplerLabel,
@@ -401,7 +436,195 @@ function guardedApplyPatch({ guard, blockedDisables, onLog }) {
             onLog(`strict business guard: blocked disable of ${filtered.blocked.length} protected sampler(s): ` +
                 filtered.blocked.map(item => item.samplerLabel).slice(0, 4).join(', '));
         }
-        return autoPatcher.applyPatch(jmxPath, filtered.report, harEntries, options);
+        logRequestAdjudication(filtered.adjudication, onLog);
+        const patchResult = await autoPatcher.applyPatch(jmxPath, filtered.report, harEntries, options);
+        if ((!patchResult || !patchResult.patchedJmxPath) && hasAdjudicatorStop(filtered.adjudication)) {
+            const root = filtered.adjudication.actions.stop[0];
+            onLog(`adjudicator: auth/session wall recorded at ${root.samplerLabel}; continuing bounded iterations for evidence without unsafe downstream patches`);
+            return continueWithNoopPatch({ jmxPath, iteration: options.iteration || 0, reason: root.reason });
+        }
+        if (patchResult && patchResult.patchedJmxPath) {
+            pendingFoldProbes = buildPendingFoldProbes({
+                adjudication: filtered.adjudication,
+                failureReport,
+                guard,
+                iteration: options.iteration || 0,
+            });
+        }
+        return patchResult;
+    };
+}
+
+function buildPendingFoldProbes({ adjudication, failureReport, guard, iteration = 0 } = {}) {
+    const disables = adjudication && adjudication.actions && Array.isArray(adjudication.actions.disable)
+        ? adjudication.actions.disable
+        : [];
+    const allowed = new Set(['dead_plumbing', 'safe_browser_plumbing', 'redirect_hop']);
+    return disables
+        .filter(item => item && allowed.has(item.category) && item.samplerLabel)
+        .map(item => ({
+            samplerLabel: item.samplerLabel,
+            category: item.category,
+            iteration,
+            protectedFailuresBefore: [...protectedFailureLabels(failureReport, guard)],
+            failureCountBefore: allFailureLabels(failureReport).size,
+        }));
+}
+
+function evaluateFoldProbes({ pending = [], failureReport = {}, guard = null } = {}) {
+    if (!pending.length) return { accepted: [], rejected: [], pending: [] };
+    const protectedNow = protectedFailureLabels(failureReport, guard);
+    const allNow = allFailureLabels(failureReport);
+    const accepted = [];
+    const rejected = [];
+    const stillPending = [];
+    for (const probe of pending) {
+        const beforeProtected = new Set(probe.protectedFailuresBefore || []);
+        const newProtected = [...protectedNow].filter(label => !beforeProtected.has(label));
+        if (newProtected.length) {
+            rejected.push({ ...probe, newProtectedFailures: newProtected });
+            continue;
+        }
+        if (allNow.size <= Number(probe.failureCountBefore || 0)) {
+            accepted.push(probe);
+            continue;
+        }
+        stillPending.push(probe);
+    }
+    return { accepted, rejected, pending: stillPending };
+}
+
+function protectedFailureLabels(failureReport = {}, guard = null) {
+    const protectedNames = guard && guard.protectedNames instanceof Set ? guard.protectedNames : new Set();
+    const out = new Set();
+    for (const label of allFailureLabels(failureReport)) {
+        if (protectedNames.has(label)) out.add(label);
+    }
+    return out;
+}
+
+function allFailureLabels(failureReport = {}) {
+    const out = new Set();
+    const rows = [
+        ...(failureReport.brokenSamplers || []),
+        ...(failureReport.samplersToDisable || []),
+        ...(failureReport.unresolvedFailures || []),
+    ];
+    for (const row of rows) {
+        const label = String(row && (row.samplerLabel || row.sampler || row.label || row.name) || '').trim();
+        if (label) out.add(label);
+    }
+    return out;
+}
+
+function suppressRejectedProbeDisables(report = {}, rejected = []) {
+    if (!rejected.length || !report || !Array.isArray(report.samplersToDisable)) return report;
+    const blocked = new Set(rejected.map(item => item.samplerLabel));
+    return {
+        ...report,
+        samplersToDisable: report.samplersToDisable.filter(item => !blocked.has(String(item.samplerLabel || '').trim())),
+    };
+}
+
+function rollbackRejectedFoldProbes({ jmxPath, rejected = [], iteration = 0 } = {}) {
+    if (!jmxPath || !fs.existsSync(jmxPath) || !rejected.length) return jmxPath;
+    const fixes = rejected.map(item => ({ kind: 'setSamplerEnabled', sampler: item.samplerLabel, enabled: true }));
+    const xml = fs.readFileSync(jmxPath, 'utf8');
+    const patched = applyLlmPatches(xml, fixes);
+    if (!patched.applied.length) return jmxPath;
+    const parsed = path.parse(jmxPath);
+    const suffix = iteration ? `_fold_probe_rollback_iter_${iteration}` : '_fold_probe_rollback';
+    const patchedJmxPath = path.join(parsed.dir, `${parsed.name}${suffix}${parsed.ext || '.jmx'}`);
+    fs.writeFileSync(patchedJmxPath, patched.xml);
+    return patchedJmxPath;
+}
+
+function hasAdjudicatorStop(adjudication) {
+    return !!(adjudication && adjudication.actions && Array.isArray(adjudication.actions.stop) && adjudication.actions.stop.length);
+}
+
+function continueWithNoopPatch({ jmxPath, iteration = 0, reason = '' } = {}) {
+    if (!jmxPath || !fs.existsSync(jmxPath)) return { patchedJmxPath: null, patchSummary: [] };
+    const parsed = path.parse(jmxPath);
+    const suffix = iteration ? `_adjudication_iter_${iteration}` : '_adjudication_continue';
+    const patchedJmxPath = path.join(parsed.dir, `${parsed.name}${suffix}${parsed.ext || '.jmx'}`);
+    if (path.resolve(jmxPath) !== path.resolve(patchedJmxPath)) {
+        fs.copyFileSync(jmxPath, patchedJmxPath);
+    }
+    return {
+        patchedJmxPath,
+        patchSummary: [{
+            type: 'SKIPPED',
+            sampler: '',
+            reason: reason || 'auth/session wall recorded; no safe patch available, continuing bounded evidence collection',
+        }],
+    };
+}
+
+function buildPatchFailureForensics({ entries = [], evidence = null, onLog = () => {} } = {}) {
+    try {
+        if (!evidence) return null;
+        return failureForensics.analyzeFailureForensics({
+            entries,
+            samples: evidence.samples || [],
+            evidence,
+        });
+    } catch (e) {
+        onLog(`adjudicator forensics skipped: ${e.message}`);
+        return null;
+    }
+}
+
+function writeRequestAdjudicationArtifacts({ outDir = '', name = '', iteration = 0, adjudication = null, records = [] } = {}) {
+    if (!outDir || !name || !adjudication) return null;
+    try {
+        fs.mkdirSync(outDir, { recursive: true });
+        const record = {
+            iteration,
+            generatedAt: new Date().toISOString(),
+            summary: adjudication.summary || {},
+            actions: adjudication.actions || {},
+            decisions: Object.values(adjudication.byIndex || {}),
+        };
+        records.push(record);
+        const iterPath = path.join(outDir, `${name}_request_adjudication_iter_${iteration}.json`);
+        const aggregatePath = path.join(outDir, `${name}_request_adjudication.json`);
+        fs.writeFileSync(iterPath, JSON.stringify(record, null, 2));
+        fs.writeFileSync(aggregatePath, JSON.stringify({ name, iterations: records }, null, 2));
+        return { iterPath, aggregatePath };
+    } catch {
+        return null;
+    }
+}
+
+function logRequestAdjudication(adjudication, onLog = () => {}) {
+    if (!adjudication || !adjudication.summary) return;
+    const summary = adjudication.summary;
+    if (!summary.disable && !summary.protect && !summary.ignore && !summary.stop && !summary.blocked) return;
+    onLog(`adjudicator: disabled ${summary.disable || 0} dead/safe plumbing sampler(s), protected ${summary.protect || 0} producer/business sampler(s), ${summary.ignore || 0} downstream casualties ignored`);
+}
+
+function guardFailureReportWithAdjudication({
+    failureReport = {},
+    entries = [],
+    evidence = null,
+    valueFlow = null,
+    guard = null,
+    failureForensics = null,
+} = {}) {
+    const adjudicated = postRunAdjudicator.adjudicateFailureReport({
+        failureReport,
+        entries,
+        evidence,
+        valueFlow,
+        guard,
+        failureForensics,
+    });
+    const filtered = businessGuard.filterProtectedDisables(adjudicated.report, guard);
+    return {
+        report: filtered.report,
+        blocked: [...(adjudicated.blocked || []), ...(filtered.blocked || [])],
+        adjudication: adjudicated.adjudication,
     };
 }
 
@@ -490,6 +713,26 @@ function baselineDiffArtifact(diff) {
             })),
         },
     };
+}
+
+function adjudicatedDisableFixes(result = {}) {
+    if (!result || result.success !== true) return [];
+    const allowed = new Set(['dead_plumbing', 'safe_browser_plumbing', 'redirect_hop']);
+    const iterations = result.requestAdjudication && Array.isArray(result.requestAdjudication.iterations)
+        ? result.requestAdjudication.iterations
+        : [];
+    const fixes = [];
+    const seen = new Set();
+    for (const iter of iterations) {
+        const disables = iter && iter.actions && Array.isArray(iter.actions.disable) ? iter.actions.disable : [];
+        for (const item of disables) {
+            const sampler = String(item.samplerLabel || item.sampler || '').trim();
+            if (!sampler || !allowed.has(item.category) || seen.has(sampler)) continue;
+            seen.add(sampler);
+            fixes.push({ kind: 'setSamplerEnabled', sampler, enabled: false });
+        }
+    }
+    return fixes;
 }
 
 function applyStatusRootCauseToResult(result = {}, entries = [], evidence = null) {
@@ -1140,9 +1383,18 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
             'jmeter.save.saveservice.response_data': 'false',
             'jmeter.save.saveservice.response_data.on_error': 'false',
             'jmeter.save.saveservice.samplerData': 'false',
+            'jmeter.save.saveservice.responseHeaders': 'true',
+            'jmeter.save.saveservice.url': 'true',
         },
-        onIteration: (s) => onLog(`[iter] ${JSON.stringify(s).slice(0, 180)}`),
+        onIteration: (s) => {
+            onLog(`[iter] ${JSON.stringify(s).slice(0, 180)}`);
+            steeringTick('between JMeter iterations');
+        },
     };
+    // Rebound once the steering channel exists (declared below, after the
+    // guard); the engine loop only starts after that, so this stub never
+    // races the real hook.
+    let steeringTick = () => 0;
 
     // 5a. Strip GUI listeners + add a SimpleDataWriter pointing at a stable
     //     JTL path. The engine's feedback loop also writes its own JTL per
@@ -1185,9 +1437,63 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         valueFlowDecisions: samplerDecisions,
     });
     const blockedDisables = [];
+    const requestAdjudications = [];
     if (strictGuard.enabled) {
         onLog(`strict business guard: protecting ${strictGuard.protectedSamplers.length} sampler(s) from disable`);
     }
+
+    // ── Live operator steering ─────────────────────────────────────────
+    // The UI writes messages into a per-run steering file; we poll it at
+    // every decision checkpoint. protect = instant (guard reads the set
+    // live); disable = folded from the next repair/regeneration; free text
+    // = injected into AI escalation + replan context; questions get an
+    // answer in the chat. Every applied message is acknowledged so the
+    // operator sees exactly what changed course.
+    const steering = steeringModule.createSteeringChannel({ file: process.env.PERFSCRIPT_STEERING, onLog });
+    const applySteering = (checkpoint) => {
+        const commands = steering.poll();
+        for (const cmd of commands) {
+            if (cmd.kind === 'protect') {
+                enrichedRunCfg.protectedCalls = [...(enrichedRunCfg.protectedCalls || []), cmd.pattern];
+                let hits = 0;
+                try {
+                    const currentXml = fs.readFileSync(finalJmxPathRef.value, 'utf8');
+                    for (const s of businessGuard._internal.indexSamplers(currentXml)) {
+                        if (`${s.name} ${s.domain || ''}${s.path || ''}`.includes(cmd.pattern)) {
+                            strictGuard.protectedNames.add(s.name); hits++;
+                        }
+                    }
+                } catch { /* jmx unreadable mid-write — protectedCalls still covers rebuilds */ }
+                steering.say(`Protected "${cmd.pattern}" (${hits} sampler(s) matched) — I will not disable these, effective immediately.`);
+            } else if (cmd.kind === 'disable') {
+                enrichedRunCfg.disableCalls = [...(enrichedRunCfg.disableCalls || []), cmd.pattern];
+                let disabledNow = 0;
+                try {
+                    const currentXml = fs.readFileSync(finalJmxPathRef.value, 'utf8');
+                    const dis = stripAwareDisable(currentXml, cmd.pattern, strictGuard);
+                    if (dis.disabled > 0) { fs.writeFileSync(finalJmxPathRef.value, dis.xml); disabledNow = dis.disabled; }
+                } catch { /* applied at next regeneration instead */ }
+                steering.say(`Disabling "${cmd.pattern}" — ${disabledNow} sampler(s) folded now, and every regeneration this run inherits it.` +
+                    (disabledNow === 0 ? ' (No live match yet; it will apply at the next regeneration.)' : ''));
+            } else if (cmd.kind === 'question') {
+                const ff = blueprintCtx && blueprintCtx.loop && blueprintCtx.loop.firstFailure;
+                const lastAttempt = blueprintCtx && blueprintCtx.loop && blueprintCtx.loop.attempts.slice(-1)[0];
+                steering.say(`You asked: "${cmd.text}" · Current diagnosis: ${ff ? `${ff.category || 'unclassified'} — ${(ff.message || '').slice(0, 160)}` : 'no failure classified yet'}. ` +
+                    `Last attempt: ${lastAttempt ? `${lastAttempt.phase || lastAttempt.strategy || 'n/a'} (${lastAttempt.success ? 'succeeded' : 'not green'})` : 'initial validation'}. ` +
+                    `Checkpoint: ${checkpoint}.`);
+            } else {
+                enrichedRunCfg.llmFlowNotes = [...(enrichedRunCfg.llmFlowNotes || []), `OPERATOR (live, during run): ${cmd.text}`];
+                steering.say(`Noted — your guidance will steer the next AI round and any replan: "${cmd.text.slice(0, 140)}"`);
+            }
+        }
+        return commands.length;
+    };
+    const stripAwareDisable = (xml, pattern, guard) => disableByPatternTransform(xml, [pattern], {
+        protect: (s) => guard && guard.protectedNames && guard.protectedNames.has(s.name),
+    });
+    const finalJmxPathRef = { value: gen.jmxPath };
+    steeringTick = (checkpoint) => { try { return applySteering(checkpoint); } catch (e) { onLog(`steering poll skipped: ${e.message}`); return 0; } };
+    if (steering.active) steering.say(`Chat online. You can steer me while I work: "protect <name>", "disable <name>", free-text guidance, or a question ending in "?".`);
 
     const blueprintCtx = blueprintContext.createBlueprintContext({
         entries,
@@ -1231,7 +1537,16 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     let result;
     const raced = await Promise.race([
         runFeedbackLoop(config, gen.flat, {
-            applyPatch: guardedApplyPatch({ guard: strictGuard, blockedDisables, onLog }),
+            applyPatch: guardedApplyPatch({
+                guard: strictGuard,
+                blockedDisables,
+                onLog,
+                valueFlow,
+                stableJtl,
+                outDir,
+                name,
+                adjudicationRecords: requestAdjudications,
+            }),
         }).then(r => ({ kind: 'loop', r })),
         new Promise(res => setTimeout(() => res({ kind: 'watchdog' }), WATCHDOG_MS)),
     ]);
@@ -1251,6 +1566,8 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     }
 
     let finalJmxPath = result.finalJmxPath || gen.jmxPath;
+    finalJmxPathRef.value = finalJmxPath;
+    steeringTick('after initial validation');
     recoverSamplesFromJtl(result, stableJtl, outDir, onLog);
     let currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
     let verified = applyBusinessVerification(result, finalJmxPath, strictGuard, blockedDisables);
@@ -1302,11 +1619,14 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 onLog(`blueprint failing-response evidence skipped: ${e.message}`);
             }
         }
+        steeringTick('before AI escalation');
+        if (steering.active) steering.say('Deterministic repair is exhausted — starting AI escalation. Guidance sent now reaches the model.');
         const flowNotes = Array.isArray(enrichedRunCfg.llmFlowNotes) ? enrichedRunCfg.llmFlowNotes : [];
         const llm = await runLlmPatchRounds({
             result: finalResult, jmxPath: finalJmxPath, config, gen, outDir, name, onLog, agentCfg: agent, learningCfg: learning, guard: strictGuard, flowNotes, blueprintEvidence, blueprintCtx,
         });
         finalJmxPath = llm.jmxPath;
+        finalJmxPathRef.value = finalJmxPath;
         recoverSamplesFromJtl(llm.result, stableJtl, outDir, onLog);
         currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
         verified = applyBusinessVerification(llm.result, finalJmxPath, strictGuard, blockedDisables);
@@ -1331,6 +1651,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     if (!finalResult.success && agent.enabled) {
         const triedStrategies = [];
         for (let attempt = 1; attempt <= agent.maxReplans && !finalResult.success; attempt++) {
+            steeringTick('before replan');
             const strategy = replanner.proposeReplan({
                 result: finalResult,
                 runCfg: finalRunCfg,
@@ -1341,6 +1662,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
             });
             if (!strategy) { onLog('replan: no untried strategy fits the evidence'); break; }
             triedStrategies.push(strategy.id);
+            if (steering.active) steering.say(`Replanning with strategy "${strategy.id}": ${strategy.reason.slice(0, 160)} — say "protect <name>" now if I should not touch something.`);
             onLog(`REPLAN ${attempt}/${agent.maxReplans}: ${strategy.id} — ${strategy.reason}`);
             try {
                 const replanCfg = { ...finalRunCfg, ...strategy.runCfgPatch };
@@ -1367,7 +1689,18 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 const result2 = await runFeedbackLoop(
                     { ...config, jmxPath: gen2.jmxPath, maxIterations: reverifyIterationBudget(config) },
                     gen2.flat,
-                    { applyPatch: guardedApplyPatch({ guard: guard2, blockedDisables: replanBlockedDisables, onLog }) }
+                    {
+                        applyPatch: guardedApplyPatch({
+                            guard: guard2,
+                            blockedDisables: replanBlockedDisables,
+                            onLog,
+                            valueFlow: valueFlow2,
+                            stableJtl,
+                            outDir,
+                            name,
+                            adjudicationRecords: requestAdjudications,
+                        }),
+                    }
                 );
                 recoverSamplesFromJtl(result2, stableJtl, outDir, onLog);
                 const evidence2 = buildAttemptRunEvidence({ entries: gen2.flat, stableJtl, outDir, onLog });
@@ -1380,6 +1713,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                     onLog(`REPLAN ${strategy.id} SUCCEEDED — adopting the regenerated script as final`);
                     finalResult = verified2.result;
                     finalJmxPath = verified2.result.finalJmxPath || gen2.jmxPath;
+                    finalJmxPathRef.value = finalJmxPath;
                     currentEvidence = evidence2;
                     finalRunCfg = replanCfg;
                     currentSamplerDecisions = samplerDecisions2;
@@ -1393,6 +1727,11 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 onLog(`replan ${strategy.id} errored: ${e.message}`);
             }
         }
+    }
+
+    if (requestAdjudications.length) {
+        finalResult.requestAdjudication = { iterations: requestAdjudications };
+        if (blueprintCtx && blueprintCtx.validation) blueprintCtx.validation.requestAdjudication = finalResult.requestAdjudication;
     }
 
     if (blueprintCtx) {
@@ -1438,7 +1777,10 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
 
     let learnedLessons = null;
     if (learning.enabled) {
-        const fixSource = llmPatch && Array.isArray(llmPatch.successfulFixes) ? llmPatch.successfulFixes : [];
+        const fixSource = [
+            ...(llmPatch && Array.isArray(llmPatch.successfulFixes) ? llmPatch.successfulFixes : []),
+            ...adjudicatedDisableFixes(finalResult),
+        ];
         learnedLessons = learningStore.learnFromRun({
             storePath: learning.storePath,
             flowName: name,
@@ -1497,6 +1839,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
 
     return {
         ok: true, result: finalResult, jmxPath: finalJmxPath, humanBlockers,
+        steeringActive: steering.active,
         stats: gen.stats, baselineDiff, finalGreenGate: finalResult.finalGreenGate || null,
         memoryMatches: llmPatch && llmPatch.memory ? llmPatch.memory.matches || [] : [],
         learnedLessons,
@@ -1531,6 +1874,17 @@ module.exports = {
         applyStatusRootCauseToResult,
         attachFailureForensics,
         refreshBlueprintFirstFailure,
+        guardFailureReportWithAdjudication,
+        buildPatchFailureForensics,
+        writeRequestAdjudicationArtifacts,
+        logRequestAdjudication,
+        hasAdjudicatorStop,
+        continueWithNoopPatch,
+        buildPendingFoldProbes,
+        evaluateFoldProbes,
+        rollbackRejectedFoldProbes,
+        suppressRejectedProbeDisables,
+        adjudicatedDisableFixes,
         applyJavaSafeGuard,
         tryVerifiedCorrelationRepairRound,
         summarizeBlueprintEvidence,

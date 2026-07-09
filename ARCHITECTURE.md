@@ -205,10 +205,10 @@ The goal is 80%-grunt-work → 20%-review, fully auditable — not zero-human.
   `--run` (not only `--fast-loop`) when a target is set: cheap Phase-2
   localization before the JVM boots.
 - **Load profile** — applies to **every** Thread Group (setUp/multi-TG safe).
-- **Web UI** (`src/ui-server.js`, `perfscript-ui.cmd`) — drag-drop recordings,
-  Generate / Generate+Validate / Senior AI Agent, a settings panel
-  (target/credentials/load profile), live log, cancel, and links to the report
-  + `.jmx`.
+- **Single launcher UI** (`START_AGENT.cmd`, `src/ui-server.js`) — drag-drop
+  recordings, logical HAR/JMX/XML input selection, multi-run, rerun, Generate /
+  Generate+Validate / Senior AI Agent / Mature PE Agent / Watch modes, settings,
+  live logs, Windows process-tree stop, and links to the report + `.jmx`.
 - **Test gate** — `githooks/pre-push` runs the suite before every push;
   `.github/workflows/test.yml` runs it in CI (set the `ENGINE_REPO` Actions
   variable so CI can check out the engine). Run `npm test` locally before

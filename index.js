@@ -20,6 +20,7 @@
  *   --agent         run + bounded OpenAI/Gemini diagnose/patch/re-verify loop
  *   --watch         keep running; process files as they appear in input/
  *   --force         reprocess unchanged input files once
+ *   --input NAME    process only the selected logical input unit/file
  *   --iterations N  max feedback-loop iterations (default 3, cap 5)
  */
 const fs = require('fs');
@@ -73,6 +74,8 @@ const inputState = require('./src/input-state');
 const { archiveSuccessfulRun } = require('./src/success-archive');
 const { writeFinalJmxPointer } = require('./src/final-artifact');
 const runProgress = require('./src/run-progress');
+const outputOrganizer = require('./src/output-organizer');
+const { selectUnits } = require('./src/ui-inputs');
 
 const AGENT_OPTS = resolveAgentOptions(args, CONFIG);
 const DO_RUN = AGENT_OPTS.doRun;
@@ -80,6 +83,7 @@ const DO_AGENT = AGENT_OPTS.doAgent;
 const WATCH = args.includes('--watch');
 const FAST_LOOP = args.includes('--fast-loop');
 const FORCE = args.includes('--force');
+const SELECTED_INPUTS = valuesAfterRepeatedFlag('--input');
 const LEARNING_CFG = CONFIG.learning || {};
 const INPUT_STATE_CFG = CONFIG.inputState || {};
 const SUCCESS_ARCHIVE_CFG = CONFIG.successArchive || {};
@@ -87,8 +91,8 @@ const USE_INPUT_STATE = INPUT_STATE_CFG.enabled !== false;
 
 const iterFlag = args.indexOf('--iterations');
 const MAX_ITER = iterFlag >= 0
-    ? Math.min(5, Math.max(1, Number(args[iterFlag + 1]) || 3))
-    : Math.min(5, Math.max(1, Number(CONFIG.maxIterations) || 3));
+    ? Math.min(6, Math.max(1, Number(args[iterFlag + 1]) || 3))
+    : Math.min(6, Math.max(1, Number(CONFIG.maxIterations) || 3));
 
 const processed = new Set();
 let lastIdleScanMessageKey = '';
@@ -104,6 +108,18 @@ function safeName(name) {
 function valueAfterFlag(flag) {
     const idx = args.indexOf(flag);
     return idx >= 0 ? args[idx + 1] : null;
+}
+function valuesAfterRepeatedFlag(flag) {
+    const values = [];
+    for (let i = 0; i < args.length; i += 1) {
+        if (args[i] === flag && args[i + 1]) {
+            values.push(args[i + 1]);
+            i += 1;
+            continue;
+        }
+        if (String(args[i]).startsWith(`${flag}=`)) values.push(String(args[i]).slice(flag.length + 1));
+    }
+    return values.map(v => String(v || '').trim()).filter(Boolean);
 }
 function inputRetryOptions() {
     const retryFlag = valueAfterFlag('--retry-failed');
@@ -278,11 +294,13 @@ async function processUnit(unit) {
                     verdict,
                     validated: true,
                     businessVerified: !!(out.businessVerification && out.businessVerification.ok),
+                    currentJtlPath: path.join(outDir, 'final.jtl'),
+                    labelMapPath: path.join(outDir, `${name}_label_map.json`),
                 });
                 rec(`DONE — verdict=${verdict} · ` +
                     `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
                 rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
-                writeHtmlReport(outDir, name, {
+                let reportPath = writeHtmlReport(outDir, name, {
                     mode: `generate + run (${mode})`, verdict,
                     stats: out.stats, samples: out.result.samples || [],
                     baselineDiff: out.baselineDiff,
@@ -297,8 +315,38 @@ async function processUnit(unit) {
                     failureForensics: out.failureForensics || null,
                 });
                 rec(`open ${name}_report.html for a summary`);
-                if (out.result.success) archiveGreenRun({ outDir, name, rec });
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
+                outputOrganizer.organizeOutput({
+                    outDir,
+                    name,
+                    verdict,
+                    finalJmxPath: finalMarker.finalCopyPath,
+                    reportPath,
+                    currentJtlPath: path.join(outDir, 'final.jtl'),
+                });
+                reportPath = writeHtmlReport(outDir, name, {
+                    mode: `generate + run (${mode})`, verdict,
+                    stats: out.stats, samples: out.result.samples || [],
+                    baselineDiff: out.baselineDiff,
+                    memoryMatches: out.memoryMatches || [],
+                    learnedLessons: out.learnedLessons || null,
+                    correlations: out.correlations || [],
+                    dualHar: notes.dualHar || null,
+                    loadProfile: (out.stats && out.stats.loadProfile) || null,
+                    reasoning: out.reasoning || [],
+                    businessVerification: out.businessVerification || null,
+                    disableDecisions: out.disableDecisions || null,
+                    failureForensics: out.failureForensics || null,
+                });
+                outputOrganizer.organizeOutput({
+                    outDir,
+                    name,
+                    verdict,
+                    finalJmxPath: finalMarker.finalCopyPath,
+                    reportPath,
+                    currentJtlPath: path.join(outDir, 'final.jtl'),
+                });
+                if (out.result.success) archiveGreenRun({ outDir, name, rec });
                 return { success: !!out.result.success, verdict };
             }
         } catch (e) {
@@ -321,6 +369,7 @@ async function processUnit(unit) {
             verdict: runAttemptError ? 'not verified' : 'generated',
             validated: false,
             businessVerified: false,
+            labelMapPath: path.join(outDir, `${name}_label_map.json`),
         });
         rec(`generated JMX — ${gen.stats.samplers} samplers, ${gen.stats.correlations} correlations` +
             `${gen.stats.bodyCorrelations ? ` (+${gen.stats.bodyCorrelations} body/session)` : ''}, ` +
@@ -329,7 +378,7 @@ async function processUnit(unit) {
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
         rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
-        writeHtmlReport(outDir, name, {
+        let reportPath = writeHtmlReport(outDir, name, {
             mode: runAttemptError ? `${DO_AGENT ? 'agent validate' : 'generate + validate'} attempted (${mode})` : `generate only (${mode})`,
             verdict: runAttemptError ? 'not verified' : 'generated',
             stats: gen.stats, samples: [],
@@ -338,8 +387,31 @@ async function processUnit(unit) {
             loadProfile: gen.loadProfile || null,
             reasoning: gen.reasoning || [],
         });
-        rec(`open ${name}_report.html for a summary`);
         const verdict = runAttemptError ? 'not verified' : 'generated';
+        outputOrganizer.organizeOutput({
+            outDir,
+            name,
+            verdict,
+            finalJmxPath: finalMarker.finalCopyPath,
+            reportPath,
+        });
+        reportPath = writeHtmlReport(outDir, name, {
+            mode: runAttemptError ? `${DO_AGENT ? 'agent validate' : 'generate + validate'} attempted (${mode})` : `generate only (${mode})`,
+            verdict,
+            stats: gen.stats, samples: [],
+            correlations: gen.correlations || [],
+            dualHar: notes.dualHar || null,
+            loadProfile: gen.loadProfile || null,
+            reasoning: gen.reasoning || [],
+        });
+        outputOrganizer.organizeOutput({
+            outDir,
+            name,
+            verdict,
+            finalJmxPath: finalMarker.finalCopyPath,
+            reportPath,
+        });
+        rec(`open ${name}_report.html for a summary`);
         return { success: !runAttemptError, verdict };
     } catch (e) {
         rec(`GENERATE FAILED: ${e.message}`);
@@ -374,11 +446,15 @@ async function scanOnce() {
     for (const issue of analysis.issues) {
         log(`INPUT ISSUE [${issue.severity || 'info'}] ${issue.code}: ${issue.message}`);
     }
-    const units = analysis.units;
+    const selection = selectUnits(analysis.units, SELECTED_INPUTS);
+    for (const missing of selection.missing) {
+        log(`INPUT ISSUE [warning] selected_input_not_found: ${missing} did not match any logical input unit or file.`);
+    }
+    const units = SELECTED_INPUTS.length ? selection.selected : analysis.units;
     const retryOptions = inputRetryOptions();
     const fresh = units.filter(u => !processed.has(u.primary) && (FORCE || !USE_INPUT_STATE || inputState.shouldProcessUnit(u, processedState, retryOptions)));
     if (fresh.length === 0) {
-        const idleMessage = buildIdleScanMessage({ processable, units, retryOptions });
+        const idleMessage = buildIdleScanMessage({ processable, units, retryOptions, selectedInputs: SELECTED_INPUTS, missingInputs: selection.missing });
         const idleMessageKey = idleMessage.join('\n');
         if (!WATCH || idleMessageKey !== lastIdleScanMessageKey) {
             for (const line of idleMessage) log(line);
@@ -395,7 +471,12 @@ async function scanOnce() {
     }
 }
 
-function buildIdleScanMessage({ processable, units, retryOptions }) {
+function buildIdleScanMessage({ processable, units, retryOptions, selectedInputs = [], missingInputs = [] }) {
+    if (selectedInputs.length && !units.length) {
+        const available = processable.length ? ` Available recording-like files: ${processable.map(f => path.basename(f)).join(', ')}.` : '';
+        const missing = missingInputs.length ? ` Missing selection(s): ${missingInputs.join(', ')}.` : '';
+        return [`No selected input units matched this run.${missing}${available}`];
+    }
     if (!processable.length) {
         return [`No HAR / JMX files in ${INPUT}. Drop recordings there and re-run.`];
     }
@@ -425,6 +506,7 @@ function buildIdleScanMessage({ processable, units, retryOptions }) {
     }
     if ((memoryImport || memoryExport) && !WATCH && !DO_RUN && !FAST_LOOP) return;
     log(`perfscript-local — mode: ${labelForAgentOptions(AGENT_OPTS, WATCH)}`);
+    if (SELECTED_INPUTS.length) log(`selected input(s): ${SELECTED_INPUTS.join(', ')}`);
     log(`engine: ${require('./src/engine').ENGINE_ROOT}`);
     await scanOnce();
     if (WATCH) {

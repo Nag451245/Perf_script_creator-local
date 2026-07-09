@@ -1079,6 +1079,21 @@ test('fold safety: a duplicate redirect hop is safe despite navigating (parent r
     assert.ok(!byIndex[1].checks.loadBearingNavigation, 'navigation is reproduced by the parent');
 });
 
+test('input selection: the UI unit id matches a RAW ingest unit (dropdown selection bug)', () => {
+    const { selectUnits, unitId } = require('../src/ui-inputs');
+    // Raw ingest units carry NO .id (only the UI projection does) — the matcher
+    // must compute it, or a dropdown selection resolves to zero units and
+    // --pair then fails with "got 0".
+    const rawUnits = [
+        { name: 'Scheduled_Visits_STG_0047', kind: 'jmx', primary: '/in/Scheduled_Visits_STG_0047.jmx', secondary: '/in/Scheduled_Visits_STG_0047.xml' },
+        { name: 'Scheduled_Visits_STG_0061', kind: 'jmx', primary: '/in/Scheduled_Visits_STG_0061.jmx', secondary: '/in/Scheduled_Visits_STG_0061.xml' },
+    ];
+    const ids = rawUnits.map(unitId);
+    const sel = selectUnits(rawUnits, ids);
+    assert.strictEqual(sel.missing.length, 0, 'both dropdown ids resolve');
+    assert.deepStrictEqual(sel.selected.map(u => u.name), ['Scheduled_Visits_STG_0047', 'Scheduled_Visits_STG_0061']);
+});
+
 test('dual-recording pairing: two single JMX units merge into a dual-jmx variance unit', () => {
     const { mergeUnitsAsDual } = require('../src/ingest');
     const a = { name: 'LOGI_0004User', kind: 'jmx', primary: '/in/LOGI_0004User.jmx', secondary: '/in/LOGI_0004User.xml' };

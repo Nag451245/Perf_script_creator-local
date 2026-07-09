@@ -104,7 +104,11 @@ function matchCandidates(unit) {
     const files = filesForUnit(unit).map(file => path.basename(file));
     const projectedFiles = Array.isArray(unit.files) ? unit.files.map(file => file.name || file.path).filter(Boolean) : [];
     return [
-        unit.id,
+        // The UI sends the synthetic unit id. The UI's projected units carry
+        // `.id`, but index.js selects against RAW ingest units that don't —
+        // so ALWAYS include the computed id, or the dropdown selection never
+        // matches and --pair then sees zero units.
+        unit.id || unitId(unit),
         unit.name,
         unit.primary,
         unit.secondary,

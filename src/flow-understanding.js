@@ -30,7 +30,7 @@ function summarizeFlow({ entries = [], pages = [], runCfg = {} } = {}) {
 
     const lines = [];
     lines.push('── Flow understanding ──────────────────────────────');
-    lines.push(`Business flow: ${flow.narrative}`);
+    lines.push(`Business flow: ${conciseNarrative(flow)}`);
     if (businessAction) lines.push(`Primary business action: ${businessAction}`);
     lines.push(`Application host(s): ${hosts.primary}${hosts.thirdParty.length ? ` · third-party: ${hosts.thirdParty.slice(0, 4).join(', ')}` : ''}`);
     lines.push(`Auth / session: ${authStyle}`);
@@ -69,6 +69,24 @@ function summarizeFlow({ entries = [], pages = [], runCfg = {} } = {}) {
             dataInputs,
         },
     };
+}
+
+/**
+ * The raw narrative alternates "navigate/read -> authenticate" dozens of times
+ * on a long flow — noise. Collapse to the DISTINCT business phases in order of
+ * first appearance, which reads like a real flow summary.
+ */
+function conciseNarrative(flow) {
+    const seen = new Set();
+    const phases = [];
+    for (const s of flow.businessSteps || []) {
+        if (seen.has(s.name)) continue;
+        seen.add(s.name);
+        phases.push(s.name);
+    }
+    if (!phases.length) return flow.narrative;
+    if (phases.length > 9) return phases.slice(0, 9).join(' → ') + ` → … (${phases.length} distinct phases)`;
+    return phases.join(' → ');
 }
 
 function topHosts(entries) {

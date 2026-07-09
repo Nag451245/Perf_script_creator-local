@@ -131,17 +131,25 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .chat-in input:focus{outline:0;border-color:var(--brand);box-shadow:0 0 0 3px rgba(79,124,255,.18)}
 
 .results{border-top:1px solid var(--line);padding:14px 18px}
-.results-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px}
-.results-h h3{margin:0;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink2)}
-.result{border:1px solid var(--line);border-radius:12px;padding:12px 13px;margin-bottom:10px;background:var(--surface2)}
-.result-h{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.result-h h4{margin:0;font-size:14px;font-weight:650}
-.verdict{font-size:11.5px;font-weight:700;padding:4px 10px;border-radius:999px;border:1px solid var(--line)}
-.verdict.ok{background:rgba(47,208,138,.14);color:var(--ok);border-color:transparent}
-.verdict.warn{background:rgba(243,182,75,.14);color:var(--warn);border-color:transparent}
-.result .stats{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
-.result .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:11px}
-.action{display:inline-flex;align-items:center;gap:6px;border-radius:9px;padding:8px 12px;background:var(--raise);color:var(--ink);text-decoration:none;font-weight:600;font-size:12.5px;border:1px solid var(--line2)}
+.results-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:11px;gap:12px}
+.results-h h3{margin:0;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink2);display:flex;align-items:center}
+#outputs{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:12px}
+.hrow{display:flex;align-items:center;gap:10px;padding:10px 13px;border-bottom:1px solid var(--line);cursor:pointer;transition:background .12s}
+.hrow:last-child{border-bottom:0}
+.hrow:hover{background:var(--surface2)}
+.hdot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--mut)}
+.hdot.ok{background:var(--ok)} .hdot.warn{background:var(--warn)}
+.hname{font-weight:600;font-size:13px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hmeta{font-size:11.5px;color:var(--mut);white-space:nowrap}
+.hverdict{font-size:10.5px;font-weight:700;padding:3px 9px;border-radius:999px;flex:none}
+.hverdict.ok{background:rgba(47,208,138,.14);color:var(--ok)} .hverdict.warn{background:rgba(243,182,75,.14);color:var(--warn)} .hverdict.gen{background:var(--raise);color:var(--ink2)}
+.hcaret{color:var(--mut);font-size:11px;transition:transform .15s;flex:none}
+.hrow.open .hcaret{transform:rotate(90deg)}
+.hbody{display:none;padding:0 13px 13px 31px;border-bottom:1px solid var(--line);background:var(--surface2)}
+.hbody.open{display:block}
+.hbody .stats{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.hbody .actions{display:flex;gap:8px;flex-wrap:wrap}
+.action{display:inline-flex;align-items:center;gap:6px;border-radius:9px;padding:7px 12px;background:var(--raise);color:var(--ink);text-decoration:none;font-weight:600;font-size:12.5px;border:1px solid var(--line2)}
 .action:hover{border-color:#3a496a}
 .action.primary{background:linear-gradient(135deg,var(--brand),var(--brand2));border-color:transparent;color:#fff}
 
@@ -274,8 +282,11 @@ The agent will print its understanding of the flow and domain before it begins.<
     </div>
 
     <div class="results">
-      <div class="results-h"><h3>Results</h3></div>
-      <div id="outputs"><div class="empty">No output yet. Completed runs appear here.</div></div>
+      <div class="results-h">
+        <h3>History <span id="hist-count" class="count" style="margin-left:6px">0</span></h3>
+        <input id="hist-search" placeholder="Filter runs…" style="width:180px;background:var(--bg);border:1px solid var(--line2);border-radius:var(--radius-sm);padding:6px 10px;font-size:12.5px">
+      </div>
+      <div id="outputs"><div class="empty">No runs yet. Completed runs are listed here.</div></div>
     </div>
   </main>
 </div>
@@ -344,19 +355,38 @@ function renderIssues(issues){
  q('#input-issues').innerHTML=(issues||[]).filter(function(i){return i.severity==='error'||i.severity==='warning'}).slice(0,8)
   .map(function(i){return '<div class="warnrow">'+esc(i.severity.toUpperCase()+': '+i.message)+'</div>'}).join('');
 }
+var allOutputs=[];
 function renderOutputs(outputs){
- if(!outputs.length){q('#outputs').innerHTML='<div class="empty">No output yet. Completed runs appear here.</div>';return}
- q('#outputs').innerHTML=outputs.map(function(o){
-  var cls=o.verdict==='GREEN'?'ok':(o.verdict==='needs attention'?'warn':'');
+ allOutputs=outputs||[];
+ q('#hist-count').textContent=allOutputs.length;
+ paintHistory();
+}
+function paintHistory(){
+ var term=(q('#hist-search').value||'').toLowerCase();
+ var list=allOutputs.filter(function(o){return !term||String(o.name||'').toLowerCase().indexOf(term)>=0});
+ if(!list.length){q('#outputs').innerHTML='<div class="empty">'+(allOutputs.length?'No runs match the filter.':'No runs yet. Completed runs are listed here.')+'</div>';return}
+ q('#outputs').innerHTML=list.map(function(o,i){
+  var vc=o.verdict==='GREEN'?'ok':(o.verdict==='needs attention'?'warn':'gen');
+  var vlabel=o.verdict==='GREEN'?'GREEN':(o.verdict==='needs attention'?'ATTENTION':'generated');
+  var meta=o.kind==='validated'?((o.passed||0)+'/'+((o.passed||0)+(o.failed||0))+' passed'):((o.samplers||0)+' samplers');
   var stats=o.kind==='validated'
-   ?'<div class="stats"><span class="chip" style="color:var(--ok)">'+(o.passed||0)+' passed</span><span class="chip" style="color:'+((o.failed||0)?'var(--bad)':'var(--mut)')+'">'+(o.failed||0)+' failed</span><span class="chip">'+(o.total||0)+' app reqs</span></div>'
-   :'<div class="stats"><span class="chip">'+(o.samplers||0)+' samplers</span><span class="chip" style="color:var(--accent)">'+(o.correlations||0)+' correlations</span></div>';
+   ?'<span class="chip" style="color:var(--ok)">'+(o.passed||0)+' passed</span><span class="chip" style="color:'+((o.failed||0)?'var(--bad)':'var(--mut)')+'">'+(o.failed||0)+' failed</span><span class="chip">'+(o.total||0)+' app reqs</span>'
+   :'<span class="chip">'+(o.samplers||0)+' samplers</span><span class="chip" style="color:var(--accent)">'+(o.correlations||0)+' correlations</span>';
   var act='';
   if(o.report)act+='<a class="action primary" target="_blank" href="/out/'+encodeURIComponent(o.name)+'/'+encodeURIComponent(o.report)+'">Open report</a>';
   if(o.jmx)act+='<a class="action" href="/out/'+encodeURIComponent(o.name)+'/'+encodeURIComponent(o.jmx)+'">Download JMX</a>';
-  act+='<button class="action" type="button" data-name="'+esc(o.name)+'" onclick="rerunName(this.dataset.name)">Rerun</button>';
-  return '<div class="result"><div class="result-h"><h4>'+esc(o.name)+'</h4><span class="verdict '+cls+'">'+esc(o.verdict||'generated')+'</span></div>'+stats+'<div class="actions">'+act+'</div></div>';
+  act+='<button class="action" type="button" data-name="'+esc(o.name)+'" onclick="event.stopPropagation();rerunName(this.dataset.name)">Rerun</button>';
+  return '<div class="hrow" onclick="toggleHist('+i+')"><span class="hcaret">▶</span><span class="hdot '+vc+'"></span>'+
+    '<span class="hname" title="'+esc(o.name)+'">'+esc(o.name)+'</span>'+
+    '<span class="hmeta">'+esc(meta)+'</span>'+
+    '<span class="hverdict '+vc+'">'+vlabel+'</span></div>'+
+    '<div class="hbody" id="hbody-'+i+'"><div class="stats">'+stats+'</div><div class="actions">'+act+'</div></div>';
  }).join('');
+}
+function toggleHist(i){
+ var row=qa('.hrow')[i],body=q('#hbody-'+i);
+ if(!row||!body)return;
+ var open=body.classList.toggle('open');row.classList.toggle('open',open);
 }
 function requestBody(force){
  var ins=selectedInputs();
@@ -399,6 +429,7 @@ q('#rerun-last').onclick=function(){rerunLast().catch(function(e){alert(e.messag
 q('#stop').onclick=async function(){await fetch('/api/cancel',{method:'POST'});q('#phase').textContent='Stopping…'};
 q('#refresh').onclick=refresh;q('#cfg-save').onclick=function(){saveCfg(false)};
 q('#rec1').onchange=updateSelected;q('#rec2').onchange=updateSelected;
+q('#hist-search').oninput=paintHistory;
 q('#copy-log').onclick=function(){navigator.clipboard&&navigator.clipboard.writeText(logText)};
 q('#clear-log').onclick=function(){logText='';q('#log').textContent=''};
 q('#chat-send').onclick=function(){sendChat()};q('#chat-input').onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();sendChat()}};

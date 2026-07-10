@@ -844,19 +844,45 @@ async function tryFoldNonLoadBearing({ evidence, guard, finalJmxPath, stableJtl,
             .filter(c => labelEnabledInJmx(finalJmxPath, c.label));
         if (!candidates.length) return none;
         onLog(`non-load-bearing fold: ${candidates.length} failing hop(s) with all-green downstream — ${candidates.map(c => `${c.label} [${c.responseCode}]`).join(', ')}; probing a folded re-run`);
-        const probeDir = path.join(outDir, 'fold_probe');
-        fs.mkdirSync(probeDir, { recursive: true });
-        const probeJmx = path.join(probeDir, `${name}.jmx`);
-        const probeJtl = path.join(probeDir, 'fold_probe.jtl');
+        // The probe JMX MUST live in the same directory as the real run: JMeter
+        // resolves relative CSV Data Set / upload paths against the test-plan
+        // dir, so a subfolder copy loses `createtask_data.csv` and the run yields
+        // zero samples. Keep it beside the original, isolate only via a distinct
+        // JTL so a rejected fold leaves the real final.jtl untouched.
+        const probeJmx = path.join(outDir, `${name}__fold_probe.jmx`);
+        const probeJtl = path.join(outDir, `${name}__fold_probe.jtl`);
         try { fs.rmSync(probeJtl, { force: true }); } catch { /* fresh */ }
         const foldedXml = disableByPatternTransform(fs.readFileSync(finalJmxPath, 'utf8'), candidates.map(c => c.label)).xml;
-        // Probe copy writes to its OWN JTL so a rejected fold leaves final.jtl intact.
         fs.writeFileSync(probeJmx, repointDataWriter(foldedXml, stableJtl, probeJtl));
-        try { applyJavaSafeGuard({ jmxPath: probeJmx, outDir: probeDir, name, label: 'fold_probe', enabled: agent.javaSafeMode, onLog }); } catch { /* non-fatal */ }
-        const probeResult = await runFeedbackLoop({ ...config, jmxPath: probeJmx, maxIterations: 1 }, gen.flat, {});
+        try { applyJavaSafeGuard({ jmxPath: probeJmx, outDir, name, label: 'fold_probe', enabled: agent.javaSafeMode, onLog }); } catch { /* non-fatal */ }
+        // Same watchdog the main run needs: the engine's JTL parse can stall
+        // after JMeter finishes, so race it and, on timeout, recover the probe
+        // verdict straight from the JTL the SimpleDataWriter wrote.
+        const PROBE_WATCHDOG_MS = (config.timeoutMs || 240000) + 90000;
+        const raced = await Promise.race([
+            runFeedbackLoop({ ...config, jmxPath: probeJmx, maxIterations: 1 }, gen.flat, {}).then(r => ({ kind: 'loop', r })),
+            new Promise(res => setTimeout(() => res({ kind: 'watchdog' }), PROBE_WATCHDOG_MS)),
+        ]);
+        let probeResult;
+        if (raced.kind === 'loop') {
+            probeResult = raced.r;
+        } else {
+            const samples = fs.existsSync(probeJtl) ? summarizeJtlFast(probeJtl) : [];
+            const reqs = samples.filter(s => !s.isTransaction);
+            probeResult = { success: reqs.length > 0 && reqs.every(s => s.success), iterationsRun: 1, samples, finalJmxPath: probeJmx, recoveredFromJtl: true };
+            onLog(`fold probe: engine parse stalled — recovered probe verdict from JTL (${reqs.filter(s => s.success).length}/${reqs.length} requests passed)`);
+        }
         recoverSamplesFromJtl(probeResult, probeJtl, outDir, onLog, probeResult.finalJmxPath || probeJmx);
         const probeEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl: probeJtl, outDir, onLog });
         const probeVerified = applyBusinessVerification(probeResult, probeResult.finalJmxPath || probeJmx, guard, blockedDisables);
+        // A probe that executed NO requests proves nothing (missing data file,
+        // JMeter startup error) — never reject the fold on an empty run.
+        const probeRan = (probeVerified.result.samples || []).some(s => !s.isTransaction);
+        if (!probeRan) {
+            onLog(`non-load-bearing fold INCONCLUSIVE — the probe re-run produced no request samples (execution issue, not a rejection); leaving the hops enabled for the normal repair path`);
+            try { fs.rmSync(probeJmx, { force: true }); } catch { /* best effort */ }
+            return none;
+        }
         if (probeVerified.result.success && probeVerified.evaluation.ok) {
             onLog(`non-load-bearing fold CONFIRMED — the flow stays green without ${candidates.length} hop(s); adopting the folded script`);
             // Ship the folded JMX (its writer still points at final.jtl) and make
@@ -868,6 +894,7 @@ async function tryFoldNonLoadBearing({ evidence, guard, finalJmxPath, stableJtl,
         }
         const stillFailing = (probeVerified.result.samples || []).filter(s => !s.isTransaction && s.success === false).length;
         onLog(`non-load-bearing fold REJECTED — folded re-run still not green (${stillFailing} failing); the hop(s) were load-bearing, keeping them enabled`);
+        try { fs.rmSync(probeJmx, { force: true }); } catch { /* best effort */ }
         return none;
     } catch (e) {
         onLog(`non-load-bearing fold skipped: ${e.message}`);

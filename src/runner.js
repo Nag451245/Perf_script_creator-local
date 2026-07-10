@@ -2143,6 +2143,25 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     } catch (e) { onLog(`baseline diff skipped: ${e.message}`); }
     if (baselineDiff && baselineDiff.evidence) currentEvidence = baselineDiff.evidence;
 
+    // Scope the verdict to the FINAL SHIPPED script. A sampler DISABLED in the
+    // shipped JMX does not run, so its stale row — final.jtl (SimpleDataWriter)
+    // APPENDS across the engine's iterations, so an adjudicator-disabled hop
+    // keeps its iteration-1 401 — must not count as a failure or a downstream
+    // casualty. Without this, /authorize/resume disabled in iteration 2 still
+    // reads as a live "downstream failure" and the green gate stamps a 86/86
+    // run NOT GREEN. result.samples is already scoped by recoverSamplesFromJtl;
+    // do the same for the evidence + baseline drift the gate consumes.
+    const shippedDisabled = disabledSamplerLabels(finalJmxPath);
+    if (shippedDisabled.size) {
+        const keep = (label) => !shippedDisabled.has(String(label || '').trim());
+        if (currentEvidence && Array.isArray(currentEvidence.rows)) {
+            currentEvidence = { ...currentEvidence, rows: currentEvidence.rows.filter(r => keep(r.label)) };
+        }
+        if (baselineDiff && Array.isArray(baselineDiff.drift)) {
+            baselineDiff = { ...baselineDiff, drift: baselineDiff.drift.filter(d => keep(d.label) && keep(d.sampler)) };
+        }
+    }
+
     const finalGate = finalGreenGate.evaluateFinalGreenGate({
         result: finalResult,
         baselineDiff,

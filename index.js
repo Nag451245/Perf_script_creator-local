@@ -453,7 +453,15 @@ async function scanOnce() {
         }
     }
     const retryOptions = inputRetryOptions();
-    const fresh = units.filter(u => !processed.has(u.primary) && (FORCE || !USE_INPUT_STATE || inputState.shouldProcessUnit(u, processedState, retryOptions)));
+    // The processed-input skip / failed-run retry cap exists ONLY to keep
+    // WATCH mode from reprocessing an unchanged file on every poll. An
+    // explicit one-shot run — the UI's "Run selected", or any CLI run that
+    // isn't --watch, or any run that names --input — is a deliberate request
+    // to run NOW, so it must never be capped or skipped. (Marking still
+    // happens below so watch mode stays correct.)
+    const explicitRun = !WATCH || SELECTED_INPUTS.length > 0 || FORCE;
+    const enforceInputState = USE_INPUT_STATE && !explicitRun;
+    const fresh = units.filter(u => !processed.has(u.primary) && (!enforceInputState || inputState.shouldProcessUnit(u, processedState, retryOptions)));
     if (fresh.length === 0) {
         const idleMessage = buildIdleScanMessage({ processable, units, retryOptions, selectedInputs: SELECTED_INPUTS, missingInputs: selection.missing });
         const idleMessageKey = idleMessage.join('\n');

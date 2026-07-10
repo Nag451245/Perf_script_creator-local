@@ -6446,3 +6446,51 @@ test('generate: volatile OAuth values are ignored instead of forced into correla
     assert.doesNotMatch(xml, /RegexExtractor\.refname">(state|nonce|code)</);
     assert.ok(gen.reasoning.some(r => r.phase === 'oauth-volatile-ignore'));
 });
+
+// ── Non-load-bearing fold (empirical, app-agnostic) ──────────────────────
+const { detectNonLoadBearingFailures } = require('../src/nonloadbearing-fold');
+
+test('non-load-bearing fold: folds failing hops whose downstream all passed', () => {
+    const rows = [
+        { entryIndex: 14, label: 'SC01_T02_/u/login/password-015', method: 'POST', observedStatus: 200, success: true, isTransaction: false, finalUrl: 'https://x/u/login/password' },
+        { entryIndex: 15, label: 'SC01_T02_/authorize/resume-016', method: 'GET', observedStatus: 401, success: false, isTransaction: false, finalUrl: 'https://x/authorize/resume?state=z' },
+        { entryIndex: 16, label: 'SC01_T02_/iam/callback-017', method: 'GET', observedStatus: 200, success: true, isTransaction: false, finalUrl: 'https://x/iam/callback' },
+        { entryIndex: 25, label: 'SC01_T02_/oauth/token-025', method: 'POST', observedStatus: 403, success: false, isTransaction: false, finalUrl: 'https://x/oauth/token' },
+        { entryIndex: 26, label: 'SC01_T02_/user/iam/save-026', method: 'POST', observedStatus: 200, success: true, isTransaction: false, finalUrl: 'https://x/user/iam/save' },
+    ];
+    const labels = detectNonLoadBearingFailures({ evidence: { rows } }).map(c => c.label);
+    assert.deepStrictEqual(labels.sort(), ['SC01_T02_/authorize/resume-016', 'SC01_T02_/oauth/token-025']);
+});
+
+test('non-load-bearing fold: keeps a token exchange whose failure cascades (M2M)', () => {
+    const rows = [
+        { entryIndex: 1, label: 'POST /oauth/token-002', method: 'POST', observedStatus: 403, success: false, isTransaction: false, finalUrl: 'https://x/oauth/token' },
+        { entryIndex: 2, label: 'GET /api/v1/data-003', method: 'GET', observedStatus: 401, success: false, isTransaction: false, finalUrl: 'https://x/api/v1/data' },
+    ];
+    assert.strictEqual(detectNonLoadBearingFailures({ evidence: { rows } }).length, 0);
+});
+
+test('non-load-bearing fold: never folds a failing business request', () => {
+    const rows = [
+        { entryIndex: 1, label: 'POST /checkout-002', method: 'POST', observedStatus: 500, success: false, isTransaction: false, finalUrl: 'https://x/checkout' },
+        { entryIndex: 2, label: 'GET /home-003', method: 'GET', observedStatus: 200, success: true, isTransaction: false, finalUrl: 'https://x/home' },
+    ];
+    assert.strictEqual(detectNonLoadBearingFailures({ evidence: { rows } }).length, 0);
+});
+
+test('non-load-bearing fold: never folds a guard-protected sampler', () => {
+    const rows = [
+        { entryIndex: 1, label: 'SC01_/authorize/resume-002', method: 'GET', observedStatus: 401, success: false, isTransaction: false, finalUrl: 'https://x/authorize/resume' },
+        { entryIndex: 2, label: 'GET /home-003', method: 'GET', observedStatus: 200, success: true, isTransaction: false, finalUrl: 'https://x/home' },
+    ];
+    const guard = { protectedNames: new Set(['SC01_/authorize/resume-002']) };
+    assert.strictEqual(detectNonLoadBearingFailures({ evidence: { rows }, guard }).length, 0);
+});
+
+test('non-load-bearing fold: no candidates when nothing failed', () => {
+    const rows = [
+        { entryIndex: 1, label: 'GET /a-001', method: 'GET', observedStatus: 200, success: true, isTransaction: false, finalUrl: 'https://x/a' },
+        { entryIndex: 2, label: 'GET /b-002', method: 'GET', observedStatus: 200, success: true, isTransaction: false, finalUrl: 'https://x/b' },
+    ];
+    assert.strictEqual(detectNonLoadBearingFailures({ evidence: { rows } }).length, 0);
+});

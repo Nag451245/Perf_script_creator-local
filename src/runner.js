@@ -32,6 +32,7 @@ const fastRepairLoop = require('./fast-repair-loop');
 const correlationHypotheses = require('./correlation-hypotheses');
 const statusAnalysis = require('./status-analysis');
 const finalGreenGate = require('./final-green-gate');
+const nonLoadBearingFold = require('./nonloadbearing-fold');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
 const seniorPeAnalysis = require('./senior-pe-analysis');
@@ -695,6 +696,26 @@ function disabledSamplerLabels(jmxPath) {
     return set;
 }
 
+/** Is a sampler testname present AND enabled in the JMX? (fold candidates must be.) */
+function labelEnabledInJmx(jmxPath, label) {
+    try {
+        const xml = fs.readFileSync(jmxPath, 'utf8');
+        const needle = String(label || '').trim();
+        for (const m of xml.matchAll(/<HTTPSamplerProxy\b([^>]*)>/g)) {
+            const attrs = m[1] || '';
+            const name = (attrs.match(/testname="([^"]*)"/) || [])[1];
+            if (name && name.trim() === needle) return /enabled="true"/.test(attrs);
+        }
+    } catch { /* best effort */ }
+    return false;
+}
+
+/** Re-point a JMX SimpleDataWriter from one JTL path to another (probe isolation). */
+function repointDataWriter(xml, fromPath, toPath) {
+    if (fromPath && xml.includes(fromPath)) return xml.split(fromPath).join(toPath);
+    return xml.replace(/(<stringProp name="filename">)([^<]*\bfinal\.jtl)(<\/stringProp>)/g, `$1${toPath}$3`);
+}
+
 function recoverSamplesFromJtl(result, stableJtl, outDir, onLog, finalJmxPath) {
     if (!result) return result;
     try {
@@ -806,6 +827,51 @@ function buildAttemptRunEvidence({ entries = [], stableJtl = '', outDir = '', on
     } catch (e) {
         onLog(`run evidence skipped: ${e.message}`);
         return null;
+    }
+}
+
+/**
+ * Empirical non-load-bearing fold + counterfactual replay. Detect failing
+ * samplers whose downstream all passed, disable them in an ISOLATED copy (its
+ * own JTL so a rejected fold leaves the original run's final.jtl untouched),
+ * re-run once, and adopt the folded script ONLY if the flow stays green.
+ * Returns { adopted, result, finalJmxPath, evidence, verified, candidates }.
+ */
+async function tryFoldNonLoadBearing({ evidence, guard, finalJmxPath, stableJtl, outDir, name, config, gen, agent, enrichedRunCfg, blockedDisables, onLog }) {
+    const none = { adopted: false };
+    try {
+        const candidates = nonLoadBearingFold.detectNonLoadBearingFailures({ evidence, guard })
+            .filter(c => labelEnabledInJmx(finalJmxPath, c.label));
+        if (!candidates.length) return none;
+        onLog(`non-load-bearing fold: ${candidates.length} failing hop(s) with all-green downstream — ${candidates.map(c => `${c.label} [${c.responseCode}]`).join(', ')}; probing a folded re-run`);
+        const probeDir = path.join(outDir, 'fold_probe');
+        fs.mkdirSync(probeDir, { recursive: true });
+        const probeJmx = path.join(probeDir, `${name}.jmx`);
+        const probeJtl = path.join(probeDir, 'fold_probe.jtl');
+        try { fs.rmSync(probeJtl, { force: true }); } catch { /* fresh */ }
+        const foldedXml = disableByPatternTransform(fs.readFileSync(finalJmxPath, 'utf8'), candidates.map(c => c.label)).xml;
+        // Probe copy writes to its OWN JTL so a rejected fold leaves final.jtl intact.
+        fs.writeFileSync(probeJmx, repointDataWriter(foldedXml, stableJtl, probeJtl));
+        try { applyJavaSafeGuard({ jmxPath: probeJmx, outDir: probeDir, name, label: 'fold_probe', enabled: agent.javaSafeMode, onLog }); } catch { /* non-fatal */ }
+        const probeResult = await runFeedbackLoop({ ...config, jmxPath: probeJmx, maxIterations: 1 }, gen.flat, {});
+        recoverSamplesFromJtl(probeResult, probeJtl, outDir, onLog, probeResult.finalJmxPath || probeJmx);
+        const probeEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl: probeJtl, outDir, onLog });
+        const probeVerified = applyBusinessVerification(probeResult, probeResult.finalJmxPath || probeJmx, guard, blockedDisables);
+        if (probeVerified.result.success && probeVerified.evaluation.ok) {
+            onLog(`non-load-bearing fold CONFIRMED — the flow stays green without ${candidates.length} hop(s); adopting the folded script`);
+            // Ship the folded JMX (its writer still points at final.jtl) and make
+            // final.jtl reflect the folded green run so every later stage agrees.
+            fs.writeFileSync(finalJmxPath, foldedXml);
+            try { fs.copyFileSync(probeJtl, stableJtl); } catch { /* keep probe JTL */ }
+            probeVerified.result.finalJmxPath = finalJmxPath;
+            return { adopted: true, result: probeVerified.result, finalJmxPath, evidence: probeEvidence, verified: probeVerified, candidates };
+        }
+        const stillFailing = (probeVerified.result.samples || []).filter(s => !s.isTransaction && s.success === false).length;
+        onLog(`non-load-bearing fold REJECTED — folded re-run still not green (${stillFailing} failing); the hop(s) were load-bearing, keeping them enabled`);
+        return none;
+    } catch (e) {
+        onLog(`non-load-bearing fold skipped: ${e.message}`);
+        return none;
     }
 }
 
@@ -1813,6 +1879,39 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     }
     attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
     refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+
+    // ── EMPIRICAL NON-LOAD-BEARING FOLD (app-agnostic) ─────────────────────
+    // Before spending AI tokens or a replan, reproduce the fix a senior
+    // engineer applies by hand to a browser SPA / SSO recording: a hop that
+    // FAILED (401/403) while every downstream request PASSED never carried the
+    // session — disable it and the flow stays clean. This lets RUNTIME evidence
+    // (downstream is green) override the static session/token PROTECT priors
+    // that keep resume / oauth-token enabled, and CONFIRMS the fold with an
+    // actual isolated re-run so it can never fold something load-bearing.
+    // Needs zero OAuth/SSO knowledge; deterministic and free (runs before AI).
+    if (!finalResult.success && enrichedRunCfg.foldNonLoadBearing !== false) {
+        const folded = await tryFoldNonLoadBearing({
+            evidence: currentEvidence, guard: strictGuard, finalJmxPath, stableJtl,
+            outDir, name, config, gen, agent, enrichedRunCfg, blockedDisables, onLog,
+        });
+        if (folded.adopted) {
+            finalResult = folded.result;
+            finalJmxPath = folded.finalJmxPath;
+            finalJmxPathRef.value = finalJmxPath;
+            currentEvidence = folded.evidence;
+            verified = folded.verified;
+            for (const c of folded.candidates) {
+                requestAdjudications.push({
+                    iteration: 'fold-probe',
+                    actions: { disable: [{ samplerLabel: c.label, responseCode: c.responseCode, category: 'nonloadbearing_fold', reason: c.reason }] },
+                });
+            }
+            applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence, { strictStatusMatch: enrichedRunCfg.strictStatusMatch });
+            attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
+            refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+        }
+    }
+
     try {
         blueprintCtx.seniorPeAnalysis = seniorPeAnalysis.analyzeSeniorPeFailure({
             name,

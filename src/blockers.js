@@ -24,12 +24,32 @@ function deriveBlockers({
     hasSecondRecording = true,
     ghostsRefused = 0,
     uploadFiles = null,
+    gate0 = null,
 } = {}) {
     const blockers = [];
     const reqs = (result.samples || []).filter(s => !s.isTransaction);
     const failing = reqs.filter(s => s.success === false);
     const codeOf = (s) => String(s.responseCode || s.code || '');
     const forensic = result.failureForensics || null;
+
+    // GATE 0 first: if the script would SEND wrong/literal values, that is the
+    // root cause — a DATA defect, fixable, and it must lead. It also means any
+    // auth/session failure downstream is a SYMPTOM, so we suppress the
+    // "provide a browser session / non-MFA account" speculation that would
+    // otherwise bury the real one-line fix (this is exactly what mis-triaged
+    // the Scheduled Visits credential corruption as an irreducible auth wall).
+    const gate0Defects = (gate0 && Array.isArray(gate0.findings) ? gate0.findings : []).filter(f => f && f.dataDefect);
+    const suppressAuthSpeculation = gate0Defects.some(f =>
+        f.kind === 'csv-column-shift' ||
+        /user|pass|token|state|nonce|csrf|auth|cred|session/i.test(String(f.variable || '')));
+    for (const f of gate0Defects.slice(0, 3)) {
+        blockers.push({
+            id: `gate0-${f.kind}`,
+            blocker: `The script would send an incorrect value: ${f.message}`,
+            ask: f.fix || 'Fix the data source so the request sends the intended value, then rerun.',
+            evidence: [f.variable ? `\${${f.variable}}` : null, f.file ? `${f.file} row ${f.row}` : null, f.evidence].filter(Boolean).join(' · ') || f.kind,
+        });
+    }
 
     if (forensic && forensic.rootCause) {
         const root = forensic.rootCause;
@@ -41,7 +61,7 @@ function deriveBlockers({
             missingCookies.length ||
             /auth|session|cookie|csrf|token/i.test(root.category || '') ||
             /^(401|403)$/.test(String(observed || ''));
-        if (authEvidence) {
+        if (authEvidence && !suppressAuthSpeculation) {
             blockers.push({
                 id: 'auth-session-forensics',
                 blocker: `${root.sampler} diverged first: recorded ${recorded}, observed ${observed}`,
@@ -84,7 +104,7 @@ function deriveBlockers({
         const params = ((e.request && e.request.postData && e.request.postData.params) || []).map(p => p.name).join(' ');
         return MFA_RE.test(url) || MFA_RE.test(params) || /name=["']?(otp|totp|mfa|code_challenge_method_mfa)/i.test(body);
     });
-    if (mfaEntry && failing.length) {
+    if (mfaEntry && failing.length && !suppressAuthSpeculation) {
         blockers.push({
             id: 'mfa',
             blocker: 'the recorded flow contains an MFA/OTP step — single-use codes cannot be replayed or synthesized',

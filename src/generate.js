@@ -39,6 +39,7 @@ const scenario = require('./scenario');
 const outcomeProbe = require('./outcome-probe');
 const redirectHops = require('./redirect-hops');
 const foldSafetyModule = require('./fold-safety');
+const renderedRequestCheck = require('./rendered-request-check');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
 const peNaming = require('./pe-naming');
@@ -647,7 +648,18 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     });
     let xml = getRenderer(DEFAULT_RENDERER_ID).render(ir).xml;
     if (candidates.length) {
-        xml = xml.replace(/<stringProp name="delimiter">,<\/stringProp>/g, '<stringProp name="delimiter">|</stringProp>');
+        // Our synthesized data CSV is PIPE-delimited (so comma-bearing values —
+        // date-column lists, address fields — never split a column). The
+        // renderer emits delimiter=","/quotedData=false, so retarget BOTH on
+        // the data CSVDataSet: delimiter -> "|" and quotedData -> true. The CSV
+        // writer (escape() above) RFC-4180-quotes any field containing a pipe,
+        // quote, or newline; without quotedData=true JMeter reads those quotes
+        // literally and shifts every later column — the class that made
+        // ${username}/${password} resolve to a neighbouring column's value and
+        // 400'd every login. Scope the flip to CSVDataSet blocks only.
+        xml = xml.replace(/<CSVDataSet\b[\s\S]*?<\/CSVDataSet>/g, (block) => block
+            .replace(/(<stringProp name="delimiter">),(<\/stringProp>)/g, '$1|$2')
+            .replace(/(<boolProp name="quotedData">)false(<\/boolProp>)/g, '$1true$2'));
     }
     const nativeManagers = applyForcedNativeManagers(xml, runCfg.forceNativeManagers || {});
     xml = nativeManagers.xml;
@@ -1150,6 +1162,23 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     const jmxPath = path.join(outDir, `${name}.jmx`);
     fs.writeFileSync(jmxPath, xml);
 
+    // GATE 0 — verify what the script will actually SEND (rendered-request
+    // check). Runs on the shipped XML + CSV so it sees exactly what JMeter
+    // will: undefined ${var} that would transmit literally, and CSV column
+    // shifts that would feed a variable a neighbouring column's value. These
+    // are DATA DEFECTS — the triage layer must not mistake them for auth walls.
+    let gate0 = { ok: true, findings: [] };
+    try {
+        gate0 = renderedRequestCheck.checkRenderedRequests({ xml, outDir });
+        if (gate0.findings.length) {
+            fs.writeFileSync(path.join(outDir, `${name}_gate0.json`), JSON.stringify(gate0, null, 2));
+            note('gate0',
+                `${gate0.findings.length} rendered-request defect(s) — the script would send wrong/literal values`,
+                gate0.findings.slice(0, 5).map(f => `${f.kind}${f.variable ? ` (\${${f.variable}})` : ''}: ${f.message}`).join(' · '),
+                `these are DATA defects (fixable), not auth/session walls — see ${name}_gate0.json`);
+        }
+    } catch (e) { note('gate0', 'rendered-request check skipped (non-fatal)', e.message); }
+
     // Duplicate-hop labels must reflect the FINAL sampler names (pe-naming
     // renames after the fold), or the guard/adjudicator exclusion sets match
     // nothing. Recompute from the shipped XML; include hops that were already
@@ -1210,6 +1239,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         playbookProtects: pbResult.addedProtects || [],
         duplicateHopLabels,
         foldSafety: foldSafety.byIndex,
+        gate0,
         effectiveLlmFlowNotes: runCfg.llmFlowNotes || [],
         scenario: scenarioPlan,
         uploadFiles: uploadPlan,
@@ -1238,6 +1268,8 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             bodyCorrelations: bodyCorrelated,
             graphqlCsrfHeaderRepairs: gqlCsrf.substitutions,
             formCorrelations: formCorr.wired.length,
+            gate0Findings: gate0.findings.length,
+            gate0CsvShift: gate0.findings.filter(f => f.kind === 'csv-column-shift').length,
             duplicateHops: duplicateHopLabels.length,
             foldSafetyVetoes: foldSafetyVetoes.length,
             goldenApplied,

@@ -1,0 +1,10 @@
+{
+  "_comment": "Pins the CSV-credential class that 400'd the Scheduled Visits login. groupCols is a COMMA-bearing value alongside username/password. The pipe-delimited + quotedData=true CSV must keep columns aligned so Gate 0 sees ZERO column shift and username/password send correctly (no undefined-variable literals either).",
+  "runCfg": {},
+  "stats": {
+    "gate0CsvShift": 0,
+    "gate0Findings": 0,
+    "orphans": 0,
+    "parameterized": { "min": 1 }
+  }
+}

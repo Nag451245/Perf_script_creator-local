@@ -2018,6 +2018,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 hasSecondRecording: !!(genOpts.secondaryEntries && genOpts.secondaryEntries.length),
                 ghostsRefused: (gen.stats && gen.stats.ghostsRefused) || 0,
                 uploadFiles: gen.uploadFiles || null,
+                gate0: gen.gate0 || null,
             });
             if (humanBlockers.length) {
                 fs.writeFileSync(path.join(outDir, `${name}_blockers.json`), JSON.stringify(humanBlockers, null, 2));

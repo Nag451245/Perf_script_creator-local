@@ -67,6 +67,7 @@ const outputOrganizer = require('../src/output-organizer');
 const postRunAdjudicator = require('../src/post-run-adjudicator');
 const uiInputs = require('../src/ui-inputs');
 const uiProcessControl = require('../src/ui-process-control');
+const { checkRenderedRequests } = require('../src/rendered-request-check');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
 function listenLocal(server) {
@@ -1324,6 +1325,78 @@ test('flow understanding: summarizes flow, auth style, host, and playbook up fro
     assert.ok(out.lines.some(l => /Application host\(s\): app\.test/.test(l)));
     assert.ok(out.lines.some(l => /Stated objective: release cert/.test(l)));
     assert.strictEqual(out.summary.hosts.primary, 'app.test');
+});
+
+test('gate 0: catches the CSV column-shift that fed ${username} garbage (quotedData bug)', () => {
+    const out = tmp();
+    // The ORIGINAL bug: comma delimiter, quotedData=false, a field RFC-4180-
+    // quoted because it contains commas → JMeter splits inside the quotes.
+    fs.writeFileSync(path.join(out, 'bad_data.csv'),
+        'colA,pickList,username,password\n' +
+        'a,"x,y,z",Performance_STG_0047,password1!\n');
+    const badXml = `<jmeterTestPlan><hashTree>
+  <CSVDataSet testname="CSV" enabled="true">
+    <stringProp name="filename">bad_data.csv</stringProp>
+    <stringProp name="delimiter">,</stringProp>
+    <boolProp name="quotedData">false</boolProp>
+    <stringProp name="variableNames">colA,pickList,username,password</stringProp>
+  </CSVDataSet><hashTree/>
+  <HTTPSamplerProxy testname="Step 01 - POST /login"><stringProp name="Argument.value">\${username}</stringProp></HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const bad = checkRenderedRequests({ xml: badXml, outDir: out });
+    assert.strictEqual(bad.ok, false);
+    const shift = bad.findings.find(f => f.kind === 'csv-column-shift');
+    assert.ok(shift, 'column shift detected');
+    assert.ok(shift.dataDefect, 'classified as a DATA defect, not an auth wall');
+    assert.match(shift.fix, /quotedData=true/);
+
+    // The FIX: pipe delimiter + quotedData=true → columns align → Gate 0 clean.
+    fs.writeFileSync(path.join(out, 'good_data.csv'),
+        'colA|pickList|username|password\n' +
+        'a|x,y,z|Performance_STG_0047|password1!\n');
+    const goodXml = badXml
+        .replace('bad_data.csv', 'good_data.csv')
+        .replace('<stringProp name="delimiter">,</stringProp>', '<stringProp name="delimiter">|</stringProp>')
+        .replace('<boolProp name="quotedData">false</boolProp>', '<boolProp name="quotedData">true</boolProp>');
+    const good = checkRenderedRequests({ xml: goodXml, outDir: out });
+    assert.strictEqual(good.ok, true, 'aligned CSV passes Gate 0');
+});
+
+test('gate 0 triage: a data defect leads the blockers and suppresses auth-wall speculation', () => {
+    const { deriveBlockers } = require('../src/blockers');
+    // A run that failed at login, with forensics screaming "auth wall" — but
+    // Gate 0 proves the login sent a shifted CSV column. The data defect must
+    // win; the "provide a browser session / non-MFA account" asks are gone.
+    const result = {
+        success: false,
+        samples: [{ label: 'Step 08 - POST /u/login/password', success: false, responseCode: '401', isTransaction: false }],
+        failureForensics: {
+            rootCause: { sampler: 'Step 01 - GET /', recordedStatus: 302, observedStatus: 200, category: 'auth_redirect_bounce' },
+            authSession: { missingSessionCookies: ['auth0__state', 'IDEM'] },
+            redirects: { interactiveAuthWall: true },
+        },
+    };
+    const gate0 = { findings: [{ kind: 'csv-column-shift', dataDefect: true, file: 'sv_data.csv', row: 1, message: 'row 1 parses to 24 columns but 19 variables', fix: 'Set quotedData=true on the CSV Data Set.' }] };
+    const withGate0 = deriveBlockers({ result, runCfg: {}, entries: [], gate0 });
+    assert.strictEqual(withGate0[0].id, 'gate0-csv-column-shift', 'data defect leads');
+    assert.ok(!withGate0.some(b => b.id === 'auth-session-forensics'), 'auth-wall speculation suppressed');
+    assert.ok(!withGate0.some(b => b.id === 'mfa'), 'mfa false-positive suppressed');
+    // Without Gate 0, the old (misleading) auth-wall ask still appears.
+    const withoutGate0 = deriveBlockers({ result, runCfg: {}, entries: [] });
+    assert.ok(withoutGate0.some(b => b.id === 'auth-session-forensics'));
+});
+
+test('gate 0: flags an undefined ${var} that would transmit literally', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /me"><stringProp name="HTTPSampler.path">/me?token=\${authToken}</stringProp></HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - GET /ok"><stringProp name="HTTPSampler.path">/ok?u=\${__UUID}</stringProp></HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+    const r = checkRenderedRequests({ xml, outDir: tmp() });
+    const undef = r.findings.find(f => f.kind === 'undefined-variable');
+    assert.ok(undef && undef.variable === 'authToken', 'undefined ${authToken} flagged');
+    assert.ok(undef.dataDefect);
+    // ${__UUID} is a JMeter function, not an undefined variable.
+    assert.ok(!r.findings.some(f => f.variable === '__UUID'));
 });
 
 test('AI provider label prefers OpenAI over Gemini when both are configured', () => {

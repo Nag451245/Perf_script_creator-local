@@ -40,6 +40,7 @@ const outcomeProbe = require('./outcome-probe');
 const redirectHops = require('./redirect-hops');
 const foldSafetyModule = require('./fold-safety');
 const renderedRequestCheck = require('./rendered-request-check');
+const dateIntent = require('./date-intent');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
 const peNaming = require('./pe-naming');
@@ -595,8 +596,23 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // 4. Parameterization + unique data (state-pollution defense). Discover
     //    user-input fields, synthesize a multi-row pool, wire one CSV Data Set.
     const rawCandidates = suggestParameterizations(flat) || [];
-    const candidates = filterParameterCandidates(rawCandidates, runCfg.parameterization || {});
-    const skippedParameterCandidates = rawCandidates.length - candidates.length;
+    const allCandidates = filterParameterCandidates(rawCandidates, runCfg.parameterization || {});
+    // R4 — date fields are made RELATIVE to run time via ${__timeShift}, not
+    // shipped as stale CSV literals. Pull them OUT of the CSV parameterization
+    // set; they are substituted directly into the samplers after render.
+    const dateRef = dateIntent.recordingReference(flat);
+    const datePlan = dateIntent.planDateShifts(allCandidates, dateRef, runCfg.dates || {});
+    const dateNames = new Set(datePlan.shifts.map(s => s.name));
+    const candidates = allCandidates.filter(c => !dateNames.has(c.name));
+    const skippedParameterCandidates = rawCandidates.length - allCandidates.length;
+    if (datePlan.shifts.length) note('date-intent',
+        `${datePlan.shifts.length} date field(s) made relative to run time (not hardcoded)`,
+        datePlan.shifts.slice(0, 6).map(s => `${s.name}=${s.value} → ${s.offsetDays >= 0 ? '+' : ''}${s.offsetDays}d in ${s.jmeterFormat}`).join('; '),
+        `substituted \${__timeShift(...)} so a date-filtered request stays valid whenever the test runs; pin a genuinely FIXED window in run.dates.shift=false`);
+    if (datePlan.skippedAmbiguous.length) note('date-intent',
+        `${datePlan.skippedAmbiguous.length} ambiguous MM/dd-vs-dd/MM date(s) left as recorded literals`,
+        datePlan.skippedAmbiguous.slice(0, 6).join(', '),
+        `could not prove the format from the value alone — review if these should be relative`);
     if (skippedParameterCandidates > 0) {
         note('parameterization',
             `${skippedParameterCandidates} structural GraphQL document field(s) skipped`,
@@ -660,6 +676,14 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         xml = xml.replace(/<CSVDataSet\b[\s\S]*?<\/CSVDataSet>/g, (block) => block
             .replace(/(<stringProp name="delimiter">),(<\/stringProp>)/g, '$1|$2')
             .replace(/(<boolProp name="quotedData">)false(<\/boolProp>)/g, '$1true$2'));
+    }
+    // R4 — substitute ${__timeShift(...)} for each recorded date literal so
+    // date-filtered requests stay valid at run time (native function; survives
+    // the java-safe strip).
+    let dateShiftsApplied = 0;
+    if (datePlan.shifts.length) {
+        const ds = dateIntent.injectDateShifts(xml, datePlan.shifts);
+        xml = ds.xml; dateShiftsApplied = ds.applied;
     }
     const nativeManagers = applyForcedNativeManagers(xml, runCfg.forceNativeManagers || {});
     xml = nativeManagers.xml;
@@ -1270,6 +1294,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             formCorrelations: formCorr.wired.length,
             gate0Findings: gate0.findings.length,
             gate0CsvShift: gate0.findings.filter(f => f.kind === 'csv-column-shift').length,
+            dateShifts: dateShiftsApplied,
             duplicateHops: duplicateHopLabels.length,
             foldSafetyVetoes: foldSafetyVetoes.length,
             goldenApplied,

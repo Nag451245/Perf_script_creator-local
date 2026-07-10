@@ -77,6 +77,9 @@
     "_oauth_comment": "dropBareStateNonce: opt-in per flow. When true, bare state/nonce correlations are removed and the recorded literals stay in /authorize. Leave false for standard OAuth flows that need fresh state threaded.",
     "oauth": { "dropBareStateNonce": false },
 
+    "_dates_comment": "Recorded date/datetime fields are made RELATIVE to run time via JMeter ${__timeShift} (preserving their offset from the recording, in the recorded format) so a date-filtered request never replays a stale date. shift=false keeps every date as the recorded literal; maxRelativeDays caps how far a value can sit from the recording before it's treated as a FIXED reference and left literal.",
+    "dates": { "shift": true, "maxRelativeDays": 730 },
+
     "_allowJsr223_comment": "Default false. Leave JSR223/Groovy helpers stripped for Java-safe JMXs. Set true only when you deliberately need generated Groovy helpers and have a compatible JMeter/Java runtime.",
     "allowJsr223": false,
 

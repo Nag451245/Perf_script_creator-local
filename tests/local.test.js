@@ -1327,6 +1327,37 @@ test('flow understanding: summarizes flow, auth style, host, and playbook up fro
     assert.strictEqual(out.summary.hosts.primary, 'app.test');
 });
 
+test('date intent: relative date fields become ${__timeShift}, fixed/ambiguous stay literal', () => {
+    const di = require('../src/date-intent');
+    const ref = new Date(Date.UTC(2025, 0, 1)); // recording reference
+    // detectDate
+    assert.strictEqual(di.detectDate('2024-09-23').jmeterFormat, 'yyyy-MM-dd');
+    assert.strictEqual(di.detectDate('2024-09-23 08:30:00').hasTime, true);
+    assert.strictEqual(di.detectDate('09/23/2024').jmeterFormat, 'MM/dd/yyyy');
+    assert.strictEqual(di.detectDate('not-a-date'), null);
+    assert.strictEqual(di.detectDate('23/09/2024'), null, 'dd/MM (day>12) → ambiguous, not shifted');
+    // plan
+    const plan = di.planDateShifts([
+        { name: 'startDate', value: '2024-09-23' },                 // relative name → shift
+        { name: 'event_startdatetime', value: '2024-12-25 10:00:00' }, // has time → shift
+        { name: 'rdConstantFirstDayOfFiscalYear', value: '2025-01-01' }, // fixed name → skip
+        { name: 'note', value: 'hello' },                           // not a date
+    ], ref, {});
+    const names = plan.shifts.map(s => s.name).sort();
+    assert.deepStrictEqual(names, ['event_startdatetime', 'startDate']);
+    assert.ok(plan.skippedFixed.includes('rdConstantFirstDayOfFiscalYear'));
+    // the shift expression is a native JMeter function in the recorded format
+    const sd = plan.shifts.find(s => s.name === 'startDate');
+    assert.match(sd.expr, /^\$\{__timeShift\(yyyy-MM-dd,,-P\d+D,,\)\}$/);
+    // config off → no shifts
+    assert.strictEqual(di.planDateShifts([{ name: 'startDate', value: '2024-09-23' }], ref, { shift: false }).shifts.length, 0);
+    // injection replaces the literal in a sampler send-field only
+    const xml = '<HTTPSamplerProxy><stringProp name="Argument.value">2024-09-23</stringProp><stringProp name="TestPlan.comments">recorded 2024-09-23</stringProp></HTTPSamplerProxy>';
+    const out = di.injectDateShifts(xml, [{ value: '2024-09-23', expr: '${__timeShift(yyyy-MM-dd,,-P100D,,)}' }]);
+    assert.match(out.xml, /Argument\.value">\$\{__timeShift/);
+    assert.match(out.xml, /comments">recorded 2024-09-23/, 'non-send fields (comments) are untouched');
+});
+
 test('gate 0: catches the CSV column-shift that fed ${username} garbage (quotedData bug)', () => {
     const out = tmp();
     // The ORIGINAL bug: comma delimiter, quotedData=false, a field RFC-4180-

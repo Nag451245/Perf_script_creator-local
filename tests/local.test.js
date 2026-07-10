@@ -1327,6 +1327,48 @@ test('flow understanding: summarizes flow, auth style, host, and playbook up fro
     assert.strictEqual(out.summary.hosts.primary, 'app.test');
 });
 
+test('polling detection: different query params on the same path are NOT a poll (rdChart2 charts)', () => {
+    const { detectPolling } = generateInternal;
+    const req = (url) => ({ request: { method: 'GET', url } });
+    // Six report charts on the same path but DIFFERENT chartId → distinct
+    // resources, must NOT be wrapped in a While loop.
+    const charts = [55, 56, 57, 58, 59, 60].map(n => req(`https://a.test/EMRAnalytics/rdTemplate/rdChart2.aspx?rdReport=X&chartId=0${n}`));
+    assert.deepStrictEqual(detectPolling(charts), [], 'distinct-query requests are not polling');
+    // A real status poll: same URL (or only a cache-buster differs) repeated.
+    const poll = [
+        req('https://a.test/job/status?jobId=123'),
+        req('https://a.test/job/status?jobId=123&_=1699'),
+        req('https://a.test/job/status?jobId=123&_=1700'),
+        req('https://a.test/job/status?jobId=123&_=1701'),
+    ];
+    const groups = detectPolling(poll);
+    assert.strictEqual(groups.length, 1, 'same resource + cache-buster IS a poll');
+    assert.strictEqual(groups[0].count, 4);
+});
+
+test('recoverSamplesFromJtl: a disabled sampler\'s stale JTL row is NOT merged back (false-negative fix)', () => {
+    const out = tmp();
+    // final.jtl still holds the folded redirect hop's earlier 401 (SimpleDataWriter appends).
+    fs.writeFileSync(path.join(out, 'final.jtl'), `<?xml version="1.0"?>
+<testResults version="1.2">
+<httpSample t="10" lb="SC01_T02_/authorize/resume-011" rc="401" s="false"/>
+<httpSample t="10" lb="SC01_T02_/user/login-012" rc="200" s="true"/>
+</testResults>`);
+    // The FINAL shipped JMX has that redirect hop DISABLED.
+    const jmx = path.join(out, 'final.jmx');
+    fs.writeFileSync(jmx, `<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="SC01_T02_/authorize/resume-011" enabled="false"><stringProp name="HTTPSampler.path">/authorize/resume</stringProp></HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="SC01_T02_/user/login-012" enabled="true"><stringProp name="HTTPSampler.path">/user/login</stringProp></HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`);
+    // Engine's final (clean) list is missing both rows (partial parse).
+    const result = { success: true, samples: [], finalJmxPath: jmx };
+    runnerInternal.recoverSamplesFromJtl(result, path.join(out, 'final.jtl'), out, () => {}, jmx);
+    const labels = result.samples.map(s => s.label);
+    assert.ok(!labels.includes('SC01_T02_/authorize/resume-011'), 'stale row for the DISABLED hop is excluded');
+    assert.ok(labels.includes('SC01_T02_/user/login-012'), 'the enabled sampler is still recovered');
+    assert.ok(result.samples.every(s => s.success !== false), 'no resurrected failure');
+});
+
 test('date intent: relative date fields become ${__timeShift}, fixed/ambiguous stay literal', () => {
     const di = require('../src/date-intent');
     const ref = new Date(Date.UTC(2025, 0, 1)); // recording reference

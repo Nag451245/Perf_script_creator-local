@@ -678,15 +678,50 @@ function guardFailureReportWithAdjudication({
  * occurrence wins, so a later iteration's outcome supersedes an earlier
  * one). Mutates `result` in place; engine untouched.
  */
-function recoverSamplesFromJtl(result, stableJtl, outDir, onLog) {
+/** Testnames of samplers disabled (enabled="false") in the shipped JMX. */
+function disabledSamplerLabels(jmxPath) {
+    const set = new Set();
+    try {
+        if (!jmxPath || !fs.existsSync(jmxPath)) return set;
+        const xml = fs.readFileSync(jmxPath, 'utf8');
+        for (const m of xml.matchAll(/<HTTPSamplerProxy\b([^>]*)>/g)) {
+            const attrs = m[1] || '';
+            if (/enabled="false"/.test(attrs)) {
+                const name = (attrs.match(/testname="([^"]*)"/) || [])[1];
+                if (name) set.add(name.trim());
+            }
+        }
+    } catch { /* best effort */ }
+    return set;
+}
+
+function recoverSamplesFromJtl(result, stableJtl, outDir, onLog, finalJmxPath) {
     if (!result) return result;
     try {
         const jtl = fs.existsSync(stableJtl) ? stableJtl : findLastJtl(outDir);
         if (!jtl) return result;
         const jtlRows = summarizeJtlFast(jtl);
         if (!jtlRows.length) return result;
+        // final.jtl (SimpleDataWriter) APPENDS across the engine's internal
+        // iterations, so a sampler the adjudicator DISABLED in a later
+        // iteration still has its earlier (failing) row in the file. Merging
+        // that stale row back resurrects a failure for a sampler that no
+        // longer runs — the false negative that blocked an otherwise-clean
+        // run at a folded /authorize/resume redirect hop. Exclude any sampler
+        // disabled in the FINAL shipped JMX.
+        const disabledLabels = disabledSamplerLabels(finalJmxPath);
         const byLabel = new Map();
-        for (const r of jtlRows) byLabel.set(String(r.label || '').trim(), r); // last wins
+        for (const r of jtlRows) {
+            const label = String(r.label || '').trim();
+            if (disabledLabels.has(label)) continue; // stale row for a now-disabled sampler
+            byLabel.set(label, r); // last wins
+        }
+        // Also drop any failing row already in the engine's list for a sampler
+        // that ended up disabled (defensive — the engine shouldn't emit them,
+        // but a partial parse can).
+        if (disabledLabels.size && Array.isArray(result.samples)) {
+            result.samples = result.samples.filter(s => !disabledLabels.has(String(s.label || s.name || '').trim()));
+        }
         // The engine classifies "is this row a transaction?" by label shape
         // ("METHOD /path"), which mislabels GraphQL samplers ("GraphQL
         // mutation X") as transactions — the guard then filters them out and
@@ -1762,7 +1797,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     let finalJmxPath = result.finalJmxPath || gen.jmxPath;
     finalJmxPathRef.value = finalJmxPath;
     steeringTick('after initial validation');
-    recoverSamplesFromJtl(result, stableJtl, outDir, onLog);
+    recoverSamplesFromJtl(result, stableJtl, outDir, onLog, result.finalJmxPath || gen.jmxPath);
     let currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
     let verified = applyBusinessVerification(result, finalJmxPath, strictGuard, blockedDisables);
     let finalResult = verified.result;
@@ -1821,7 +1856,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         });
         finalJmxPath = llm.jmxPath;
         finalJmxPathRef.value = finalJmxPath;
-        recoverSamplesFromJtl(llm.result, stableJtl, outDir, onLog);
+        recoverSamplesFromJtl(llm.result, stableJtl, outDir, onLog, finalJmxPath);
         currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
         verified = applyBusinessVerification(llm.result, finalJmxPath, strictGuard, blockedDisables);
         finalResult = verified.result;
@@ -1911,7 +1946,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                         }),
                     }
                 );
-                recoverSamplesFromJtl(result2, stableJtl, outDir, onLog);
+                recoverSamplesFromJtl(result2, stableJtl, outDir, onLog, result2.finalJmxPath || gen2.jmxPath);
                 const evidence2 = buildAttemptRunEvidence({ entries: gen2.flat, stableJtl, outDir, onLog });
                 const verified2 = applyBusinessVerification(result2, result2.finalJmxPath || gen2.jmxPath, guard2, replanBlockedDisables);
                 applyStatusRootCauseToResult(verified2.result, gen2.flat, evidence2);

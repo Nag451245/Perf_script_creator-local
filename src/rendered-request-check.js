@@ -81,9 +81,25 @@ function checkRenderedRequests({ xml = '', outDir = '' } = {}) {
         }
     }
 
-    // ── Class 1: undefined variables in what the sampler will SEND ─────
+    // ── Class 1: undefined variables in what an ENABLED sampler will SEND ─
+    // Only enabled samplers transmit — a literal ${var} inside a DISABLED
+    // plumbing sampler (e.g. a folded /oauth/token carrying ${access_token})
+    // is never sent, so it is not a defect and must not block. A sampler's
+    // send-fields (path, Argument.value inside it; Header.value in its
+    // hashTree) all appear AFTER its open tag and before the NEXT sampler's,
+    // so each send-field is attributed to the nearest preceding sampler.
+    const samplerTags = [];
+    for (const m of matchAll(xml, /<HTTPSamplerProxy\b([^>]*)>/g)) {
+        samplerTags.push({ index: m.index, disabled: /enabled="false"/.test(m[1] || '') });
+    }
+    const nearestSamplerDisabled = (pos) => {
+        let disabled = false;
+        for (const t of samplerTags) { if (t.index > pos) break; disabled = t.disabled; }
+        return disabled;
+    };
     const undefinedRefs = new Map(); // varName -> sample of where it's used
     for (const m of matchAll(xml, SENDABLE_PROP)) {
+        if (nearestSamplerDisabled(m.index)) continue;
         const text = m[2];
         for (const ref of matchAll(text, VAR_REF)) {
             const raw = ref[1].trim();

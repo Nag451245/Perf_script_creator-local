@@ -265,6 +265,18 @@ function escapeRegExp(value) {
  * GraphQL-heavy app gets dozens of unrelated mutations wrapped in a single
  * While Controller and the test runs the same query N times.
  */
+// Cache-buster / anti-cache query params that vary between otherwise-identical
+// poll requests and must be ignored when deciding "same resource".
+const CACHE_BUSTER_PARAM = /^(_|cb|t|ts|timestamp|rnd|rand|random|nocache|_dc|v|_ts|ms|time|__)$/i;
+function canonicalPollQuery(searchParams) {
+    const pairs = [];
+    for (const [k, v] of searchParams) {
+        if (CACHE_BUSTER_PARAM.test(k)) continue;
+        pairs.push(`${k}=${v}`);
+    }
+    return pairs.sort().join('&');
+}
+
 function bodyFingerprint(e) {
     const method = (e.request?.method || 'GET').toUpperCase();
     if (!/^(POST|PUT|PATCH)$/.test(method)) return '';
@@ -289,10 +301,21 @@ function bodyFingerprint(e) {
 function detectPolling(flat) {
     const keyOf = (e) => {
         let p = e.request?.url || '';
-        try { p = new URL(e.request.url).pathname; } catch { /* keep raw */ }
+        let q = '';
+        try {
+            const u = new URL(e.request.url);
+            p = u.pathname;
+            q = canonicalPollQuery(u.searchParams);
+        } catch { /* keep raw */ }
         const method = (e.request?.method || 'GET').toUpperCase();
         const fp = bodyFingerprint(e);
-        return `${method} ${p}${fp ? ' :: ' + fp : ''}`;
+        // Include the canonical query (cache-busters stripped): a real status
+        // poll hits the SAME resource repeatedly, differing at most by a
+        // cache-buster. Consecutive requests to the same PATH but with
+        // DIFFERENT substantive query params are DIFFERENT resources (e.g. six
+        // /rdChart2.aspx?chartId=055..060 report charts) — NOT a poll, and must
+        // not be wrapped in a While loop that would replay only the first.
+        return `${method} ${p}${q ? '?' + q : ''}${fp ? ' :: ' + fp : ''}`;
     };
     const keys = flat.map(keyOf);
     const groups = [];
@@ -1374,4 +1397,4 @@ function lookupValueForVar(flat, varName, params) {
     return '';
 }
 
-module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates } };
+module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectPolling } };

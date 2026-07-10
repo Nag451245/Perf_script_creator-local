@@ -1362,6 +1362,28 @@ test('gate 0: catches the CSV column-shift that fed ${username} garbage (quotedD
     assert.strictEqual(good.ok, true, 'aligned CSV passes Gate 0');
 });
 
+test('phase B: auth-wall-stop fires only when Gate 0 proves the login was sent correctly', () => {
+    const { proposeReplan } = require('../src/replanner');
+    // A run with a post-run auth_wall adjudication AND a failing login sampler.
+    const result = {
+        success: false,
+        samples: [{ label: 'Step 08 - POST /u/login/password', success: false, responseCode: '401', isTransaction: false }],
+        requestAdjudication: { iterations: [{ actions: { stop: [{ samplerLabel: 'Step 01 - GET /', category: 'auth_wall' }] } }] },
+    };
+    // Gate 0 CLEAN → the wall is genuinely irreducible → stop and ask a human.
+    const irreducible = proposeReplan({ result, runCfg: {}, gate0: { findings: [] }, tried: [] });
+    assert.ok(irreducible && irreducible.id === 'auth-wall-stop', 'clean Gate 0 → auth-wall-stop');
+    // Gate 0 shows the credentials column shifted → login was MIS-SENT → do NOT
+    // stop; fall through to repair strategies (auth-state flip here).
+    const gate0 = { findings: [{ kind: 'csv-column-shift', dataDefect: true, message: 'columns shifted' }] };
+    const fixable = proposeReplan({ result, runCfg: {}, gate0, tried: [] });
+    assert.ok(!fixable || fixable.id !== 'auth-wall-stop', 'mis-sent login is not an irreducible wall');
+    // An undefined auth variable (${state}) also blocks the premature stop.
+    const gate0Var = { findings: [{ kind: 'undefined-variable', variable: 'state', dataDefect: true, message: 'no producer' }] };
+    const fixable2 = proposeReplan({ result, runCfg: {}, gate0: gate0Var, tried: [] });
+    assert.ok(!fixable2 || fixable2.id !== 'auth-wall-stop');
+});
+
 test('gate 0 triage: a data defect leads the blockers and suppresses auth-wall speculation', () => {
     const { deriveBlockers } = require('../src/blockers');
     // A run that failed at login, with forensics screaming "auth wall" — but

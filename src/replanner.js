@@ -25,18 +25,27 @@
  * @param {string[]} args.tried       strategy ids already attempted
  * @returns {null | {id, reason, evidence, runCfgPatch}}
  */
-function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classification = null, seniorPeAnalysis = null, tried = [] } = {}) {
+function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classification = null, seniorPeAnalysis = null, gate0 = null, tried = [] } = {}) {
     const strategies = [];
     const reqs = (result.samples || []).filter(s => !s.isTransaction);
     const failing = reqs.filter(s => s.success === false);
     if (!failing.length) return null;
 
+    // GATE 0 CHECK — an auth/session failure is only IRREDUCIBLE if the login
+    // was SENT correctly. If Gate 0 proves the auth segment sent wrong/literal
+    // values (a shifted CSV credential column, an undefined ${state}/${token}),
+    // the "wall" is a fixable DATA defect surfacing downstream — do NOT stop
+    // and ask for a browser session; fall through to repair strategies and let
+    // the data-defect blocker lead. This is the split that keeps the agent from
+    // giving up on a login it simply mis-sent.
+    const authDataDefect = hasAuthDataDefect(gate0);
+
     const authStops = adjudicationActions(result, 'stop').filter(item => item.category === 'auth_wall');
-    if (authStops.length) {
+    if (authStops.length && !authDataDefect) {
         if (tried.includes('auth-wall-stop')) return null;
         return {
             id: 'auth-wall-stop',
-            reason: 'post-run adjudication proved an auth/session wall; stop instead of chasing downstream casualties under strict GREEN policy',
+            reason: 'post-run adjudication proved an auth/session wall AND the login was sent correctly (Gate 0 clean); stop instead of chasing downstream casualties under strict GREEN policy',
             evidence: authStops.map(item => item.samplerLabel).slice(0, 5).join(', '),
             runCfgPatch: {},
         };
@@ -126,6 +135,20 @@ function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classificat
     return strategies.find(s => !tried.includes(s.id)) || null;
 }
 
+/**
+ * Does Gate 0 prove the AUTH segment sends wrong/literal values? A column
+ * shift corrupts credentials wholesale; an undefined auth-ish variable
+ * (state/nonce/token/csrf/user/pass/session/auth/cred) transmits literally.
+ * Either means the login wasn't sent correctly → the wall is fixable.
+ */
+function hasAuthDataDefect(gate0) {
+    const findings = gate0 && Array.isArray(gate0.findings) ? gate0.findings : [];
+    return findings.some(f => f && f.dataDefect && (
+        f.kind === 'csv-column-shift' ||
+        /state|nonce|token|csrf|xsrf|user|pass|session|auth|cred|iam|login/i.test(String(f.variable || ''))
+    ));
+}
+
 function decisionRows(valueFlow) {
     if (!valueFlow || !valueFlow.byIndex) return [];
     return Array.isArray(valueFlow.byIndex)
@@ -164,4 +187,4 @@ function nativeManagerPatch(analysis) {
     };
 }
 
-module.exports = { proposeReplan, _internal: { nativeManagerPatch, decisionRows, adjudicationActions } };
+module.exports = { proposeReplan, _internal: { nativeManagerPatch, decisionRows, adjudicationActions, hasAuthDataDefect } };

@@ -1842,6 +1842,10 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // handling, fold disposables, relieve assertions) and verifies the new
     // script like any other attempt. Bounded; every attempt recorded.
     const replans = [];
+    // Gate 0 of the CURRENTLY-shipped script (updates when a replan regenerates
+    // it). Feeds the auth-wall split: don't call a login failure irreducible if
+    // Gate 0 proves it was mis-sent.
+    let activeGate0 = gen.gate0 || null;
     if (!finalResult.success && agent.enabled) {
         const triedStrategies = [];
         for (let attempt = 1; attempt <= agent.maxReplans && !finalResult.success; attempt++) {
@@ -1852,6 +1856,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 valueFlow: samplerDecisions,
                 classification: (blueprintCtx && blueprintCtx.loop && blueprintCtx.loop.firstFailure) || null,
                 seniorPeAnalysis: blueprintCtx && blueprintCtx.seniorPeAnalysis || null,
+                gate0: activeGate0,
                 tried: triedStrategies,
             });
             if (!strategy) { onLog('replan: no untried strategy fits the evidence'); break; }
@@ -1911,6 +1916,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 const verified2 = applyBusinessVerification(result2, result2.finalJmxPath || gen2.jmxPath, guard2, replanBlockedDisables);
                 applyStatusRootCauseToResult(verified2.result, gen2.flat, evidence2);
                 const success = !!verified2.result.success;
+                activeGate0 = gen2.gate0 || activeGate0; // the newly-shipped script's Gate 0 governs the next replan
                 replans.push({ attempt, strategy: strategy.id, reason: strategy.reason, evidence: strategy.evidence, success });
                 if (blueprintCtx) blueprintCtx.loop.attempts.push({ phase: 'replan', strategy: strategy.id, reason: strategy.reason, success });
                 if (success) {

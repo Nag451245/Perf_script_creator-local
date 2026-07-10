@@ -193,11 +193,28 @@ function evaluateEvidenceGate(evidence, opts = {}) {
             break;
         }
         if (/auth|session|login|redirect/i.test(`${transition.category || ''} ${transition.relevance || ''}`)) {
+            // A status-family divergence is only a FAILURE when it actually
+            // broke something: the sampler itself failed, or a downstream
+            // request failed. A divergence on a request that PASSED with no
+            // downstream failure is benign recording drift (aged recording vs
+            // live app), not a green-gate failure — otherwise a working flow
+            // (every request 2xx/3xx, business guard satisfied) is blocked by a
+            // cosmetic 302→200 on the landing page or a third-party beacon.
+            const downstreamFailure = firstDownstreamFailure(rows, row.entryIndex);
+            if (!downstreamFailure && !rowFailed(row)) {
+                warnings.push({
+                    category: 'status_drift_review',
+                    reason: `${row.label} diverged from recording (${transition.recorded}→${transition.observed}: ${transition.category}) but it passed and no downstream request failed — benign recording drift.`,
+                    details: { index: row.entryIndex, sampler: row.label, transition },
+                });
+                continue;
+            }
             failures.push({
                 index: row.entryIndex,
                 sampler: row.label,
                 reason: `${row.label} diverged from recording: ${transition.category}`,
                 transition,
+                downstreamFailure,
             });
             break;
         }

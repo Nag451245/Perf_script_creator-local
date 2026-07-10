@@ -3297,7 +3297,10 @@ test('runner: LLM failure collection prioritizes status root cause before downst
     assert.match(failures[0].failureMessage, /earliest upstream divergence/);
 });
 
-test('runner: recording status drift makes an HTTP-success result not green', () => {
+test('runner: recording status drift on an all-passing run is a warning, not a failure', () => {
+    // Every request passed (200 vs a recorded 202) and nothing downstream
+    // failed — benign drift between an aged recording and the live app. It must
+    // surface as a review warning, never flip a fully-green run red.
     const result = runnerInternal.applyStatusRootCauseToResult({
         success: true,
         samples: [
@@ -3307,9 +3310,28 @@ test('runner: recording status drift makes an HTTP-success result not green', ()
         entry('POST', 'https://app.test/job', { status: 202 }),
     ]);
 
+    assert.strictEqual(result.success, true);
+    assert.ok(!result.recordingDriftFailure);
+    assert.ok(result.statusRootCauseWarning, 'drift surfaced as a warning');
+    assert.strictEqual(result.statusRootCause.rootCause.category, 'success_code_drift');
+});
+
+test('runner: recording status drift WITH a real sampler failure is still a hard failure', () => {
+    // The divergence trace must still indict the run when something actually
+    // failed (the classic "downstream 401 whose ROOT is an upstream drift").
+    const result = runnerInternal.applyStatusRootCauseToResult({
+        success: true,
+        samples: [
+            { label: 'Step 01 - GET /', code: '200', success: true, isTransaction: false },
+            { label: 'Step 02 - GET /me', code: '401', success: false, isTransaction: false },
+        ],
+    }, [
+        entry('GET', 'https://app.test/', { status: 302 }),
+        entry('GET', 'https://app.test/me'),
+    ]);
+
     assert.strictEqual(result.success, false);
     assert.strictEqual(result.recordingDriftFailure, true);
-    assert.strictEqual(result.statusRootCause.rootCause.category, 'success_code_drift');
 });
 
 test('runner: status root cause is surfaced in unresolved failures for reports', () => {

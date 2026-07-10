@@ -1009,7 +1009,14 @@ function applyStatusRootCauseToResult(result = {}, entries = [], evidence = null
     });
     result.statusRootCause = statusRootCause;
     if (statusRootCause) {
-        if (isLogoutOnlyStatusRootCause(result, statusRootCause)) {
+        // A divergence trace only INDICTS the run when something actually
+        // failed. If every request passed, a recorded-302→observed-200 style
+        // difference is the live app diverging from an aged recording (session
+        // already valid, page served directly), not a failure — surface it as a
+        // review warning, never flip a fully-green run red. The trace still
+        // earns a hard failure the moment any real sampler failure exists (that
+        // is exactly the "downstream 401 whose ROOT is an upstream drift" case).
+        if (isLogoutOnlyStatusRootCause(result, statusRootCause) || !hasRealSamplerFailure(result)) {
             result.statusRootCauseWarning = statusRootCause;
             delete result.recordingDriftFailure;
             return result;
@@ -1022,6 +1029,13 @@ function applyStatusRootCauseToResult(result = {}, entries = [], evidence = null
         delete result.recordingDriftFailure;
     }
     return result;
+}
+
+/** True when a non-transaction sampler actually failed (success=false or >=400). 3xx is a success. */
+function hasRealSamplerFailure(result = {}) {
+    return (result.samples || []).some(s =>
+        s && !s.isTransaction &&
+        (s.success === false || Number(s.responseCode || s.code || s.status || 0) >= 400));
 }
 
 function isLogoutOnlyStatusRootCause(result = {}, statusRootCause = {}) {

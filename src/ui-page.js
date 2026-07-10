@@ -252,6 +252,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
         <div class="field"><label>Business objective</label><input id="cfg-objective" placeholder="capacity, soak, release certification"></div>
         <div class="field"><label>Tech stack</label><input id="cfg-stack" placeholder="React, Spring Boot, OAuth"></div>
         <div class="field"><label>Domain notes</label><textarea id="cfg-domain" placeholder="business rules, test data, cleanup needs"></textarea></div>
+        <div class="field"><label>Transaction names</label><textarea id="cfg-transactions" placeholder="One transaction name per line, applied to T01, T02, T03..."></textarea></div>
         <div class="grid2">
           <div class="field"><label>p95 SLO ms</label><input id="cfg-p95" type="number" min="0"></div>
           <div class="field"><label>Error %</label><input id="cfg-error" type="number" min="0"></div>
@@ -417,13 +418,13 @@ function toggleHist(i){
 }
 function requestBody(force){
  var ins=selectedInputs();
- return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,iterations:q('#iterations').value,retryFailed:q('#retry').value,aiAssist:q('#ai-assist').value,pair:ins.length===2});
+ return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,runSelected:!force,iterations:q('#iterations').value,retryFailed:q('#retry').value,aiAssist:q('#ai-assist').value,pair:ins.length===2});
 }
 async function saveCfg(quiet){
- await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetBaseUrl:q('#cfg-target').value,username:q('#cfg-user').value,password:q('#cfg-pass').value,loadProfile:{users:q('#cfg-users').value,rampUpSec:q('#cfg-ramp').value,holdSec:q('#cfg-hold').value},seniorMode:q('#mode').value==='senior-agent'?'mature':'strong',testObjective:q('#cfg-objective').value,techStack:q('#cfg-stack').value,domainNotes:q('#cfg-domain').value,slo:{p95Ms:q('#cfg-p95').value,errorRatePct:q('#cfg-error').value}})});
+ await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetBaseUrl:q('#cfg-target').value,username:q('#cfg-user').value,password:q('#cfg-pass').value,loadProfile:{users:q('#cfg-users').value,rampUpSec:q('#cfg-ramp').value,holdSec:q('#cfg-hold').value},seniorMode:q('#mode').value==='senior-agent'?'mature':'strong',testObjective:q('#cfg-objective').value,techStack:q('#cfg-stack').value,domainNotes:q('#cfg-domain').value,transactionNames:q('#cfg-transactions').value,slo:{p95Ms:q('#cfg-p95').value,errorRatePct:q('#cfg-error').value}})});
  q('#cfg-pass').value='';if(!quiet){q('#cfg-status').textContent='Saved';setTimeout(function(){q('#cfg-status').textContent=''},1800)}loadCfg();
 }
-async function loadCfg(){var c=await j('/api/config');q('#cfg-target').value=c.targetBaseUrl||'';q('#cfg-user').value=c.username||'';q('#cfg-pass').placeholder=c.hasPassword?'saved — unchanged':'password';q('#cfg-users').value=c.loadProfile.users||'';q('#cfg-ramp').value=c.loadProfile.rampUpSec||'';q('#cfg-hold').value=c.loadProfile.holdSec||'';q('#cfg-objective').value=c.testObjective||'';q('#cfg-stack').value=c.techStack||'';q('#cfg-domain').value=c.domainNotes||'';q('#cfg-p95').value=(c.slo&&c.slo.p95Ms)||'';q('#cfg-error').value=(c.slo&&c.slo.errorRatePct)||''}
+async function loadCfg(){var c=await j('/api/config');q('#cfg-target').value=c.targetBaseUrl||'';q('#cfg-user').value=c.username||'';q('#cfg-pass').placeholder=c.hasPassword?'saved — unchanged':'password';q('#cfg-users').value=c.loadProfile.users||'';q('#cfg-ramp').value=c.loadProfile.rampUpSec||'';q('#cfg-hold').value=c.loadProfile.holdSec||'';q('#cfg-objective').value=c.testObjective||'';q('#cfg-stack').value=c.techStack||'';q('#cfg-domain').value=c.domainNotes||'';q('#cfg-transactions').value=c.transactionNames||'';q('#cfg-p95').value=(c.slo&&c.slo.p95Ms)||'';q('#cfg-error').value=(c.slo&&c.slo.errorRatePct)||''}
 async function run(force){if(!selectedInputs().length){alert('Select Recording 1 first.');return}await saveCfg(true);var d=await j('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:requestBody(force)});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
 async function rerunLast(){var d=await j('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}
 async function rerunName(name){var d=await j('/api/rerun',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({selectedInputs:[name]})});logText='';q('#log').textContent='';startPolling(d.id,true);refresh()}

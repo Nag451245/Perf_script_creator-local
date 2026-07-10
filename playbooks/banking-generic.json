@@ -1,0 +1,32 @@
+{
+  "id": "banking-generic",
+  "description": "Generic retail/commercial banking priors. Protects money-movement and account business calls; only ADDS protection, so it is safe even on a partial path match.",
+  "match": {
+    "pathsAny": ["/transfer", "/payments", "/payment", "/transactions", "/beneficiar", "/accounts", "/wire", "/ach", "/billpay", "/statements", "/funds"],
+    "signalsAny": ["banking", "openbanking"]
+  },
+  "protectedCalls": [
+    "/transfer",
+    "/payments",
+    "/payment",
+    "/transactions",
+    "/beneficiar",
+    "/accounts",
+    "/wire",
+    "/ach",
+    "/billpay",
+    "/funds"
+  ],
+  "disableCalls": [],
+  "oauth": {},
+  "llmFlowNotes": [
+    "Banking: money-movement calls (transfer, payment, wire, ACH, bill-pay) are the business objective — NEVER disable one to reach green. A green run must have executed them with valid assertions on the returned confirmation/reference id.",
+    "Banking: expect step-up/strong-customer-authentication (MFA/OTP/3-D Secure). Treat OTP/MFA challenge responses as auth producers; the challenge id and device/session binding are server-issued and must be correlated, not replayed as literals.",
+    "Banking: many APIs require a per-request Idempotency-Key. If present, mint a fresh one per iteration (native __UUID) rather than replaying the recorded key, or the server will return the first (stale) result.",
+    "Banking: account numbers, amounts and beneficiary ids are business inputs — parameterize from CSV per the workload model; do not correlate them."
+  ],
+  "expectations": [
+    "Money-movement + account endpoints protected as business calls",
+    "MFA/step-up and idempotency handled explicitly"
+  ]
+}

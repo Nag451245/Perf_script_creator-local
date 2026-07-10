@@ -61,11 +61,29 @@ async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLo
     try {
         const jmxContent = fs.readFileSync(jmxPath, 'utf8');
         const prompt = buildGeminiFixPrompt({ failures, jmxContent, correlations, flowNotes, blueprintEvidence });
-        const provider = llmProviderLabel(process.env);
-        onLog(`AI escalation using ${provider} as senior performance engineer`);
-        const out = process.env.OPENAI_API_KEY
-            ? await generateWithOpenAi(prompt)
-            : await generateWithGemini(prompt, failures, jmxContent, correlations);
+        // Provider order with failover: prefer OpenAI when its key is set, but
+        // if the OpenAI call fails (bad model, 5xx, network) fall back to Gemini
+        // when a Gemini key exists, instead of abandoning the whole escalation.
+        const providers = [];
+        if (process.env.OPENAI_API_KEY) providers.push({ label: 'OpenAI', run: () => generateWithOpenAiRetry(prompt, onLog) });
+        if (aiService.isEnabled() || process.env.GOOGLE_API_KEY) providers.push({ label: 'Gemini', run: () => generateWithGemini(prompt, failures, jmxContent, correlations) });
+        if (!providers.length) { onLog(`AI escalation skipped — no usable LLM provider · ${failures.length} unresolved failure(s)`); return []; }
+
+        let out = null;
+        let lastErr = null;
+        for (const provider of providers) {
+            try {
+                onLog(`AI escalation using ${provider.label} as senior performance engineer`);
+                out = await provider.run();
+                lastErr = null;
+                break;
+            } catch (e) {
+                lastErr = e;
+                onLog(`AI escalation via ${provider.label} failed: ${e.message}${providers.length > 1 ? ' — trying next provider' : ''}`);
+            }
+        }
+        if (lastErr && !out) throw lastErr;
+
         const fixes = normalizeGeminiFixes(out);
         fs.writeFileSync(path.join(outDir, `${name}_llm_suggestions.json`), JSON.stringify(fixes, null, 2));
         if (fixes.length) {
@@ -75,6 +93,27 @@ async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLo
         }
         return fixes;
     } catch (e) { onLog(`AI escalation error: ${e.message}`); return []; }
+}
+
+// Retry the OpenAI call on transient failures (network error, 429, 5xx). A
+// non-retryable client error (400/401/404 bad model) fails fast so failover to
+// Gemini happens immediately rather than after pointless retries.
+async function generateWithOpenAiRetry(prompt, onLog = () => {}, attempts = 3) {
+    let lastErr = null;
+    for (let i = 1; i <= attempts; i++) {
+        try {
+            return await generateWithOpenAi(prompt);
+        } catch (e) {
+            lastErr = e;
+            const status = Number((String(e.message).match(/OpenAI (\d{3})/) || [])[1] || 0);
+            const retryable = status === 0 || status === 429 || (status >= 500 && status < 600);
+            if (!retryable || i === attempts) break;
+            const backoffMs = 400 * i;
+            onLog(`OpenAI transient error (${status || 'network'}) — retry ${i}/${attempts - 1} in ${backoffMs}ms`);
+            await new Promise(r => setTimeout(r, backoffMs));
+        }
+    }
+    throw lastErr;
 }
 
 function llmProviderLabel(env = process.env) {
@@ -665,6 +704,8 @@ function recoverSamplesFromJtl(result, stableJtl, outDir, onLog) {
         const existing = new Set((result.samples || []).map(s => String(s.label || s.name || '').trim()));
         if (!existing.size) {
             result.samples = [...byLabel.values()];
+            annotateSamplesWithTransactions(result);
+            ignoreLogoutOnlyFailures(result);
             result.samplesRecoveredFromJtl = path.basename(jtl);
             onLog(`engine returned no per-sampler results — recovered ${result.samples.filter(s => !s.isTransaction).length} request row(s) from ${path.basename(jtl)}`);
             return result;
@@ -675,8 +716,51 @@ function recoverSamplesFromJtl(result, stableJtl, outDir, onLog) {
             result.samplesRecoveredFromJtl = path.basename(jtl);
             onLog(`engine sample list was partial — merged ${missing.length} executed row(s) from ${path.basename(jtl)}`);
         }
+        annotateSamplesWithTransactions(result);
+        ignoreLogoutOnlyFailures(result);
     } catch (e) { onLog(`sample recovery skipped: ${e.message}`); }
     return result;
+}
+
+function annotateSamplesWithTransactions(result = {}) {
+    if (!Array.isArray(result.samples)) return result;
+    let currentTransaction = '';
+    for (const sample of result.samples) {
+        const label = String(sample.label || sample.name || '').trim();
+        if (sample.isTransaction) {
+            currentTransaction = label;
+            continue;
+        }
+        if (currentTransaction && !sample.transactionName) {
+            sample.transactionName = currentTransaction;
+        }
+    }
+    return result;
+}
+
+function ignoreLogoutOnlyFailures(result = {}) {
+    const requests = (result.samples || []).filter(s => !s.isTransaction);
+    const failures = requests.filter(s => s.success === false);
+    if (!failures.length || !failures.every(isLogoutSample)) return result;
+    for (const sample of failures) {
+        sample.success = true;
+        sample.ignoredFailure = true;
+        sample.ignoredReason = 'logout sampler failure ignored by policy';
+    }
+    result.ignoredLogoutFailures = failures.map(s => ({
+        samplerLabel: s.label || s.name || '',
+        transactionName: s.transactionName || '',
+        responseCode: s.responseCode || s.code || '',
+    }));
+    result.success = true;
+    result.failureMessage = '';
+    result.unresolvedFailures = (result.unresolvedFailures || []).filter(f => !isLogoutSample(f));
+    return result;
+}
+
+function isLogoutSample(sample = {}) {
+    const hay = `${sample.label || sample.name || sample.samplerLabel || ''} ${sample.url || ''} ${sample.finalUrl || ''} ${sample.path || ''}`;
+    return /\/(?:jwt\/v2\/logout|v2\/logout|logout)(?:\/|\?|$)|\blogout\b/i.test(hay);
 }
 
 function buildAttemptRunEvidence({ entries = [], stableJtl = '', outDir = '', onLog = () => {} } = {}) {
@@ -735,21 +819,125 @@ function adjudicatedDisableFixes(result = {}) {
     return fixes;
 }
 
-function applyStatusRootCauseToResult(result = {}, entries = [], evidence = null) {
+// A replan strategy is a no-op when merging its runCfgPatch into the current
+// runCfg changes nothing — regenerating + re-running JMeter then produces the
+// same JMX and the same failure. Detect it so terminal strategies (auth-wall-
+// stop) do not burn a full validation cycle.
+// Response-body capture policy for the engine-parsed JTL.
+//   'off'     — no bodies (legacy behavior).
+//   'onError' — bodies only for failing samplers (DEFAULT): cheap, and it is
+//               exactly what 4xx/5xx diagnosis + error-body soft-failure text
+//               need. Green runs stay body-free so the JTL never bloats.
+//   'full'    — bodies for every sample: the only mode that can catch a
+//               200-status login page or a 200 GraphQL error, at the cost of a
+//               larger JTL. A per-sample byte cap keeps even 'full' from the
+//               multi-MB parseJtl stall that forced bodies off originally.
+function bodyCaptureMode(runCfg = {}) {
+    const raw = String(runCfg.captureResponseBodies || '').trim().toLowerCase();
+    if (raw === 'off' || raw === 'none' || raw === 'false') return 'off';
+    if (raw === 'full' || raw === 'all' || raw === 'true') return 'full';
+    return 'onError';
+}
+
+function bodyCaptureProperties(runCfg = {}) {
+    const mode = bodyCaptureMode(runCfg);
+    const props = {
+        'jmeter.save.saveservice.output_format': 'xml',
+        'jmeter.save.saveservice.samplerData': 'false',
+        'jmeter.save.saveservice.responseHeaders': 'true',
+        'jmeter.save.saveservice.url': 'true',
+        'jmeter.save.saveservice.response_data': mode === 'full' ? 'true' : 'false',
+        'jmeter.save.saveservice.response_data.on_error': mode === 'off' ? 'false' : 'true',
+    };
+    if (mode !== 'off') {
+        // Cap stored bytes per sample so a large 401/login/error page cannot
+        // bloat the JTL and stall the engine's parseJtl (the original reason
+        // bodies were disabled). 64KB is plenty to detect login/GraphQL/soft
+        // markers. Operators can raise it via run.maxResponseBytes.
+        const cap = Math.max(2048, Number(runCfg.maxResponseBytes) || 65536);
+        props['httpsampler.max_bytes_to_store_per_sample'] = String(cap);
+    }
+    return props;
+}
+
+function isNoOpRunCfgPatch(runCfgPatch, currentRunCfg) {
+    if (!runCfgPatch || typeof runCfgPatch !== 'object') return true;
+    const keys = Object.keys(runCfgPatch);
+    if (!keys.length) return true;
+    try {
+        for (const k of keys) {
+            if (JSON.stringify(runCfgPatch[k]) !== JSON.stringify((currentRunCfg || {})[k])) return false;
+        }
+        return true;
+    } catch { return false; }
+}
+
+function applyStatusRootCauseToResult(result = {}, entries = [], evidence = null, opts = {}) {
     const statusRootCause = statusAnalysis.traceStatusRootCause({
         entries,
         samples: result.samples || [],
         evidence,
+        strictStatusMatch: opts.strictStatusMatch !== false,
     });
     result.statusRootCause = statusRootCause;
     if (statusRootCause) {
+        if (isLogoutOnlyStatusRootCause(result, statusRootCause)) {
+            result.statusRootCauseWarning = statusRootCause;
+            delete result.recordingDriftFailure;
+            return result;
+        }
         result.success = false;
         result.recordingDriftFailure = true;
         result.failureMessage = statusRootCause.summary;
+        result.unresolvedFailures = unresolvedFailuresWithStatusRootCause(result.unresolvedFailures || [], statusRootCause);
     } else {
         delete result.recordingDriftFailure;
     }
     return result;
+}
+
+function isLogoutOnlyStatusRootCause(result = {}, statusRootCause = {}) {
+    const failingIndex = Number(statusRootCause.failingIndex ?? statusRootCause.firstFailedIndex);
+    const failingLabel = String((statusRootCause.failing && statusRootCause.failing.sampler) || statusRootCause.failingSampler || '');
+    if (!Number.isFinite(failingIndex)) return false;
+    const failing = (result.samples || []).find(sample => {
+        if (!sample || sample.isTransaction) return false;
+        const idx = Number(sample.entryIndex ?? sample.index ?? sample.originalEntryIndex);
+        return idx === failingIndex || String(sample.label || sample.name || '') === failingLabel;
+    });
+    if (!failing) return false;
+    return /logout|logoff|signout|sign-off/i.test(`${failing.label || failing.name || ''} ${failing.transactionName || failing.transaction || failing.parentTransaction || ''}`);
+}
+
+function unresolvedFailuresWithStatusRootCause(unresolvedFailures = [], statusRootCause = {}) {
+    const root = statusRootCause.rootCause || {};
+    const rootSampler = root.sampler || '';
+    if (!rootSampler) return unresolvedFailures;
+    const rootFailure = {
+        samplerLabel: rootSampler,
+        index: statusRootCause.rootCauseIndex,
+        responseCode: String(root.observed || ''),
+        issue: 'upstream_recording_divergence',
+        manualFixHint: statusRootCause.summary || root.repairHint || 'Repair the earliest recording-vs-replay divergence before downstream failures.',
+        recordedStatus: root.recorded,
+        observedStatus: root.observed,
+        category: root.category,
+    };
+    const cascades = [];
+    for (const failure of unresolvedFailures || []) {
+        const sampler = failure.samplerLabel || failure.samplerName || '';
+        if (sampler === rootSampler) continue;
+        cascades.push({
+            ...failure,
+            issue: /^cascade_from_/i.test(String(failure.issue || ''))
+                ? failure.issue
+                : `cascade_from_${rootSampler}`,
+            manualFixHint: failure.manualFixHint && /downstream/i.test(failure.manualFixHint)
+                ? failure.manualFixHint
+                : `Downstream casualty of '${rootSampler}' - fix the upstream recording divergence first.`,
+        });
+    }
+    return [rootFailure, ...cascades];
 }
 
 function attachFailureForensics({ result = {}, entries = [], evidence = null, outDir, name, blueprintCtx = null, onLog = () => {} } = {}) {
@@ -930,6 +1118,7 @@ async function tryMemoryPatchRound({ result, jmxPath, config, gen, outDir, name,
             failures: result,
             minConfidence: learning.autoApplyMinConfidence,
             stackFingerprint: (gen.seniorPeDebrief && gen.seniorPeDebrief.stackFingerprint && gen.seniorPeDebrief.stackFingerprint.signals) || [],
+            appHost: config.targetBaseUrl || '',
         })
         : [];
 
@@ -972,6 +1161,14 @@ async function tryMemoryPatchRound({ result, jmxPath, config, gen, outDir, name,
         onLog(`learning memory: applied ${patched.applied.length} verified lesson patch(es) · re-verifying before AI escalation`);
         const result2 = await runFeedbackLoop({ ...config, jmxPath: patchedJmxPath, maxIterations: reverifyIterationBudget(config) }, gen.flat);
         const success = !!result2.success;
+        // Decay the confidence of any lesson that was auto-applied but did NOT
+        // green this run, so a stale lesson stops out-ranking fresh evidence.
+        if (!success && learning.enabled) {
+            try {
+                const res = learningStore.penalizeLessons({ storePath: learning.storePath, lessonIds: matches.map(m => m.lessonId) });
+                if (res.penalized.length) onLog(`learning memory: decayed confidence for ${res.penalized.length} lesson(s) that failed to green`);
+            } catch (e) { onLog(`learning memory decay skipped: ${e.message}`); }
+        }
         return {
             result: result2,
             jmxPath: result2.finalJmxPath || patchedJmxPath,
@@ -1224,7 +1421,10 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
             if (!fastRepair.skipped && !fastRepair.replay.ok) {
                 onLog(`fast repair loop round ${round}: rejected patch hypothesis before JMeter`);
                 rounds.push({ round, applied: 0, skipped: 0, success: false, fastReplay: false });
-                break;
+                // A rejected hypothesis in THIS round must not abandon the whole
+                // escalation budget: later rounds may produce a different, valid
+                // fix. Continue to the next round instead of breaking out.
+                continue;
             }
             const patched = applyLlmPatches(before, validation.accepted);
             const patchedJmxPath = path.join(outDir, `${name}.llm-patched.round${round}.jmx`);
@@ -1378,19 +1578,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         maxIterations,
         disableOnly: true, // already correlated; the loop only disables un-replayables
         timeoutMs: 4 * 60 * 1000,
-        jmeterProperties: {
-            'jmeter.save.saveservice.output_format': 'xml',
-            // Do NOT save response bodies into the engine-parsed JTL. With many
-            // failures (e.g. 401 pages), saved bodies bloat the JTL to multiple
-            // MB and the engine's parseJtl hangs the CLI (event loop stalls,
-            // node exits silently). Codes/assertions are still saved; the
-            // human-readable response bodies live in the recording + dashboard.
-            'jmeter.save.saveservice.response_data': 'false',
-            'jmeter.save.saveservice.response_data.on_error': 'false',
-            'jmeter.save.saveservice.samplerData': 'false',
-            'jmeter.save.saveservice.responseHeaders': 'true',
-            'jmeter.save.saveservice.url': 'true',
-        },
+        jmeterProperties: bodyCaptureProperties(enrichedRunCfg),
         onIteration: (s) => {
             onLog(`[iter] ${JSON.stringify(s).slice(0, 180)}`);
             steeringTick('between JMeter iterations');
@@ -1583,7 +1771,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     } else if (strictGuard.enabled) {
         onLog(`strict business guard: ${verified.evaluation.reason}`);
     }
-    applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence);
+    applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence, { strictStatusMatch: enrichedRunCfg.strictStatusMatch });
     if (finalResult.statusRootCause) {
         blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
         onLog(`status root cause: ${finalResult.statusRootCause.summary}`);
@@ -1637,7 +1825,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
         verified = applyBusinessVerification(llm.result, finalJmxPath, strictGuard, blockedDisables);
         finalResult = verified.result;
-        applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence);
+        applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence, { strictStatusMatch: enrichedRunCfg.strictStatusMatch });
         if (finalResult.statusRootCause) {
             blueprintCtx.validation.statusRootCause = finalResult.statusRootCause;
         }
@@ -1668,6 +1856,15 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
             });
             if (!strategy) { onLog('replan: no untried strategy fits the evidence'); break; }
             triedStrategies.push(strategy.id);
+            // Skip the expensive regenerate+JMeter cycle when a strategy carries
+            // no actual config change (e.g. auth-wall-stop): re-running identical
+            // generation into the same wall burns a JVM boot for nothing. Record
+            // the strategy so its evidence still surfaces, then stop the chain.
+            if (isNoOpRunCfgPatch(strategy.runCfgPatch, finalRunCfg)) {
+                onLog(`replan ${attempt}: strategy "${strategy.id}" makes no config change (terminal) — recording it without a wasted re-run`);
+                replans.push({ attempt, strategy: strategy.id, reason: strategy.reason, evidence: strategy.evidence, terminal: true, reran: false });
+                break;
+            }
             if (steering.active) steering.say(`Replanning with strategy "${strategy.id}": ${strategy.reason.slice(0, 160)} — say "protect <name>" now if I should not touch something.`);
             onLog(`REPLAN ${attempt}/${agent.maxReplans}: ${strategy.id} — ${strategy.reason}`);
             try {
@@ -1771,6 +1968,9 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         semanticDiff: finalResult.semanticDiff || null,
         businessVerification: finalResult.businessVerification || null,
         evidence: currentEvidence,
+        assertionsPlanned: gen.stats ? gen.stats.assertions : null,
+        requireAssertions: enrichedRunCfg.requireAssertions === true,
+        softFailurePatterns: enrichedRunCfg.softFailurePatterns || [],
     });
     finalResult.finalGreenGate = finalGate;
     fs.writeFileSync(path.join(outDir, `${name}_final_green_gate.json`), JSON.stringify(finalGate, null, 2));
@@ -1878,7 +2078,13 @@ module.exports = {
         filterProtectedPatchDisables,
         applyBusinessVerification,
         recoverSamplesFromJtl,
+        annotateSamplesWithTransactions,
+        ignoreLogoutOnlyFailures,
         applyStatusRootCauseToResult,
+        bodyCaptureMode,
+        bodyCaptureProperties,
+        isNoOpRunCfgPatch,
+        unresolvedFailuresWithStatusRootCause,
         attachFailureForensics,
         refreshBlueprintFirstFailure,
         guardFailureReportWithAdjudication,

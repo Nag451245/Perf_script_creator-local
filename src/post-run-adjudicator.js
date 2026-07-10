@@ -3,14 +3,24 @@
 const peNaming = require('./pe-naming');
 
 const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
-// Universal business VERBS only. App-specific nouns (/patient, /edoc,
-// /scheduler/index/data, ...) live in playbooks as protectedCalls — baked-in
-// app paths are how one flow's rules silently misjudge the next app's.
-const BUSINESS_PATH_RE = /(?:\/api\/|\/graphql|\/batch|\/print|\/upload|\/download|\/export|\/save|\/create|\/update|\/delete|\/submit|\/tasks?)/i;
-const SESSION_PATH_RE = /(?:login|auth|oauth|oidc|saml|sso|callback|token|session|csrf|authorize|jwt\/v2\/create-cookie|iam)/i;
+// Universal business VERBS + cross-domain business NOUNS (commerce, banking,
+// scheduling, workflow). App-specific nouns (/patient, /edoc, ...) still live
+// in playbooks as protectedCalls — but the universal verbs/nouns here must be
+// broad enough that a checkout / transfer / booking is protected out of the
+// box for retail, banking, and scheduling apps, not only WebPT-shaped flows.
+const BUSINESS_PATH_RE = /(?:\/api\/|\/graphql|\/rest\/|\/v\d+\/|\/batch|\/print|\/upload|\/download|\/export|\/import|\/save|\/create|\/update|\/edit|\/delete|\/remove|\/submit|\/tasks?|\/checkout|\/cart|\/order|\/orders|\/basket|\/payment|\/pay\b|\/purchase|\/refund|\/transfer|\/transaction|\/account|\/withdraw|\/deposit|\/booking|\/reservation|\/appointment|\/schedule|\/apply|\/approve|\/reject|\/confirm|\/place|\/process|\/quote|\/enroll|\/subscribe)/i;
+const SESSION_PATH_RE = /(?:login|logon|auth|oauth|oidc|saml|sso|callback|token|session|csrf|xsrf|authorize|jwt\/v2\/create-cookie|iam|mfa|otp|2fa|totp|challenge|verify|step-?up|connect\/token|realms|adfs|wsfed|openid)/i;
+// Token-exchange endpoints (OAuth2/OIDC token, PKCE, client-credentials) are
+// business-critical auth producers, NOT foldable browser redirect hops. A POST
+// to any of these must never be disabled to reach green (M2M/PKCE/banking).
+const TOKEN_ENDPOINT_RE = /\/(?:oauth2?\/token|connect\/token|token|as\/token\.oauth2|v\d+\/token|services\/oauth2\/token|access[_-]?token)(?:\/|\?|$)/i;
 const SESSION_MATERIAL_RE = /(?:sess|session|token|csrf|xsrf|auth|iam|idem|sso|jwt|access|refresh|PHPSESSID)/i;
+const AUTHORIZE_RESUME_RE = /\/authorize\/resume\/?(?:\?|$)/i;
 const INTERCEPTOR_AUTHORIZE_RE = /\/s\/interceptor\/authorize\/?(?:\?|$)/i;
 const JWT_CREATE_COOKIE_RE = /\/jwt\/v2\/create-cookie(?:\/|\?|$)/i;
+// NOTE: oauth/token is kept here for GET browser-redirect hops (SPA flows where
+// JMeter follows the redirect), but isFoldableRedirectHop() below refuses to
+// fold a POST token exchange — that carries the credential grant.
 const REDIRECT_HOP_RE = /\/(?:s\/interceptor(?:\/authorize)?|interceptor|authorize\/resume|iam\/callback|oauth\/token|user\/iam\/authorize|redirect|logout|v2\/logout)(?:\/|\?|$)/i;
 const SAFE_BROWSER_NOISE_RE = /(?:domainreliability|ohttp|safebrowsing|gstatic|beacon|analytics|telemetry|launchdarkly|\/sdk\/evalx|\/favicon\.ico|\/_next\/data\/)/i;
 
@@ -113,7 +123,8 @@ function classifyOne({ entry, index, label, row, flow, attemptedDisable, guard, 
     const failed = !!failure || row.success === false || (Number.isFinite(observedStatus) && observedStatus >= 400);
     const businessRequest = isBusinessRequest(method, hay);
     const sessionLike = SESSION_PATH_RE.test(hay);
-    const redirectHop = REDIRECT_HOP_RE.test(path);
+    const tokenExchange = TOKEN_ENDPOINT_RE.test(path) && MUTATING_METHOD_RE.test(method || '');
+    const redirectHop = REDIRECT_HOP_RE.test(path) && !tokenExchange;
     const safeNoise = SAFE_BROWSER_NOISE_RE.test(hay);
     const downstreamOfRoot = Number.isFinite(rootCauseIndex) && index > rootCauseIndex;
     const isRoot = Number.isFinite(rootCauseIndex) && index === rootCauseIndex;
@@ -121,6 +132,13 @@ function classifyOne({ entry, index, label, row, flow, attemptedDisable, guard, 
     const foldableRedirectHop = isFoldableRedirectHop({
         method, path, redirectHop, protectedByGuard, businessRequest, consumedOutputCount, sessionMaterial,
     });
+
+    if (authWall && downstreamOfRoot && failed && AUTHORIZE_RESUME_RE.test(path) && /^GET$/i.test(method || '')) {
+        return buildDecision('redirect_hop', 'disable', {
+            entry, index, label, row, flow,
+            reason: `downstream authorize/resume redirect hop is stale under auth/session root cause at index ${rootCauseIndex}`,
+        });
+    }
 
     if (attemptedDisable && !foldableRedirectHop && (protectedByGuard || consumedOutputCount > 0 || businessRequest || sessionMaterial)) {
         return buildDecision('blocked_disable', 'protect', {
@@ -153,6 +171,16 @@ function classifyOne({ entry, index, label, row, flow, attemptedDisable, guard, 
     if ((sessionMaterial || consumedOutputCount > 0) && (sessionLike || JWT_CREATE_COOKIE_RE.test(path)) && !INTERCEPTOR_AUTHORIZE_RE.test(path)) {
         return buildDecision('session_producer', 'protect', {
             entry, index, label, row, flow, reason: 'sampler produces session/cookie/token evidence consumed downstream',
+        });
+    }
+
+    // A POST token-exchange is the credential grant; protect it unconditionally
+    // (even if correlation didn't track its access_token as a consumer) so it is
+    // never folded to reach green in M2M / PKCE / client-credentials / banking.
+    if (tokenExchange) {
+        return buildDecision('session_producer', 'protect', {
+            entry, index, label, row, flow, tier: 'prior',
+            reason: 'OAuth2/OIDC token exchange endpoint issues the access grant; never fold it',
         });
     }
 
@@ -345,6 +373,11 @@ function isDeadPlumbingPath(path, hay) {
 
 function isFoldableRedirectHop({ method, path, redirectHop, protectedByGuard, businessRequest, consumedOutputCount, sessionMaterial }) {
     if (!redirectHop || protectedByGuard || businessRequest || sessionMaterial) return false;
+    // A POST to a token-exchange endpoint is the credential grant itself (OAuth2
+    // token, PKCE code exchange, client-credentials, Salesforce oauth2/token). Its
+    // access_token output may not be tracked as a consumer if correlation missed
+    // it, but folding it silently breaks every downstream authenticated call.
+    if (TOKEN_ENDPOINT_RE.test(path) && MUTATING_METHOD_RE.test(method || '')) return false;
     if (INTERCEPTOR_AUTHORIZE_RE.test(path)) return /^GET$/i.test(method || '');
     return consumedOutputCount === 0;
 }

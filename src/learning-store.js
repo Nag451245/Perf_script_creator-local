@@ -130,16 +130,27 @@ function normalizeSegment(segment, index) {
     return index === 0 ? s.toLowerCase() : ':segment';
 }
 
-function findMatchingLessons({ storePath = defaultStorePath(), failures = [], minConfidence = 0.85, stackFingerprint = [] } = {}) {
+function findMatchingLessons({ storePath = defaultStorePath(), failures = [], minConfidence = 0.85, stackFingerprint = [], appHost = '' } = {}) {
     const lessons = loadLessons(storePath).filter(l => Number(l.confidence || 0) >= minConfidence);
     const failureList = normalizeFailures(failures);
     const currentStacks = new Set((stackFingerprint || []).map(s => String(s && s.stack || s)));
+    // Host-scoped lessons must not fire on a DIFFERENT app that happens to share
+    // a URL shape (two Salesforce orgs, retail vs banking /api/login). When we
+    // know the current appHost, a 'host' lesson only matches if its hashed host
+    // matches; 'generic' lessons still match broadly. When appHost is unknown we
+    // keep prior behavior (match by pattern) to stay backward compatible.
+    const currentHostHash = appHost ? sha256(String(appHost)).slice(0, 16) : '';
     const matches = [];
     for (const failure of failureList) {
         const failurePattern = normalizePattern(failure.samplerName || failure.label || failure.name || failure.url || '');
         for (const lesson of lessons) {
             const lessonPattern = lesson.contextPattern && lesson.contextPattern.samplerPattern;
             if (!lessonPattern || lessonPattern !== failurePattern) continue;
+            if (currentHostHash && lesson.scope === 'host' && lesson.appHostHash && lesson.appHostHash !== currentHostHash) continue;
+            // A replaceValueWithVar lesson whose literal was redacted cannot
+            // find-and-replace anything (searching for '[REDACTED_VALUE]' always
+            // misses). Skip it instead of emitting a guaranteed no-op patch.
+            if (lesson.fix && lesson.fix.kind === 'replaceValueWithVar' && String(lesson.fix.value || '') === '[REDACTED_VALUE]') continue;
             const fix = adaptFixForFailure(lesson.fix, failure);
             const gate = validateLlmPatches([fix]);
             if (!gate.accepted.length) continue;
@@ -187,6 +198,26 @@ function learnFromRun({ storePath = defaultStorePath(), flowName = '', sourceRun
     }
     writeLessons(storePath, Array.from(bySignature.values()));
     return { learned: learned.map(publicLesson), skipped: [] };
+}
+
+// Decay a lesson's confidence when it was auto-applied but the run did NOT go
+// green. Without this, a lesson that helped once keeps firing at high
+// confidence forever even after it starts failing on newer app versions.
+function penalizeLessons({ storePath = defaultStorePath(), lessonIds = [], penalty = 0.15, floor = 0.3 } = {}) {
+    const ids = new Set((Array.isArray(lessonIds) ? lessonIds : [lessonIds]).filter(Boolean));
+    if (!ids.size) return { penalized: [] };
+    const lessons = loadLessons(storePath);
+    const penalized = [];
+    for (const lesson of lessons) {
+        if (!ids.has(lesson.id)) continue;
+        const before = Number(lesson.confidence || DEFAULT_CONFIDENCE);
+        lesson.confidence = Math.max(floor, Number((before - penalty).toFixed(4)));
+        lesson.failureCount = Number(lesson.failureCount || 0) + 1;
+        lesson.lastFailedAt = new Date().toISOString();
+        penalized.push({ id: lesson.id, from: before, to: lesson.confidence });
+    }
+    if (penalized.length) writeLessons(storePath, lessons);
+    return { penalized };
 }
 
 function exportLessons({ storePath = defaultStorePath(), exportPath } = {}) {
@@ -275,6 +306,8 @@ function sanitizeLesson(raw) {
         verification: redactSensitive(raw.verification || {}),
         confidence: clampNumber(raw.confidence, 0, 0.99, DEFAULT_CONFIDENCE),
         successCount: Math.max(1, Number(raw.successCount) || 1),
+        failureCount: Math.max(0, Number(raw.failureCount) || 0),
+        ...(raw.lastFailedAt ? { lastFailedAt: raw.lastFailedAt } : {}),
         scope: ['host', 'app', 'generic'].includes(raw.scope) ? raw.scope : 'generic',
         signature,
     };
@@ -285,6 +318,11 @@ function sanitizeFixes(fixes) {
     return validation.accepted
         .map(fix => {
             const safe = redactSensitive(fix);
+            // A replaceValueWithVar literal is app/session-specific and may be a
+            // secret, so it is never stored verbatim (shareable-export safety).
+            // The redacted marker below makes the lesson non-replayable by design
+            // — findMatchingLessons skips it so a broken '[REDACTED_VALUE]' patch
+            // is never emitted (see the match-time guard).
             if (safe.kind === 'replaceValueWithVar' && safe.value) {
                 safe.value = '[REDACTED_VALUE]';
             }
@@ -373,6 +411,7 @@ module.exports = {
     normalizePattern,
     findMatchingLessons,
     learnFromRun,
+    penalizeLessons,
     exportLessons,
     importLessons,
     _internal: {

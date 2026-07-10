@@ -2,15 +2,48 @@
 
 const statusAnalysis = require('./status-analysis');
 
+// 200-status responses that carry an application-level failure. These are the
+// "everything 200 but nothing worked" bodies: GraphQL error envelopes, SOAP
+// faults, gRPC status, and common soft-failure markers. Operators can extend
+// via run.softFailurePatterns.
+const DEFAULT_SOFT_FAILURE_RES = [
+    /"errors"\s*:\s*\[\s*\{/i,               // GraphQL error envelope (non-empty)
+    /\bsession expired\b/i,
+    /\binvalid[_-]?token\b/i,
+    /\bunauthenticated\b/i,                  // gRPC / OIDC
+    /\baccess denied\b/i,
+    /"faultstring"\s*:/i,                    // SOAP fault (JSON-encoded)
+    /<faultstring>/i,                        // SOAP fault (XML)
+    /"success"\s*:\s*false/i,
+    /"status"\s*:\s*"(?:error|failed|unauthorized|forbidden)"/i,
+];
+
 function evaluateFinalGreenGate({
     result = {},
     baselineDiff = null,
     semanticDiff = null,
     businessVerification = null,
     evidence = null,
+    assertionsPlanned = null,
+    requireAssertions = false,
+    softFailurePatterns = [],
 } = {}) {
     const failures = [];
     const warnings = [];
+
+    // Assertion coverage: a JMX with zero assertions passes JMeter on HTTP
+    // status alone — the classic "everything 200 but nothing verified" trap.
+    // Default is a review WARNING (so today's assertion-light flows still reach
+    // GREEN); run.requireAssertions promotes it to a hard gate for teams that
+    // demand every green script prove a business marker.
+    if (assertionsPlanned != null && Number(assertionsPlanned) <= 0) {
+        const assertionFinding = {
+            category: 'no_assertion_coverage',
+            reason: 'The script ships with no response assertions — HTTP 200 alone cannot prove the business flow worked.',
+        };
+        if (requireAssertions) failures.push(assertionFinding);
+        else warnings.push(assertionFinding);
+    }
 
     if (result.success === false) {
         failures.push({
@@ -51,12 +84,19 @@ function evaluateFinalGreenGate({
         });
     }
 
-    const evidenceGate = evaluateEvidenceGate(evidence);
+    const evidenceGate = evaluateEvidenceGate(evidence, { softFailurePatterns });
     if (evidenceGate.failures.length) {
         failures.push({
             category: 'recording_evidence_drift',
             reason: evidenceGate.failures[0].reason,
             details: evidenceGate.failures,
+        });
+    }
+    if (evidenceGate.businessErrors.length) {
+        failures.push({
+            category: 'business_error_in_body',
+            reason: evidenceGate.businessErrors[0].reason,
+            details: evidenceGate.businessErrors,
         });
     }
     if (evidenceGate.warnings.length) warnings.push(...evidenceGate.warnings);
@@ -74,14 +114,46 @@ function evaluateFinalGreenGate({
     };
 }
 
-function evaluateEvidenceGate(evidence) {
+function evaluateEvidenceGate(evidence, opts = {}) {
     const failures = [];
     const warnings = [];
-    if (!evidence || !Array.isArray(evidence.rows)) return { failures, warnings };
+    const businessErrors = [];
+    const softFailureRes = compileSoftFailurePatterns(opts.softFailurePatterns);
+    if (!evidence || !Array.isArray(evidence.rows)) return { failures, warnings, businessErrors };
+    const rows = evidence.rows || [];
     let bodyComparable = 0;
-    for (const row of evidence.rows || []) {
+    for (const row of rows) {
         if (row.isTransaction) continue;
         if (row.recordedBodyLength > 0 && row.observedBodyLength > 0) bodyComparable++;
+        // Soft failure inside a returned body (works whenever bodies were
+        // captured — run.captureResponseBodies='full' or the fast-replay path).
+        // Only a PRESENT body can trip this, so it can never flip a body-free
+        // run; it strictly closes the "200 but broken" hole when evidence exists.
+        const observedBody = String(row.observedBody || '');
+        if (observedBody) {
+            const hit = softFailureRes.find(re => re.test(observedBody));
+            if (hit) {
+                businessErrors.push({
+                    index: row.entryIndex,
+                    sampler: row.label,
+                    reason: `${row.label} returned status ${row.observedStatus || '?'} but its body contains an application-level failure (matched /${hit.source}/).`,
+                    marker: hit.source,
+                });
+            }
+        }
+        if (isLogoutRow(row) && rowFailed(row)) {
+            warnings.push({
+                category: 'logout_failure_ignored',
+                reason: `Ignored logout sampler failure at ${formatSamplerWithTransaction(row)}.`,
+                details: {
+                    index: row.entryIndex,
+                    sampler: row.label,
+                    transactionName: transactionNameOf(row),
+                    observedStatus: row.observedStatus,
+                },
+            });
+            continue;
+        }
         const transition = statusAnalysis.classifySampleReplay(row.entry || {}, {
             ...(row.sample || {}),
             label: row.label,
@@ -93,6 +165,33 @@ function evaluateEvidenceGate(evidence) {
             finalUrl: row.finalUrl,
         });
         if (!transition || transition.matchesRecording || transition.folded) continue;
+        if (isBodylessAuthRedirectReview(row, transition)) {
+            const downstreamFailure = firstDownstreamFailure(rows, row.entryIndex);
+            if (!downstreamFailure) {
+                warnings.push({
+                    category: 'bodyless_redirect_review',
+                    reason: `${row.label} changed from recorded ${transition.recorded} to observed ${transition.observed}, but recording and replay bodies are both empty and no downstream request failed.`,
+                    details: { index: row.entryIndex, sampler: row.label, transition },
+                });
+                continue;
+            }
+            if (isLogoutRow(downstreamFailure)) {
+                warnings.push({
+                    category: 'logout_downstream_ignored',
+                    reason: `${row.label} changed from recorded ${transition.recorded} to observed ${transition.observed}, but the only downstream failure is logout transaction ${downstreamFailure.transactionName || downstreamFailure.label}.`,
+                    details: { index: row.entryIndex, sampler: row.label, transition, downstreamFailure },
+                });
+                continue;
+            }
+            failures.push({
+                index: row.entryIndex,
+                sampler: row.label,
+                reason: `${row.label} bodyless redirect mismatch has downstream failure at ${formatSamplerWithTransaction(downstreamFailure)}`,
+                transition,
+                downstreamFailure,
+            });
+            break;
+        }
         if (/auth|session|login|redirect/i.test(`${transition.category || ''} ${transition.relevance || ''}`)) {
             failures.push({
                 index: row.entryIndex,
@@ -106,14 +205,75 @@ function evaluateEvidenceGate(evidence) {
     if (!bodyComparable) {
         warnings.push({
             category: 'body_compare_unavailable',
-            reason: 'No recorded and observed response bodies were available for recording comparison.',
+            reason: 'No recorded and observed response bodies were available for recording comparison. Set run.captureResponseBodies="full" for body-level green verification.',
         });
     }
-    return { failures, warnings };
+    return { failures, warnings, businessErrors };
+}
+
+function compileSoftFailurePatterns(extra = []) {
+    const compiled = [...DEFAULT_SOFT_FAILURE_RES];
+    for (const p of (Array.isArray(extra) ? extra : [])) {
+        try {
+            if (p instanceof RegExp) compiled.push(p);
+            else if (typeof p === 'string' && p.trim()) compiled.push(new RegExp(p, 'i'));
+        } catch { /* skip invalid operator-supplied pattern */ }
+    }
+    return compiled;
+}
+
+function isBodylessAuthRedirectReview(row = {}, transition = {}) {
+    if (transition.category !== 'auth_redirect_bounce') return false;
+    const recordedBody = String(row.recordedBody || '').trim();
+    const observedBody = String(row.observedBody || '').trim();
+    const recordedLen = Number(row.recordedBodyLength || recordedBody.length || 0);
+    const observedLen = Number(row.observedBodyLength || observedBody.length || 0);
+    return recordedLen === 0 && observedLen === 0 && !recordedBody && !observedBody;
+}
+
+function firstDownstreamFailure(rows = [], index) {
+    const start = Number(index);
+    for (const row of rows) {
+        if (row.isTransaction) continue;
+        if (!Number.isFinite(start) || Number(row.entryIndex) <= start) continue;
+        const status = Number(row.observedStatus || row.sample && (row.sample.responseCode || row.sample.code || row.sample.status) || 0);
+        if (row.success === false || status >= 400) {
+            return {
+                index: row.entryIndex,
+                label: row.label,
+                responseCode: status || '',
+                transactionName: transactionNameOf(row),
+            };
+        }
+    }
+    return null;
+}
+
+function transactionNameOf(row = {}) {
+    return row.transactionName ||
+        row.transaction ||
+        row.parentTransaction ||
+        (row.sample && (row.sample.transactionName || row.sample.transaction || row.sample.parentTransaction)) ||
+        '';
+}
+
+function isLogoutRow(row = {}) {
+    return /logout|logoff|signout|sign-off/i.test(`${row.label || ''} ${transactionNameOf(row)}`);
+}
+
+function rowFailed(row = {}) {
+    const status = Number(row.observedStatus || row.sample && (row.sample.responseCode || row.sample.code || row.sample.status) || 0);
+    return row.success === false || (row.sample && row.sample.success === false) || status >= 400;
+}
+
+function formatSamplerWithTransaction(row = {}) {
+    const label = row.label || row.sampler || 'later sampler';
+    const transactionName = transactionNameOf(row);
+    return transactionName ? `${label} in transaction ${transactionName}` : label;
 }
 
 function unique(values) {
     return [...new Set(values.filter(Boolean))];
 }
 
-module.exports = { evaluateFinalGreenGate, _internal: { evaluateEvidenceGate } };
+module.exports = { evaluateFinalGreenGate, _internal: { evaluateEvidenceGate, isBodylessAuthRedirectReview, firstDownstreamFailure, compileSoftFailurePatterns, isLogoutRow, formatSamplerWithTransaction } };

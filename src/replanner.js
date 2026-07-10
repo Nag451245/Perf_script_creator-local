@@ -79,7 +79,7 @@ function proposeReplan({ result = {}, runCfg = {}, valueFlow = null, classificat
     //    the last generation went, try the other — unless the operator pinned
     //    it in config (explicit oauth config wins, we only flip the effective
     //    value when it came from a default/playbook).
-    const authFailure = failing.some(s => /login|authorize|callback|identifier|password|oauth|iam/i.test(String(s.label || s.name || ''))) ||
+    const authFailure = failing.some(s => /login|logon|authorize|callback|identifier|password|oauth|oidc|saml|sso|iam|session|token|mfa|otp|2fa|challenge|verify|step-?up|realms|adfs|connect\/token/i.test(String(s.label || s.name || ''))) ||
         (classification && /auth|session|redirect/i.test(String(classification.category || '')));
     if (authFailure && !(runCfg.oauth && runCfg.oauth._operatorPinned)) {
         const current = !!(runCfg.oauth && runCfg.oauth.dropBareStateNonce);

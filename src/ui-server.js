@@ -20,6 +20,15 @@ const INPUT = path.join(ROOT, 'input');
 const OUTPUT = path.join(ROOT, 'output');
 const CONFIG_PATH = path.join(ROOT, 'perfscript.config.json');
 const START_PORT = Number(process.env.PERFSCRIPT_UI_PORT) || 7070;
+// Bind to loopback by default: this UI can spawn processes and read/write the
+// input/output folders, so it must not be reachable from the LAN unless the
+// operator deliberately opts in via PERFSCRIPT_UI_HOST=0.0.0.0.
+const HOST = process.env.PERFSCRIPT_UI_HOST || '127.0.0.1';
+const MAX_UPLOAD_BYTES = Number(process.env.PERFSCRIPT_UI_MAX_UPLOAD_BYTES) || 256 * 1024 * 1024;
+const MAX_JSON_BYTES = 8 * 1024 * 1024;
+// Input-ingestion allowlist: recordings and test data only. An allowlist is
+// safer than a blocklist for a local server that later executes these inputs.
+const ALLOWED_UPLOAD_EXT_RE = /\.(har|jmx|xml|jtl|json|csv|txt|zip|saz|postman_collection)$/i;
 
 fs.mkdirSync(INPUT, { recursive: true });
 fs.mkdirSync(OUTPUT, { recursive: true });
@@ -215,7 +224,9 @@ function send(res, code, body, headers = {}) {
 
 function serveOutputFile(res, rel) {
     const full = path.normalize(path.join(OUTPUT, rel));
-    if (!full.startsWith(OUTPUT)) return send(res, 403, { error: 'forbidden' });
+    // Boundary-aware containment check: `output` must not also match a sibling
+    // like `output-evil`, so require an exact match or a real path separator.
+    if (full !== OUTPUT && !full.startsWith(OUTPUT + path.sep)) return send(res, 403, { error: 'forbidden' });
     if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return send(res, 404, { error: 'not found' });
     const ext = path.extname(full).toLowerCase();
     const type = ext === '.html' ? 'text/html'
@@ -227,24 +238,37 @@ function serveOutputFile(res, rel) {
     fs.createReadStream(full).pipe(res);
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = MAX_UPLOAD_BYTES) {
     return new Promise((resolve, reject) => {
         const chunks = [];
-        req.on('data', c => chunks.push(c));
+        let size = 0;
+        req.on('data', c => {
+            size += c.length;
+            if (size > maxBytes) {
+                const err = new Error('payload too large');
+                err.httpStatus = 413;
+                req.destroy();
+                reject(err);
+                return;
+            }
+            chunks.push(c);
+        });
         req.on('end', () => resolve(Buffer.concat(chunks)));
         req.on('error', reject);
     });
 }
 
 async function readJsonBody(req) {
-    const body = await readBody(req);
+    const body = await readBody(req, MAX_JSON_BYTES);
     if (!body.length) return {};
     return JSON.parse(body.toString() || '{}');
 }
 
 function safeUploadName(name) {
     const base = path.basename(name || '');
-    if (!base || /\.(exe|cmd|bat|ps1|js|mjs|cjs)$/i.test(base)) return '';
+    // Reject path components, and require a known input extension (allowlist).
+    if (!base || base === '.' || base === '..' || base.includes('/') || base.includes('\\')) return '';
+    if (!ALLOWED_UPLOAD_EXT_RE.test(base)) return '';
     return base;
 }
 
@@ -312,7 +336,7 @@ const server = http.createServer(async (req, res) => {
         if (p === '/file' && req.method === 'GET') return serveOutputFile(res, url.searchParams.get('path') || '');
         return send(res, 404, { error: 'not found' });
     } catch (e) {
-        return send(res, 500, { error: e.message });
+        return send(res, e.httpStatus || 500, { error: e.message });
     }
 });
 
@@ -326,8 +350,8 @@ function listenWithFallback(port, attemptsLeft) {
         process.stderr.write(`UI server failed to start: ${e.message}\n`);
         process.exit(1);
     });
-    server.listen(port, () => {
-        process.stdout.write(`\nPerfScript Agent Launcher running at http://localhost:${port}\ninput: ${INPUT}\nClose this window to stop the UI.\n`);
+    server.listen(port, HOST, () => {
+        process.stdout.write(`\nPerfScript Agent Launcher running at http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${port}\ninput: ${INPUT}\nbind: ${HOST}${HOST === '127.0.0.1' ? ' (loopback only — set PERFSCRIPT_UI_HOST=0.0.0.0 to expose)' : ''}\nClose this window to stop the UI.\n`);
     });
 }
 

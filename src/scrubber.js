@@ -13,13 +13,18 @@
  * String-in / string-out. Idempotent.
  */
 
+// Only fields the correlation engine does NOT need to keep intact. We
+// deliberately do NOT scrub session/CSRF/state tokens here — those make the
+// recording reproducible and the correlation engine reads this artifact.
 const SECRET_FIELD_NAMES = [
     'password', 'passwd', 'pwd', 'pass',
     'authorization', 'auth', 'apikey', 'api_key', 'api-key',
     'access_token', 'refresh_token', 'id_token',
     'x-api-key', 'x-auth-token',
-    'ssn', 'pin', 'otp', 'mfa', 'totp',
-    'creditcard', 'credit_card', 'cardnumber', 'cvv', 'cvc',
+    'client_secret', 'clientsecret', 'secret', 'private_key', 'privatekey', 'client_assertion',
+    'ssn', 'pin', 'otp', 'mfa', 'totp', 'securityanswer', 'security_answer',
+    'creditcard', 'credit_card', 'cardnumber', 'cardnum', 'cvv', 'cvc', 'iban',
+    'dob', 'date_of_birth', 'dateofbirth', 'taxid', 'tax_id', 'passport', 'nationalid', 'national_id',
 ];
 const REDACT = '***REDACTED***';
 

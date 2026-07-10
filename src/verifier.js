@@ -23,6 +23,11 @@ const runEvidence = require('./run-evidence');
 const statusAnalysis = require('./status-analysis');
 
 const DEFAULT_LENGTH_DRIFT_PCT = 30; // > +/- 30% body-length change worth flagging
+// A percentage on a tiny body is noise (10B -> 16B is +60% but meaningless).
+// Only flag length drift when BOTH the percentage AND an absolute byte delta
+// clear their floors, and only for bodies large enough to be a real payload.
+const DEFAULT_MIN_DRIFT_BYTES = 256;
+const MIN_COMPARABLE_BODY_BYTES = 64;
 
 function killProcessTree(pid) {
     if (!pid) return;
@@ -103,9 +108,12 @@ function diffRunAgainstRecording({ outDir, flatEntries, jtlPath: explicitJtlPath
                 repairHint: status.repairHint,
             });
         }
-        if (recordedBodyLen > 0 && observedBodyLen > 0) {
-            const pct = Math.abs(observedBodyLen - recordedBodyLen) / recordedBodyLen * 100;
-            if (pct > thresholdPct) issues.push({ kind: 'lengthDriftPct', pct: Math.round(pct), recorded: recordedBodyLen, observed: observedBodyLen });
+        if (recordedBodyLen >= MIN_COMPARABLE_BODY_BYTES && observedBodyLen > 0) {
+            const absDelta = Math.abs(observedBodyLen - recordedBodyLen);
+            const pct = absDelta / recordedBodyLen * 100;
+            if (pct > thresholdPct && absDelta >= DEFAULT_MIN_DRIFT_BYTES) {
+                issues.push({ kind: 'lengthDriftPct', pct: Math.round(pct), absDelta, recorded: recordedBodyLen, observed: observedBodyLen });
+            }
         }
         if (recordedShape && observedShape && recordedShape !== observedShape) issues.push({ kind: 'shapeDiff', recorded: recordedShape, observed: observedShape });
         if (issues.length) drift.push({ index: i, sampler: `${row.method} ${row.recordedUrl}`, issues });

@@ -42,6 +42,7 @@ const { propagateGraphqlCsrfTokens } = require('../src/graphql-auth-repair');
 const correlationHypotheses = require('../src/correlation-hypotheses');
 const { writeHtmlReport: writeHtmlReportFn } = require('../src/report');
 const volatileProtocol = require('../src/volatile-protocol');
+const pkceModule = require('../src/pkce');
 const blueprintContext = require('../src/blueprint-context');
 const failureClassifier = require('../src/failure-classifier');
 const blueprintAgent = require('../src/blueprint-agent');
@@ -135,6 +136,40 @@ test('parameterization: user-input fields become a CSV Data Set + ${var} substit
     const jmx = fs.readFileSync(gen.jmxPath, 'utf8');
     assert.match(jmx, /\$\{username\}/, 'JMX should substitute ${username}');
     assert.match(jmx, /CSVDataSet/, 'JMX should contain a CSV Data Set');
+});
+
+test('parameterization: credential CSV rows keep recorded login values unless user supplies a credential pool', () => {
+    const { entries, pages } = parse(har([
+        entry('POST', 'https://stglogin.webpt.com/u/login/identifier', {
+            reqHeaders: [{ name: 'Content-Type', value: 'application/x-www-form-urlencoded' }],
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'username=Performance_STG_0047' },
+        }),
+        entry('POST', 'https://stglogin.webpt.com/u/login/password', {
+            reqHeaders: [{ name: 'Content-Type', value: 'application/x-www-form-urlencoded' }],
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'password=password1!' },
+        }),
+    ]));
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'scheduled-visits', { dataRows: 4 });
+    const rows = fs.readFileSync(path.join(out, gen.csvFile), 'utf8').trim().split(/\r?\n/).map(line => line.split('|'));
+    const header = rows[0];
+    const usernameCol = header.indexOf('username');
+    const passwordCol = header.indexOf('password');
+
+    assert.ok(usernameCol >= 0, 'username stays parameterized');
+    assert.ok(passwordCol >= 0, 'password stays parameterized');
+    assert.deepStrictEqual(rows.slice(1).map(row => row[usernameCol]), [
+        'Performance_STG_0047',
+        'Performance_STG_0047',
+        'Performance_STG_0047',
+        'Performance_STG_0047',
+    ]);
+    assert.deepStrictEqual(rows.slice(1).map(row => row[passwordCol]), [
+        'password1!',
+        'password1!',
+        'password1!',
+        'password1!',
+    ]);
 });
 
 test('ghost sources: client-minted values are detected + reported', () => {
@@ -265,6 +300,21 @@ test('PE naming: builds spreadsheet-style transaction and request labels with st
     assert.strictEqual(model.labelByIndex.get(2).originalLabel, 'Step 03 - GET /patientChart.php');
 });
 
+test('PE naming: configured transaction names override default generated names in order', () => {
+    const model = peNaming.buildPeNamingModel({
+        flowName: 'scheduled visits',
+        transactionNames: ['Launch Login', '90 Days Search'],
+        entries: [
+            entry('GET', 'https://app.test/'),
+            entry('POST', 'https://app.test/u/login/password'),
+            entry('POST', 'https://app.test/scheduler/index/data/T/d'),
+        ],
+    });
+
+    assert.strictEqual(model.groups[0].transactionLabel, 'SC01_T01_Launch_Login');
+    assert.strictEqual(model.groups[1].transactionLabel, 'SC01_T02_90_Days_Search');
+});
+
 test('PE naming: generated JMX uses prefixed sampler labels and writes label map', () => {
     const { entries, pages } = parse(har([
         entry('GET', 'https://app.test/authorization/'),
@@ -314,6 +364,7 @@ test('output organizer: creates compatibility subfolders and manifest without re
     fs.writeFileSync(path.join(out, 'demo_report.html'), '<!doctype html>');
     fs.writeFileSync(path.join(out, 'final.jtl'), '<testResults/>');
     fs.writeFileSync(path.join(out, 'demo_label_map.json'), '{"requests":[]}');
+    fs.writeFileSync(path.join(out, 'demo_data.csv'), 'username|password\nuser1|pass1\n');
 
     const manifest = outputOrganizer.organizeOutput({
         outDir: out,
@@ -329,9 +380,12 @@ test('output organizer: creates compatibility subfolders and manifest without re
     assert.ok(fs.existsSync(path.join(out, 'reports', 'demo_report.html')));
     assert.ok(fs.existsSync(path.join(out, 'results', 'final.jtl')));
     assert.ok(fs.existsSync(path.join(out, 'evidence', 'demo_label_map.json')));
+    assert.ok(fs.existsSync(path.join(out, 'data', 'demo_data.csv')));
     assert.ok(fs.existsSync(path.join(out, 'output_manifest.json')));
     assert.strictEqual(manifest.verdict, 'GREEN');
     assert.strictEqual(manifest.whatToOpen.finalJmx, 'scripts/00_USE_THIS_FINAL_VALIDATED_demo.jmx');
+    assert.strictEqual(manifest.whatToOpen.dataCsv, 'data/demo_data.csv');
+    assert.match(fs.readFileSync(path.join(out, '00_OUTPUT_INDEX.md'), 'utf8'), /Data CSV: data\/demo_data\.csv/);
 });
 
 test('LLM escalation: clean no-op without a Gemini key', async () => {
@@ -360,6 +414,79 @@ test('LLM escalation: unresolved protected failures are included even without fa
     assert.strictEqual(failures.length, 1);
     assert.strictEqual(failures[0].samplerName, 'Step 05 - GET /u/login/identifier');
     assert.match(failures[0].failureMessage, /Compare the request body/);
+});
+
+test('runner samples inherit transaction names for failure reporting', () => {
+    const result = {
+        samples: [
+            { label: 'SC01_T02_Scheduled Visits', isTransaction: true, success: false },
+            { label: 'SC01_T02_/authorize/resume-011', isTransaction: false, success: false, responseCode: '401' },
+            { label: 'SC01_T03_Logout', isTransaction: true, success: false },
+            { label: 'SC01_T03_/logout-099', isTransaction: false, success: false, responseCode: '500' },
+        ],
+    };
+
+    runnerInternal.annotateSamplesWithTransactions(result);
+
+    assert.strictEqual(result.samples[1].transactionName, 'SC01_T02_Scheduled Visits');
+    assert.strictEqual(result.samples[3].transactionName, 'SC01_T03_Logout');
+});
+
+test('runner ignores logout-only failures but preserves mixed real failures', () => {
+    const logoutOnly = {
+        success: false,
+        failureMessage: 'logout failed',
+        samples: [
+            { label: 'SC01_T09_Logout', isTransaction: true, success: false },
+            { label: 'SC01_T09_/v2/logout-120', transactionName: 'SC01_T09_Logout', isTransaction: false, success: false, responseCode: '500' },
+        ],
+        unresolvedFailures: [{ samplerLabel: 'SC01_T09_/v2/logout-120', issue: 'server error' }],
+    };
+    runnerInternal.ignoreLogoutOnlyFailures(logoutOnly);
+
+    assert.strictEqual(logoutOnly.success, true);
+    assert.strictEqual(logoutOnly.samples[1].success, true);
+    assert.strictEqual(logoutOnly.samples[1].ignoredFailure, true);
+    assert.deepStrictEqual(logoutOnly.unresolvedFailures, []);
+
+    const mixed = {
+        success: false,
+        samples: [
+            { label: 'SC01_T02_/scheduler/index/data/T/d-044', isTransaction: false, success: false, responseCode: '401' },
+            { label: 'SC01_T09_/logout-120', isTransaction: false, success: false, responseCode: '500' },
+        ],
+    };
+    runnerInternal.ignoreLogoutOnlyFailures(mixed);
+
+    assert.strictEqual(mixed.success, false);
+    assert.strictEqual(mixed.samples[1].success, false);
+});
+
+test('runner treats status-root-cause drift as warning when downstream proof is logout-only', () => {
+    const entries = [
+        entry('GET', 'https://stgapp.webpt.com/', { status: 302, body: '' }),
+        entry('GET', 'https://stglogin.webpt.com/authorize/resume', { status: 302, body: '' }),
+    ];
+    const result = {
+        success: true,
+        samples: [
+            { label: 'SC01_T01_GET_/-001', isTransaction: false, success: true, code: '200' },
+            {
+                label: 'SC01_T09_/authorize/resume-011',
+                transactionName: 'SC01_T09_Scheduled_Visits_Logout',
+                isTransaction: false,
+                success: false,
+                code: '401',
+                responseCode: '401',
+            },
+        ],
+    };
+
+    runnerInternal.applyStatusRootCauseToResult(result, entries);
+
+    assert.strictEqual(result.success, true);
+    assert.ok(result.statusRootCauseWarning);
+    assert.ok(!result.recordingDriftFailure);
 });
 
 test('AI fix prompt: senior performance engineer rules and safe patch schema only', () => {
@@ -938,6 +1065,27 @@ test('playbooks: protectedCalls carry app-specific business nouns (de-WebPT the 
     assert.ok(!dec || dec.category !== 'unknown', 'universal verb still protects');
 });
 
+test('playbooks: domain packs (salesforce/servicenow/sap/banking/ecommerce) match evidence and add protection + notes', () => {
+    const { applyPlaybooks } = require('../src/playbooks');
+    const cases = [
+        { id: 'salesforce', url: 'https://na1.my.salesforce.com/services/data/v58.0/query', signals: [], protect: '/services/data/' },
+        { id: 'servicenow', url: 'https://acme.service-now.com/api/now/table/incident', signals: [], protect: '/api/now/' },
+        { id: 'sap', url: 'https://s4.hana.ondemand.com/sap/opu/odata/SD/SALESORDER', signals: ['odata'], protect: '/sap/opu/odata/' },
+        { id: 'banking-generic', url: 'https://bank.example.com/api/transfer', signals: [], protect: '/transfer' },
+        { id: 'ecommerce-generic', url: 'https://shop.example.com/checkout', signals: [], protect: '/checkout' },
+    ];
+    for (const c of cases) {
+        const entries = [{ request: { method: 'POST', url: c.url, headers: [] }, response: { status: 200, headers: [], content: { text: '' } } }];
+        const out = applyPlaybooks({ entries, fingerprintSignals: c.signals.map(s => ({ stack: s })), runCfg: {} });
+        assert.ok(out.applied.some(p => p.id === c.id), `${c.id} playbook matched by evidence`);
+        assert.ok(out.runCfg.protectedCalls.includes(c.protect), `${c.id} protects ${c.protect}`);
+        assert.ok((out.runCfg.llmFlowNotes || []).length > 0, `${c.id} contributes senior-PE flow notes`);
+    }
+    // A generic unrelated app never picks up any domain pack.
+    const none = applyPlaybooks({ entries: [{ request: { method: 'GET', url: 'https://plain.example.com/home', headers: [] }, response: { status: 200, headers: [], content: { text: '' } } }], fingerprintSignals: [], runCfg: {} });
+    for (const c of cases) assert.ok(!none.applied.some(p => p.id === c.id), `${c.id} does not fire on an unrelated app`);
+});
+
 test('adjudicator: every decision declares its evidence tier', () => {
     const { adjudicateRequests } = require('../src/post-run-adjudicator');
     const entries = [
@@ -1010,6 +1158,37 @@ test('operator disable is ABSOLUTE: session-like priors cannot veto run.disableC
     const sampler2 = xml2.match(/<HTTPSamplerProxy\b[^>]*testname="[^"]*authorize[^"]*"[^>]*>/);
     assert.match(sampler2[0], /enabled="true"/, 'operator protect outranks operator disable');
     assert.ok(gen2.reasoning.some(r => r.phase === 'disable-calls-conflict'), 'conflict surfaced in reasoning');
+});
+
+test('operator disable cannot remove token-bearing interceptor session handoff without unsafe override', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/home'),
+        entry('POST', 'https://app.test/s/interceptor', {
+            postData: { mimeType: 'application/x-www-form-urlencoded', params: [{ name: 'token', value: 'RECORDED_TOKEN' }] },
+            headers: [{ name: 'Content-Type', value: 'application/x-www-form-urlencoded' }],
+            status: 302,
+        }),
+        entry('GET', 'https://app.test/dashboard'),
+    ]));
+
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'token-interceptor', {
+        runCfg: { disableCalls: ['/s/interceptor'] },
+    });
+    const xml = fs.readFileSync(gen.jmxPath, 'utf8');
+    const sampler = xml.match(/<HTTPSamplerProxy\b[^>]*testname="[^"]*interceptor[^"]*"[^>]*>/);
+
+    assert.ok(sampler, 'interceptor sampler exists');
+    assert.match(sampler[0], /enabled="true"/, 'token-bearing interceptor stays enabled');
+    assert.ok(gen.reasoning.some(r => r.phase === 'disable-calls-conflict' && /allowUnsafeDisableProtected/i.test(JSON.stringify(r))));
+
+    const unsafeOut = tmp();
+    const unsafe = generate(entries, pages, unsafeOut, 'token-interceptor-unsafe', {
+        runCfg: { disableCalls: ['/s/interceptor'], allowUnsafeDisableProtected: true },
+    });
+    const unsafeXml = fs.readFileSync(unsafe.jmxPath, 'utf8');
+    const unsafeSampler = unsafeXml.match(/<HTTPSamplerProxy\b[^>]*testname="[^"]*interceptor[^"]*"[^>]*>/);
+    assert.match(unsafeSampler[0], /enabled="false"/, 'unsafe override explicitly allows the disable');
 });
 
 test('business guard: never protects operator-disabled samplers or proven duplicate hops', () => {
@@ -1214,6 +1393,71 @@ test('learning store: saves only verified safe lessons and finds matching failur
     });
     assert.strictEqual(matches.length, 1);
     assert.deepStrictEqual(matches[0].fix, { kind: 'setSamplerEnabled', sampler: 'Step 99 - GET /avatar/other', enabled: false });
+});
+
+test('learning store: host-scoped lesson does not fire on a different app host', () => {
+    const dir = tmp();
+    const storePath = path.join(dir, 'lessons.json');
+    learningStore.learnFromRun({
+        storePath,
+        flowName: 'bankA',
+        sourceRun: 'green',
+        appHost: 'https://bank-a.example.com',
+        result: { success: true, samples: [{ isTransaction: false, success: true }] },
+        fixes: [{ kind: 'setSamplerEnabled', sampler: 'Step 01 - GET /api/accounts', enabled: false }],
+    });
+    // Same URL shape, DIFFERENT host + known appHost -> host-scoped lesson must not match.
+    const otherHost = learningStore.findMatchingLessons({
+        storePath,
+        failures: [{ samplerName: 'Step 07 - GET /api/accounts', responseCode: '500' }],
+        appHost: 'https://bank-b.example.com',
+    });
+    assert.strictEqual(otherHost.length, 0);
+    // Same host -> matches.
+    const sameHost = learningStore.findMatchingLessons({
+        storePath,
+        failures: [{ samplerName: 'Step 07 - GET /api/accounts', responseCode: '500' }],
+        appHost: 'https://bank-a.example.com',
+    });
+    assert.strictEqual(sameHost.length, 1);
+});
+
+test('learning store: redacted replaceValueWithVar lesson is not offered as a broken no-op patch', () => {
+    const dir = tmp();
+    const storePath = path.join(dir, 'lessons.json');
+    learningStore.learnFromRun({
+        storePath,
+        flowName: 'demo',
+        sourceRun: 'green',
+        result: { success: true, samples: [{ isTransaction: false, success: true }] },
+        fixes: [{ kind: 'replaceValueWithVar', sampler: 'Step 02 - GET /me', value: 'abc123def456', variable: 'session_id' }],
+    });
+    // The literal is redacted on disk (security); it must therefore be skipped
+    // at match time rather than emitting a '[REDACTED_VALUE]' find-and-replace.
+    const matches = learningStore.findMatchingLessons({
+        storePath,
+        failures: [{ samplerName: 'Step 02 - GET /me', responseCode: '401' }],
+    });
+    assert.strictEqual(matches.length, 0);
+});
+
+test('learning store: penalizeLessons decays confidence of a lesson that failed to green', () => {
+    const dir = tmp();
+    const storePath = path.join(dir, 'lessons.json');
+    const learned = learningStore.learnFromRun({
+        storePath,
+        flowName: 'demo',
+        sourceRun: 'green',
+        result: { success: true, samples: [{ isTransaction: false, success: true }] },
+        fixes: [{ kind: 'setSamplerEnabled', sampler: 'Step 01 - GET /avatar/a3bd', enabled: false }],
+    });
+    const id = learned.learned[0].id;
+    const before = learningStore.loadLessons(storePath).find(l => l.id === id).confidence;
+    const res = learningStore.penalizeLessons({ storePath, lessonIds: [id] });
+    assert.strictEqual(res.penalized.length, 1);
+    const after = learningStore.loadLessons(storePath).find(l => l.id === id);
+    assert.ok(after.confidence < before);
+    assert.strictEqual(after.failureCount, 1);
 });
 
 test('learning store: exports and imports sanitized team bundles', () => {
@@ -1673,6 +1917,12 @@ test('UI run modes map to the expected CLI flags', () => {
 test('UI run requests include selected inputs and rerun controls as CLI flags', () => {
     const { flagsForRunRequest } = require('../src/ui-run-mode');
 
+    assert.ok(flagsForRunRequest({
+        mode: 'agent',
+        selectedInputs: ['orders'],
+        runSelected: true,
+    }).includes('--force'), 'Run selected always forces selected inputs to execute');
+
     assert.deepStrictEqual(flagsForRunRequest({
         mode: 'agent',
         selectedInputs: ['orders', 'login.jmx'],
@@ -1705,6 +1955,7 @@ test('UI config: round-trips senior PE context without dropping existing keys', 
         testObjective: 'checkout capacity',
         techStack: 'React + Spring Boot + OAuth',
         domainNotes: 'Orders must be unique and cleanup is required.',
+        transactionNames: 'Launch Login\n90 Days Search\nLogout',
         slo: { p95Ms: '750', errorRatePct: '1' },
         seniorMode: 'mature',
     });
@@ -1715,11 +1966,13 @@ test('UI config: round-trips senior PE context without dropping existing keys', 
     assert.strictEqual(updated.run.testObjective, 'checkout capacity');
     assert.deepStrictEqual(updated.run.techStack, ['React', 'Spring Boot', 'OAuth']);
     assert.deepStrictEqual(updated.run.domainNotes, ['Orders must be unique and cleanup is required.']);
+    assert.deepStrictEqual(updated.run.transactionNames, ['Launch Login', '90 Days Search', 'Logout']);
     assert.deepStrictEqual(updated.run.slo, { p95Ms: 750, errorRatePct: 1 });
     assert.strictEqual(updated.agent.seniorMode, 'mature');
     assert.strictEqual(ui.testObjective, 'checkout capacity');
     assert.strictEqual(ui.techStack, 'React, Spring Boot, OAuth');
     assert.strictEqual(ui.domainNotes, 'Orders must be unique and cleanup is required.');
+    assert.strictEqual(ui.transactionNames, 'Launch Login\n90 Days Search\nLogout');
     assert.strictEqual(ui.slo.p95Ms, 750);
 });
 
@@ -1813,6 +2066,97 @@ test('java-safe JMX sanitizer also strips JSR223 blocks with explicit empty hash
     assert.strictEqual(out.changed, true);
     assert.strictEqual(out.removed.length, 1);
     assert.ok(!out.xml.includes('JSR223PreProcessor'));
+});
+
+test('java-safe JMX sanitizer also strips legacy BeanShell pre/post processors', () => {
+    const xml = `<jmeterTestPlan><hashTree>
+        <BeanShellPreProcessor testname="bsh pre" enabled="true">
+          <stringProp name="script">vars.put("x","1");</stringProp>
+        </BeanShellPreProcessor>
+        <hashTree/>
+        <HTTPSamplerProxy testname="keep me"></HTTPSamplerProxy>
+        <hashTree/>
+        <BeanShellPostProcessor testname="bsh post" enabled="true">
+          <stringProp name="script">log.info("y");</stringProp>
+        </BeanShellPostProcessor>
+        <hashTree/>
+      </hashTree></jmeterTestPlan>`;
+    const out = sanitizeJavaUnsafeJmx(xml);
+    assert.strictEqual(out.changed, true);
+    assert.strictEqual(out.removed.length, 2);
+    assert.ok(!out.xml.includes('BeanShellPreProcessor'));
+    assert.ok(!out.xml.includes('BeanShellPostProcessor'));
+    assert.match(out.xml, /keep me/);
+});
+
+test('fast-repair extractJsonPath: supports array index + bracket/quoted keys', () => {
+    const xjp = fastRepairLoop._internal.extractJsonPath;
+    const body = JSON.stringify({ data: { items: [{ id: 'A1' }, { id: 'B2' }], meta: { 'x-token': 'tok_9' } }, ok: true });
+    assert.strictEqual(xjp(body, '$.data.items[0].id'), 'A1');
+    assert.strictEqual(xjp(body, '$.data.items[1].id'), 'B2');
+    assert.strictEqual(xjp(body, "$.data.meta['x-token']"), 'tok_9');
+    assert.strictEqual(xjp(body, '$..x-token'), 'tok_9');
+    assert.strictEqual(xjp(body, '$.does.not.exist'), null);
+});
+
+test('GraphQL auth repair: broadened path + token name (/api/graphql, _csrf, x-xsrf-token)', () => {
+    const gql = (name, path, tokenKey, headerName, headerValue) => `
+      <HTTPSamplerProxy testname="GraphQL ${name}">
+        <stringProp name="HTTPSampler.path">${path}</stringProp>
+        <stringProp name="GraphQLHTTPSampler.operationName">${name}</stringProp>
+        <stringProp name="q">mutation ${name} { ${name} { ${tokenKey} } }</stringProp>
+        ${headerName ? `<elementProp name="h" elementType="Header"><stringProp name="Header.name">${headerName}</stringProp><stringProp name="Header.value">${headerValue}</stringProp></elementProp>` : ''}
+      </HTTPSamplerProxy>
+      <hashTree/>`;
+    const jmx = `<jmeterTestPlan><hashTree>
+      ${gql('Login', '/api/graphql', '_csrf', null, null)}
+      ${gql('DoThing', '/api/graphql', '_csrf', 'x-xsrf-token', 'recorded-csrf-123')}
+    </hashTree></jmeterTestPlan>`;
+    const repaired = propagateGraphqlCsrfTokens(jmx);
+    assert.strictEqual(repaired.substitutions, 1);
+    assert.strictEqual(repaired.extractors, 1);
+    assert.match(repaired.xml, /JSONPostProcessor\.referenceNames">gql_Login_csrf</);
+    assert.match(repaired.xml, /jsonPathExprs">\$\.\._csrf</);
+    assert.match(repaired.xml, /Header\.value">\$\{gql_Login_csrf\}</);
+    assert.doesNotMatch(repaired.xml, /recorded-csrf-123/);
+});
+
+test('pkce: plain method is native-safe, S256 is flagged as an unresolved requirement', () => {
+    const plain = pkceModule.analyzePkce([
+        { request: { url: 'https://idp.example.com/authorize?client_id=x&code_challenge=abc&code_challenge_method=plain' } },
+        { request: { url: 'https://idp.example.com/oauth2/token', postData: { text: 'grant_type=authorization_code&code_verifier=abc' } } },
+    ]);
+    assert.strictEqual(plain.present, true);
+    assert.strictEqual(plain.method, 'PLAIN');
+    assert.strictEqual(plain.nativeSafe, true);
+    assert.ok(plain.note);
+
+    const s256 = pkceModule.analyzePkce([
+        { request: { url: 'https://idp.example.com/authorize?client_id=x&code_challenge=abc&code_challenge_method=S256' } },
+    ]);
+    assert.strictEqual(s256.method, 'S256');
+    assert.strictEqual(s256.nativeSafe, false);
+    assert.strictEqual(s256.blocker.requirement, 'oauth_pkce_s256');
+
+    assert.strictEqual(pkceModule.analyzePkce([{ request: { url: 'https://app/x' } }]).present, false);
+});
+
+test('senior PE: static config params get static_config role, not user_test_input', () => {
+    const ledger = seniorPe._internal.buildValueLedger({
+        parameterCandidates: [
+            { name: 'api_version', value: 'v2', location: 'query' },
+            { name: 'locale', value: 'en-US', location: 'query' },
+            { name: 'username', value: 'alice@example.com', location: 'body' },
+        ],
+        objective: { value: 'business_load' },
+    });
+    const byName = Object.fromEntries(ledger.map(v => [v.name, v]));
+    assert.strictEqual(byName.api_version.role, 'static_config');
+    assert.strictEqual(byName.api_version.decision, 'keep_static_literal');
+    assert.strictEqual(byName.locale.role, 'static_config');
+    assert.strictEqual(byName.username.role, 'user_test_input');
+    assert.strictEqual(seniorPe._internal.isStaticConfigName('tenant_id'), true);
+    assert.strictEqual(seniorPe._internal.isStaticConfigName('order_total'), false);
 });
 
 test('generate: shipped JMX is Java-safe for manual JMeter runs', () => {
@@ -2619,6 +2963,85 @@ test('status analysis: recording-first status semantics explain 2xx, 3xx, 4xx, a
     assert.strictEqual(statusAnalysis.classifyStatusTransition(200, 500).category, 'server_error_after_replay_request');
 });
 
+test('status analysis: lenient success drift folds 200->201 async-create only when opted in', () => {
+    // Default (strict, recording-first) still flags it — preserves the senior-PE principle.
+    assert.strictEqual(statusAnalysis.classifyStatusTransition(200, 201).category, 'success_code_drift');
+    // With run.strictStatusMatch=false, a create returning 201 where recording had 200 is tolerated.
+    const lenient = statusAnalysis.classifyStatusTransition(200, 201, { lenientSuccessDrift: true });
+    assert.strictEqual(lenient.folded, true);
+    assert.strictEqual(lenient.category, 'success_code_drift_tolerated');
+    // Lenient does NOT excuse a real failure (200 -> 401 is still auth drift).
+    assert.strictEqual(
+        statusAnalysis.classifyStatusTransition(200, 401, { lenientSuccessDrift: true }).category,
+        'auth_or_session_correlation_failed'
+    );
+});
+
+test('final green gate: a 200 body carrying a GraphQL/soft-failure error fails the gate (no false green)', () => {
+    const evidence = {
+        rows: [
+            {
+                entryIndex: 0, label: 'Step 01 - POST /graphql', isTransaction: false,
+                observedStatus: 200, success: true,
+                recordedBodyLength: 40, observedBodyLength: 60,
+                recordedBody: '{"data":{"me":{"id":1}}}',
+                observedBody: '{"data":null,"errors":[{"message":"Session Expired"}]}',
+                entry: { response: { status: 200 } },
+            },
+        ],
+    };
+    const gate = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence });
+    assert.strictEqual(gate.ok, false);
+    assert.ok(gate.categories.includes('business_error_in_body'));
+});
+
+test('final green gate: operator soft-failure pattern extends the built-in body scan', () => {
+    const evidence = {
+        rows: [{
+            entryIndex: 0, label: 'Step 01 - GET /account', isTransaction: false,
+            observedStatus: 200, success: true, recordedBodyLength: 10, observedBodyLength: 30,
+            recordedBody: '{"ok":true}', observedBody: '{"code":"ACCT_LOCKED"}',
+            entry: { response: { status: 200 } },
+        }],
+    };
+    const clean = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence });
+    assert.strictEqual(clean.ok, true); // ACCT_LOCKED is not a built-in marker
+    const strict = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence, softFailurePatterns: ['ACCT_LOCKED'] });
+    assert.strictEqual(strict.ok, false);
+});
+
+test('runner: body-capture properties default to onError, honor off/full + byte cap', () => {
+    const off = runnerInternal.bodyCaptureProperties({ captureResponseBodies: 'off' });
+    assert.strictEqual(off['jmeter.save.saveservice.response_data'], 'false');
+    assert.strictEqual(off['jmeter.save.saveservice.response_data.on_error'], 'false');
+    assert.ok(!('httpsampler.max_bytes_to_store_per_sample' in off));
+
+    const def = runnerInternal.bodyCaptureProperties({});
+    assert.strictEqual(def['jmeter.save.saveservice.response_data'], 'false');
+    assert.strictEqual(def['jmeter.save.saveservice.response_data.on_error'], 'true');
+    assert.strictEqual(def['httpsampler.max_bytes_to_store_per_sample'], '65536');
+
+    const full = runnerInternal.bodyCaptureProperties({ captureResponseBodies: 'full', maxResponseBytes: 8192 });
+    assert.strictEqual(full['jmeter.save.saveservice.response_data'], 'true');
+    assert.strictEqual(full['httpsampler.max_bytes_to_store_per_sample'], '8192');
+});
+
+test('final green gate: assertion-free script is a warning by default, hard fail under requireAssertions', () => {
+    const base = { result: { success: true }, baselineDiff: null, evidence: null };
+    const warn = finalGreenGate.evaluateFinalGreenGate({ ...base, assertionsPlanned: 0 });
+    assert.strictEqual(warn.ok, true);
+    assert.ok(warn.warnings.some(w => w.category === 'no_assertion_coverage'));
+
+    const strict = finalGreenGate.evaluateFinalGreenGate({ ...base, assertionsPlanned: 0, requireAssertions: true });
+    assert.strictEqual(strict.ok, false);
+    assert.ok(strict.categories.includes('no_assertion_coverage'));
+
+    // With assertions present, no coverage finding at all.
+    const covered = finalGreenGate.evaluateFinalGreenGate({ ...base, assertionsPlanned: 3, requireAssertions: true });
+    assert.ok(!covered.warnings.some(w => w.category === 'no_assertion_coverage'));
+    assert.ok(!covered.categories.includes('no_assertion_coverage'));
+});
+
 test('status analysis: traces root cause to earliest upstream recording drift before failing sampler', () => {
     const entries = [
         entry('GET', 'https://app.test/auth', { status: 302 }),
@@ -2721,6 +3144,33 @@ test('runner: recording status drift makes an HTTP-success result not green', ()
     assert.strictEqual(result.statusRootCause.rootCause.category, 'success_code_drift');
 });
 
+test('runner: status root cause is surfaced in unresolved failures for reports', () => {
+    const result = runnerInternal.applyStatusRootCauseToResult({
+        success: false,
+        unresolvedFailures: [
+            {
+                samplerLabel: 'Step 03 - POST /scheduler/index/data/T/d',
+                issue: 'session_expired_or_auth_failed',
+                responseCode: '401',
+                manualFixHint: 'Downstream scheduler failed.',
+            },
+        ],
+        samples: [
+            { label: 'Step 01 - GET /', responseCode: '200', success: true, finalUrl: 'https://stglogin.webpt.com/u/login/identifier' },
+            { label: 'Step 03 - POST /scheduler/index/data/T/d', responseCode: '401', success: false },
+        ],
+    }, [
+        entry('GET', 'https://stgapp.webpt.com/', { status: 302 }),
+        entry('GET', 'https://stgapp.webpt.com/dashboard.php'),
+        entry('POST', 'https://stgapp.webpt.com/scheduler/index/data/T/d'),
+    ]);
+
+    assert.strictEqual(result.unresolvedFailures[0].samplerLabel, 'Step 01 - GET /');
+    assert.strictEqual(result.unresolvedFailures[0].issue, 'upstream_recording_divergence');
+    assert.match(result.unresolvedFailures[0].manualFixHint, /earliest upstream divergence/i);
+    assert.strictEqual(result.unresolvedFailures[1].issue, 'cascade_from_Step 01 - GET /');
+});
+
 test('runner: blueprint first failure refreshes from status root cause evidence', () => {
     const ctx = {
         loop: { firstFailure: { category: 'auth_correlation_failed', sampler: 'Step 03 - GET /me' } },
@@ -2783,6 +3233,78 @@ test('final green gate: rejects status drift, semantic drift, and failed busines
     assert.deepStrictEqual(rejected.categories, ['semantic_drift', 'business_verification_failed']);
     assert.strictEqual(rejected.warnings.length, 1);
     assert.strictEqual(rejected.warnings[0].category, 'baseline_drift');
+});
+
+test('final green gate: bodyless auth redirect mismatch is warning unless downstream fails', () => {
+    const start = entry('GET', 'https://stgapp.webpt.com/', { status: 302, body: '' });
+    start.response.content.text = '';
+    const dashboard = entry('GET', 'https://stgapp.webpt.com/dashboard', { status: 200, body: '' });
+    dashboard.response.content.text = '';
+    const cleanEvidence = {
+        rows: [
+            {
+                entryIndex: 0,
+                label: 'SC01_T01_GET_/-001',
+                entry: start,
+                recordedStatus: 302,
+                observedStatus: 200,
+                recordedBodyLength: 0,
+                observedBodyLength: 0,
+                finalUrl: 'https://stglogin.webpt.com/u/login/identifier',
+                sample: { responseCode: '200', success: true, finalUrl: 'https://stglogin.webpt.com/u/login/identifier' },
+            },
+            {
+                entryIndex: 1,
+                label: 'SC01_T01_/dashboard-002',
+                entry: dashboard,
+                recordedStatus: 200,
+                observedStatus: 200,
+                recordedBodyLength: 0,
+                observedBodyLength: 0,
+                sample: { responseCode: '200', success: true },
+            },
+        ],
+    };
+
+    const clean = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence: cleanEvidence });
+    assert.strictEqual(clean.ok, true);
+    assert.ok(clean.warnings.some(w => w.category === 'bodyless_redirect_review'));
+
+    const failingEvidence = {
+        rows: cleanEvidence.rows.map(row => ({ ...row })),
+    };
+    failingEvidence.rows[1] = {
+        ...failingEvidence.rows[1],
+        observedStatus: 401,
+        success: false,
+        transactionName: 'SC01_T02_Login',
+        sample: { responseCode: '401', success: false, transactionName: 'SC01_T02_Login' },
+    };
+
+    const gate = finalGreenGate._internal.evaluateEvidenceGate(failingEvidence);
+    assert.strictEqual(gate.failures.length, 1);
+    assert.match(gate.failures[0].reason, /downstream/i);
+    assert.match(gate.failures[0].reason, /SC01_T02_Login/);
+
+    const logoutEvidence = {
+        rows: cleanEvidence.rows.map(row => ({ ...row })),
+    };
+    logoutEvidence.rows[1] = {
+        ...logoutEvidence.rows[1],
+        label: 'SC01_T09_/authorize/resume-011',
+        observedStatus: 401,
+        success: false,
+        transactionName: 'SC01_T09_Scheduled_Visits_Performance_STG_0061_Logout',
+        sample: {
+            responseCode: '401',
+            success: false,
+            transactionName: 'SC01_T09_Scheduled_Visits_Performance_STG_0061_Logout',
+        },
+    };
+
+    const logoutGate = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence: logoutEvidence });
+    assert.strictEqual(logoutGate.ok, true);
+    assert.ok(logoutGate.warnings.some(w => w.category === 'logout_downstream_ignored'));
 });
 
 test('request diff: identifies stale request values and redirect header drift', () => {
@@ -3151,6 +3673,59 @@ test('post-run adjudicator: unconsumed jwt create-cookie 400 is dead plumbing an
     assert.deepStrictEqual(adjudication.actions.disable.map(item => item.samplerLabel), ['Step 02 - GET /jwt/v2/create-cookie']);
 });
 
+test('post-run adjudicator: failing POST oauth2/token exchange is protected, never folded (PKCE/M2M/banking)', () => {
+    const entries = [
+        entry('POST', 'https://login.example.com/oauth2/token', { status: 200 }),
+        entry('GET', 'https://api.example.com/v1/accounts'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - POST /oauth2/token', responseCode: '401', success: false, finalUrl: 'https://login.example.com/oauth2/token' },
+            { label: 'Step 02 - GET /v1/accounts', responseCode: '401', success: false, finalUrl: 'https://api.example.com/v1/accounts' },
+        ],
+    });
+    // No tracked consumer for the token output — the old fold heuristic would
+    // have disabled it. It must be protected instead.
+    const valueFlow = valueFlowDecisions.classifySamplerDisableDecisions({
+        entries,
+        failures: [{ index: 0, samplerLabel: 'Step 01 - POST /oauth2/token', responseCode: '401' }],
+    });
+    const adjudication = postRunAdjudicator.adjudicateRequests({
+        entries,
+        evidence,
+        valueFlow,
+        failureReport: { samplersToDisable: [{ samplerLabel: 'Step 01 - POST /oauth2/token', responseCode: '401' }] },
+    });
+    assert.strictEqual(adjudication.byIndex[0].action, 'protect');
+    assert.deepStrictEqual(adjudication.actions.disable, []);
+});
+
+test('post-run adjudicator: cross-domain business verbs (checkout/transfer) are protected out of the box', () => {
+    const checkout = entry('POST', 'https://shop.example.com/v2/checkout', { status: 200 });
+    const transfer = entry('POST', 'https://bank.example.com/accounts/transfer', { status: 200 });
+    const entries = [checkout, transfer];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - POST /v2/checkout', responseCode: '500', success: false, finalUrl: 'https://shop.example.com/v2/checkout' },
+            { label: 'Step 02 - POST /accounts/transfer', responseCode: '500', success: false, finalUrl: 'https://bank.example.com/accounts/transfer' },
+        ],
+    });
+    const adjudication = postRunAdjudicator.adjudicateRequests({
+        entries,
+        evidence,
+        failureReport: {
+            samplersToDisable: [
+                { samplerLabel: 'Step 01 - POST /v2/checkout', responseCode: '500' },
+                { samplerLabel: 'Step 02 - POST /accounts/transfer', responseCode: '500' },
+            ],
+        },
+    });
+    assert.strictEqual(adjudication.byIndex[0].action, 'protect');
+    assert.strictEqual(adjudication.byIndex[1].action, 'protect');
+});
+
 test('post-run adjudicator: consumed jwt create-cookie is a protected session producer', () => {
     const jwt = entry('GET', 'https://stgemr.webpt.com/jwt/v2/create-cookie');
     jwt.response.headers = [{ name: 'Set-Cookie', value: 'LOGI_SESS=abc123session; Path=/; HttpOnly' }];
@@ -3253,6 +3828,52 @@ test('post-run adjudicator: interceptor authorize without session material folds
     assert.deepStrictEqual(adjudication.actions.disable.map(item => item.samplerLabel), ['Step 01 - GET /s/interceptor/authorize/']);
 });
 
+test('post-run adjudicator: downstream interceptor authorize still folds under an upstream auth wall', () => {
+    const entries = [
+        entry('GET', 'https://stgadmin.webpt.com/', { status: 302 }),
+        entry('GET', 'https://stgapp.webpt.com/s/interceptor/authorize/', { status: 302 }),
+        entry('POST', 'https://stage-vega-tasks-icon-service.webpt.com/graphql'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /', responseCode: '200', success: true, finalUrl: 'https://stglogin.webpt.com/u/login/identifier' },
+            {
+                label: 'Step 02 - GET /s/interceptor/authorize/',
+                responseCode: '404',
+                success: false,
+                finalUrl: 'https://stgapp.webpt.com/s/interceptor/authorize/',
+                responseHeaders: [{ name: 'Content-Type', value: 'text/html' }],
+            },
+            { label: 'Step 03 - POST /graphql', responseCode: '401', success: false },
+        ],
+    });
+
+    const adjudication = postRunAdjudicator.adjudicateRequests({
+        entries,
+        evidence,
+        valueFlow: {
+            byIndex: {
+                1: {
+                    samplerLabel: 'Step 02 - GET /s/interceptor/authorize/',
+                    consumedOutputCount: 42,
+                    consumerIndexes: [2],
+                },
+            },
+        },
+        failureForensics: {
+            rootCause: { index: 0, sampler: 'Step 01 - GET /', category: 'auth_redirect_bounce', recordedStatus: 302, observedStatus: 200 },
+            redirects: { interactiveAuthWall: true },
+            recommendedAction: { id: 'provide-test-auth-path' },
+        },
+    });
+
+    assert.strictEqual(adjudication.byIndex[0].category, 'auth_wall');
+    assert.strictEqual(adjudication.byIndex[1].category, 'redirect_hop');
+    assert.strictEqual(adjudication.byIndex[1].action, 'disable');
+    assert.deepStrictEqual(adjudication.actions.disable.map(item => item.samplerLabel), ['Step 02 - GET /s/interceptor/authorize/']);
+});
+
 test('post-run adjudicator: downstream scheduler 401 after auth bounce is casualty, not direct repair', () => {
     const entries = [
         entry('GET', 'https://stgadmin.webpt.com/', { status: 302 }),
@@ -3282,6 +3903,107 @@ test('post-run adjudicator: downstream scheduler 401 after auth bounce is casual
     assert.strictEqual(adjudication.byIndex[1].category, 'downstream_casualty');
     assert.strictEqual(adjudication.byIndex[1].action, 'ignore');
     assert.deepStrictEqual(adjudication.actions.disable, []);
+});
+
+test('post-run adjudicator: attempted downstream authorize resume fold is not blocked by value-flow under auth wall', () => {
+    const authorizeResume = entry('GET', 'https://stglogin.webpt.com/authorize/resume?state=stale', { status: 302 });
+    authorizeResume.response.headers = [{ name: 'Set-Cookie', value: 'auth0=recorded-browser-session; Path=/; HttpOnly' }];
+    const entries = [
+        entry('GET', 'https://stgapp.webpt.com/', { status: 302 }),
+        authorizeResume,
+        entry('POST', 'https://stgapp.webpt.com/scheduler/index/data/T/d'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /', responseCode: '200', success: true, finalUrl: 'https://stglogin.webpt.com/u/login/identifier' },
+            { label: 'Step 02 - GET /authorize/resume', responseCode: '401', success: false, finalUrl: 'https://stglogin.webpt.com/authorize/resume?state=stale' },
+            { label: 'Step 03 - POST /scheduler/index/data/T/d', responseCode: '401', success: false, finalUrl: 'https://stgapp.webpt.com/scheduler/index/data/T/d' },
+        ],
+    });
+
+    const filtered = postRunAdjudicator.adjudicateFailureReport({
+        entries,
+        evidence,
+        valueFlow: {
+            byIndex: {
+                1: {
+                    samplerLabel: 'Step 02 - GET /authorize/resume',
+                    consumedOutputCount: 12,
+                    consumerIndexes: [2],
+                },
+            },
+        },
+        failureReport: {
+            samplersToDisable: [
+                { samplerLabel: 'Step 02 - GET /authorize/resume', responseCode: '401', reason: 'engine proposed stale auth hop fold' },
+            ],
+        },
+        failureForensics: {
+            rootCause: { index: 0, sampler: 'Step 01 - GET /', category: 'auth_redirect_bounce', recordedStatus: 302, observedStatus: 200 },
+            redirects: { interactiveAuthWall: true },
+            recommendedAction: { id: 'provide-test-auth-path' },
+        },
+    });
+
+    assert.deepStrictEqual(filtered.blocked, []);
+    assert.deepStrictEqual(filtered.report.samplersToDisable.map(item => item.samplerLabel), ['Step 02 - GET /authorize/resume']);
+    assert.strictEqual(filtered.adjudication.byIndex[1].category, 'redirect_hop');
+    assert.strictEqual(filtered.adjudication.byIndex[1].action, 'disable');
+});
+
+test('post-run adjudicator: attempted downstream token-bearing interceptor posts are protected under auth wall', () => {
+    const firstInterceptor = entry('POST', 'https://stgapp.webpt.com/s/interceptor/?companyId=13629&facilityId=21180', { status: 302 });
+    firstInterceptor.response.headers = [{ name: 'Set-Cookie', value: 'stgapp_webpt_com_sess=recorded; Path=/; HttpOnly' }];
+    const secondInterceptor = entry('POST', 'https://stgapp.webpt.com/s/interceptor/?companyId=7272&facilityId=10354', { status: 302 });
+    secondInterceptor.response.headers = [{ name: 'Set-Cookie', value: 'stgapp_webpt_com_sess=recorded2; Path=/; HttpOnly' }];
+    const entries = [
+        entry('GET', 'https://stgapp.webpt.com/', { status: 302 }),
+        firstInterceptor,
+        entry('GET', 'https://stgapp.webpt.com/dashboard.php'),
+        secondInterceptor,
+        entry('POST', 'https://stgapp.webpt.com/scheduler/index/data/T/d'),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            { label: 'Step 01 - GET /', responseCode: '200', success: true, finalUrl: 'https://stglogin.webpt.com/u/login/identifier' },
+            { label: 'Step 02 - POST /s/interceptor/', responseCode: '401', success: false, finalUrl: 'https://stgapp.webpt.com/s/interceptor/?companyId=13629&facilityId=21180' },
+            { label: 'Step 03 - GET /dashboard.php', responseCode: '401', success: false },
+            { label: 'Step 04 - POST /s/interceptor/', responseCode: '401', success: false, finalUrl: 'https://stgapp.webpt.com/s/interceptor/?companyId=7272&facilityId=10354' },
+            { label: 'Step 05 - POST /scheduler/index/data/T/d', responseCode: '401', success: false },
+        ],
+    });
+
+    const filtered = postRunAdjudicator.adjudicateFailureReport({
+        entries,
+        evidence,
+        valueFlow: {
+            byIndex: {
+                1: { samplerLabel: 'Step 02 - POST /s/interceptor/', consumedOutputCount: 8, consumerIndexes: [2] },
+                3: { samplerLabel: 'Step 04 - POST /s/interceptor/', consumedOutputCount: 8, consumerIndexes: [4] },
+            },
+        },
+        failureReport: {
+            samplersToDisable: [
+                { samplerLabel: 'Step 02 - POST /s/interceptor/', responseCode: '401', reason: 'engine proposed repeated interceptor fold' },
+                { samplerLabel: 'Step 04 - POST /s/interceptor/', responseCode: '401', reason: 'engine proposed repeated interceptor fold' },
+            ],
+        },
+        failureForensics: {
+            rootCause: { index: 0, sampler: 'Step 01 - GET /', category: 'auth_redirect_bounce', recordedStatus: 302, observedStatus: 200 },
+            redirects: { interactiveAuthWall: true },
+            recommendedAction: { id: 'provide-test-auth-path' },
+        },
+    });
+
+    assert.deepStrictEqual(filtered.blocked.map(item => item.samplerLabel), [
+        'Step 02 - POST /s/interceptor/',
+        'Step 04 - POST /s/interceptor/',
+    ]);
+    assert.deepStrictEqual(filtered.report.samplersToDisable, []);
+    assert.strictEqual(filtered.adjudication.byIndex[1].category, 'blocked_disable');
+    assert.strictEqual(filtered.adjudication.byIndex[3].category, 'blocked_disable');
 });
 
 test('runner adjudication filter adds proven disables and blocks protected producers', () => {
@@ -4347,6 +5069,37 @@ test('baseline diff compares responseData from folded redirect children', () => 
     assert.ok(diff.drift.some(d => d.index === 0 && d.issues.some(i => i.kind === 'lengthDriftPct')));
 });
 
+test('baseline diff: tiny-body percentage swings are NOT flagged (adaptive absolute floor)', () => {
+    const out = tmp();
+    const iter = path.join(out, 'iteration_1');
+    fs.mkdirSync(iter, { recursive: true });
+    // recorded 20B -> observed 40B is +100% but only +20B absolute: noise.
+    fs.writeFileSync(path.join(iter, 'results.jtl'), `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /ping" rc="200" rm="OK" s="true">
+    <responseData class="java.lang.String">{"status":"okokokokokokokok"}</responseData>
+    <java.net.URL>https://app.test/ping</java.net.URL>
+  </httpSample>
+</testResults>`);
+    const flatEntries = [entry('GET', 'https://app.test/ping', { status: 200, body: '{"status":"ok"}' })];
+    const diff = diffRunAgainstRecording({ outDir: out, flatEntries, thresholdPct: 10 });
+    assert.ok(!diff.drift.some(d => d.issues.some(i => i.kind === 'lengthDriftPct')));
+});
+
+test('scrubber: redacts client_secret and PII fields, keeps session/csrf tokens intact', () => {
+    const xml = [
+        '<recording>',
+        '<samplerData>grant_type=authorization_code&amp;client_secret=abc123SECRET&amp;code=keepme</samplerData>',
+        '<samplerData>{"dob":"1990-01-01","csrfToken":"keep-csrf-123"}</samplerData>',
+        '</recording>',
+    ].join('\n');
+    const { xml: out } = scrubRecordingXml(xml);
+    assert.ok(!out.includes('abc123SECRET'));
+    assert.ok(!out.includes('1990-01-01'));
+    assert.ok(out.includes('keep-csrf-123'), 'csrf token must stay intact for correlation');
+    assert.ok(out.includes('keepme'), 'oauth code must stay intact for correlation');
+});
+
 test('baseline diff uses explicit current JTL instead of stale iteration folders', () => {
     const out = tmp();
     const stale = path.join(out, 'iteration_9');
@@ -5024,6 +5777,38 @@ test('LLM patch validator: rejects unsafe variable names before auto-apply', () 
     assert.strictEqual(out.accepted.length, 1);
     assert.strictEqual(out.accepted[0].variable, 'safe_token_1');
     assert.deepStrictEqual(out.rejected.map(r => r.reason), ['invalid_variable', 'invalid_variable']);
+});
+
+test('HTML report: performance summary renders percentiles + SLO scorecard when timing + slo present', () => {
+    const out = tmp();
+    const reportPath = writeHtmlReportFn(out, 'perf', {
+        mode: 'run', verdict: 'GREEN',
+        stats: { samplers: 3 },
+        slo: { p95Ms: 500, errorRatePct: 5 },
+        samples: [
+            { label: 'A', success: true, responseCode: '200', elapsed: 100 },
+            { label: 'B', success: true, responseCode: '200', elapsed: 200 },
+            { label: 'C', success: false, responseCode: '500', elapsed: 900 },
+        ],
+    });
+    const html = fs.readFileSync(reportPath, 'utf8');
+    assert.match(html, /Performance summary/);
+    assert.match(html, /p95 ms/);
+    assert.match(html, /SLO scorecard/);
+    assert.match(html, /Error rate/);
+    assert.match(html, /FAIL/); // p95 (=900) exceeds 500ms target
+});
+
+test('LLM patch validator: rejects malformed regex and JSONPath expressions before auto-apply', () => {
+    const out = validateLlmPatches([
+        { kind: 'addExtractor', sampler: 'Step 01', variable: 'good_re', type: 'regex', regex: 'token=([^&]+)' },
+        { kind: 'addExtractor', sampler: 'Step 02', variable: 'bad_re', type: 'regex', regex: 'token=([' },
+        { kind: 'addExtractor', sampler: 'Step 03', variable: 'good_jp', type: 'json', path: '$.data.items[0].id' },
+        { kind: 'addExtractor', sampler: 'Step 04', variable: 'bad_jp', type: 'json', path: 'data.id' },
+        { kind: 'addExtractor', sampler: 'Step 05', variable: 'unbalanced', type: 'json', path: '$.a[0' },
+    ]);
+    assert.deepStrictEqual(out.accepted.map(f => f.variable).sort(), ['good_jp', 'good_re']);
+    assert.deepStrictEqual(out.rejected.map(r => r.reason).sort(), ['invalid_jsonpath', 'invalid_jsonpath', 'invalid_regex']);
 });
 
 test('HTML report: load profile + correlation table + dual-recording panel render when data is present', () => {

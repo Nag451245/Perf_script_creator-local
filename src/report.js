@@ -62,6 +62,65 @@ function statCard(label, value) {
     return `<div class="card"><div class="num">${esc(value)}</div><div class="lbl">${esc(label)}</div></div>`;
 }
 
+function firstNumeric(...vals) {
+    for (const v of vals) {
+        const n = Number(v);
+        if (Number.isFinite(n)) return n;
+    }
+    return null;
+}
+
+function percentile(sortedAsc, p) {
+    if (!sortedAsc.length) return null;
+    const rank = (p / 100) * (sortedAsc.length - 1);
+    const lo = Math.floor(rank);
+    const hi = Math.ceil(rank);
+    if (lo === hi) return sortedAsc[lo];
+    return Math.round(sortedAsc[lo] + (sortedAsc[hi] - sortedAsc[lo]) * (rank - lo));
+}
+
+// Performance + SLO scorecard. Pass/error rate always render (from success
+// flags); latency percentiles render only when samples carry a numeric elapsed
+// time, so we never fabricate timings. An optional SLO object
+// ({ p95Ms, errorRatePct, avgMs }) is scored PASS/FAIL against the observed run.
+function buildPerformanceSummary(reqs, slo) {
+    if (!reqs || !reqs.length) return '';
+    const total = reqs.length;
+    const passed = reqs.filter(s => s.success).length;
+    const errorRatePct = Math.round(((total - passed) / total) * 1000) / 10;
+    const latencies = reqs
+        .map(s => firstNumeric(s.elapsed, s.time, s.t, s.latency, s.responseTime))
+        .filter(n => n != null && n >= 0)
+        .sort((a, b) => a - b);
+
+    const cells = [statCard('Requests', total), statCard('Pass rate', `${Math.round((passed / total) * 1000) / 10}%`), statCard('Error rate', `${errorRatePct}%`)];
+    let p95 = null; let avg = null;
+    if (latencies.length) {
+        avg = Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length);
+        p95 = percentile(latencies, 95);
+        cells.push(statCard('Avg ms', avg));
+        cells.push(statCard('p90 ms', percentile(latencies, 90)));
+        cells.push(statCard('p95 ms', p95));
+        cells.push(statCard('p99 ms', percentile(latencies, 99)));
+        cells.push(statCard('Max ms', latencies[latencies.length - 1]));
+    }
+
+    let sloRows = '';
+    if (slo && typeof slo === 'object') {
+        const checks = [];
+        if (slo.errorRatePct != null) checks.push(['Error rate', `${errorRatePct}%`, `<= ${slo.errorRatePct}%`, errorRatePct <= Number(slo.errorRatePct)]);
+        if (slo.p95Ms != null && p95 != null) checks.push(['p95 latency', `${p95} ms`, `<= ${slo.p95Ms} ms`, p95 <= Number(slo.p95Ms)]);
+        if (slo.avgMs != null && avg != null) checks.push(['Avg latency', `${avg} ms`, `<= ${slo.avgMs} ms`, avg <= Number(slo.avgMs)]);
+        if (checks.length) {
+            sloRows = `<h3>SLO scorecard</h3><table><thead><tr><th>Objective</th><th>Observed</th><th>Target</th><th>Result</th></tr></thead><tbody>${
+                checks.map(([k, obs, target, ok]) => `<tr class="${ok ? 'ok' : 'bad'}"><td>${esc(k)}</td><td>${esc(obs)}</td><td>${esc(target)}</td><td><span class="badge ${ok ? 'ok' : 'bad'}">${ok ? 'PASS' : 'FAIL'}</span></td></tr>`).join('')
+            }</tbody></table>`;
+        }
+    }
+    const latencyNote = latencies.length ? '' : '<p class="muted">Latency percentiles need per-sample timing; run with response results to populate them.</p>';
+    return `<h2>Performance summary</h2><div class="grid">${cells.join('')}</div>${latencyNote}${sloRows}`;
+}
+
 function firstPresent(...values) {
     return values.find(v => v !== undefined && v !== null && String(v) !== '');
 }
@@ -84,6 +143,7 @@ function writeHtmlReport(outDir, name, data = {}) {
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
     const failures = reqs.filter(s => s.success === false);
+    const performanceSummarySection = buildPerformanceSummary(reqs, data.slo || null);
     const failureForensics = data.failureForensics || readJsonIfExists(path.join(outDir, `${name}_failure_forensics.json`));
     const requestAdjudication = data.requestAdjudication || readJsonIfExists(path.join(outDir, `${name}_request_adjudication.json`));
     const labelMap = data.peNaming || readJsonIfExists(path.join(outDir, `${name}_label_map.json`));
@@ -107,11 +167,12 @@ function writeHtmlReport(outDir, name, data = {}) {
     const reqRows = reqs.length ? reqs.map(s => `
         <tr class="${s.success ? 'ok' : 'bad'}">
             <td>${s.success ? '✓' : '✗'}</td>
+            <td>${esc(firstPresent(s.transactionName, s.transaction, s.parentTransaction, ''))}</td>
             <td>${esc(s.label || s.name || '')}</td>
             <td>${esc(firstPresent(s.responseCode, s.code, s.rc, ''))}</td>
             <td>${esc(decisionForSampler(decisionBySampler, s.label || s.name))}</td>
             <td>${esc(firstPresent(s.responseMessage, s.message, s.failureMessage, ''))}</td>
-        </tr>`).join('') : `<tr><td colspan="5" class="muted">No request results (generate-only, or run did not execute).</td></tr>`;
+        </tr>`).join('') : `<tr><td colspan="6" class="muted">No request results (generate-only, or run did not execute).</td></tr>`;
 
     const businessSection = businessVerification ? `<h2>Business verification</h2>
       <p><span class="badge ${businessVerification.ok ? 'ok' : 'bad'}">${businessVerification.ok ? 'PASSED' : 'NOT VERIFIED'}</span></p>
@@ -310,6 +371,8 @@ function writeHtmlReport(outDir, name, data = {}) {
 
   <div class="grid">${cards}</div>
 
+  ${performanceSummarySection}
+
   ${loadProfileSection}
 
   ${dashLink}
@@ -319,10 +382,10 @@ function writeHtmlReport(outDir, name, data = {}) {
   ${requestAdjudicationSection}
 
   <h2>Request results</h2>
-  <table><thead><tr><th></th><th>Sampler</th><th>Code</th><th>Decision</th><th>Message</th></tr></thead>
+  <table><thead><tr><th></th><th>Transaction</th><th>Sampler</th><th>Code</th><th>Decision</th><th>Message</th></tr></thead>
   <tbody>${reqRows}</tbody></table>
 
-  ${failures.length ? `<h2>Failures (${failures.length})</h2><ul>${failures.map(f => `<li><b>${esc(f.label || f.name)}</b> — ${esc(f.responseCode || '')} ${esc(f.responseMessage || f.failureMessage || '')}</li>`).join('')}</ul>` : ''}
+  ${failures.length ? `<h2>Failures (${failures.length})</h2><ul>${failures.map(f => `<li><b>${esc(f.label || f.name)}</b>${firstPresent(f.transactionName, f.transaction, f.parentTransaction, '') ? ` <span class="muted">in ${esc(firstPresent(f.transactionName, f.transaction, f.parentTransaction, ''))}</span>` : ''} — ${esc(f.responseCode || '')} ${esc(f.responseMessage || f.failureMessage || '')}</li>`).join('')}</ul>` : ''}
 
   ${dualHarSection}
 

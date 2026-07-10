@@ -3,7 +3,7 @@
 const statusAnalysis = require('./status-analysis');
 const peNaming = require('./pe-naming');
 
-const AUTH_PATH_RE = /\/(?:authorize(?:\/resume)?|iam\/callback|redirect|authorization|login|u\/login|oauth|saml|sso)\b/i;
+const AUTH_PATH_RE = /\/(?:authorize(?:\/resume)?|iam\/callback|redirect|authorization|login|logon|u\/login|oauth|oauth2|saml|sso|sessions?|connect\/token|token|protocol\/openid-connect|realms|adfs|wsfed|federation|mfa|otp|2fa|totp|challenge|verify|step-?up|services\/oauth2|frontdoor)\b/i;
 
 function analyzeFailureForensics({
     entries = [],

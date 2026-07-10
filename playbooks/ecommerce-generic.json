@@ -1,0 +1,29 @@
+{
+  "id": "ecommerce-generic",
+  "description": "Generic retail / e-commerce priors. Protects the cart-to-order funnel; only ADDS protection, so it is safe even on a partial path match.",
+  "match": {
+    "pathsAny": ["/cart", "/basket", "/checkout", "/order", "/orders", "/payment", "/pay", "/wishlist", "/inventory", "/product", "/catalog"],
+    "signalsAny": ["ecommerce", "commerce", "hybris", "magento", "shopify", "commercetools", "sfcc"]
+  },
+  "protectedCalls": [
+    "/cart",
+    "/basket",
+    "/checkout",
+    "/order",
+    "/orders",
+    "/payment",
+    "/pay"
+  ],
+  "disableCalls": [],
+  "oauth": {},
+  "llmFlowNotes": [
+    "E-commerce: the cart -> checkout -> order funnel IS the business objective. Never disable add-to-cart, checkout, or order-placement to reach green; a green run must place an order and assert on the order/confirmation id.",
+    "E-commerce: the cart id / basket id is server-issued on the first add-to-cart and consumed by every later cart/checkout call — extract it fresh and substitute it; replaying the recorded cart id operates on a stale/empty cart.",
+    "E-commerce: payment is usually tokenized (PSP token, one-time). If the payment token has no server producer in the recording, flag it — do not fake it; the run needs a sandbox PSP token or a synthesized value per the PSP's known contract.",
+    "E-commerce: SKU, quantity, coupon, and search terms are business inputs — parameterize from CSV, do not correlate."
+  ],
+  "expectations": [
+    "Cart-to-order funnel protected as business calls",
+    "Cart/basket id correlated; payment token limits surfaced honestly"
+  ]
+}

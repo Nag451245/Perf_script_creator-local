@@ -1,6 +1,10 @@
 'use strict';
 
+// Scripting elements that break "Java-safe by default": JSR223 and the legacy
+// BeanShell/BSF pre/post-processors all execute arbitrary code the customer's
+// JMeter may not permit (Groovy engine missing, security manager, etc.).
 const JSR223_BLOCK_RE = /<((?:JSR223)(?:PreProcessor|PostProcessor))\b[^>]*>[\s\S]*?<\/\1>\s*<hashTree\s*(?:\/>|>\s*<\/hashTree>)/g;
+const BEANSHELL_BLOCK_RE = /<((?:BeanShell|BSF)(?:PreProcessor|PostProcessor))\b[^>]*>[\s\S]*?<\/\1>\s*<hashTree\s*(?:\/>|>\s*<\/hashTree>)/g;
 
 function sanitizeJavaUnsafeJmx(xml, opts = {}) {
     const mode = opts.mode || 'strip';
@@ -31,17 +35,20 @@ function findJavaUnsafeJsr223(xml) {
     const blocks = [];
     if (!xml) return blocks;
 
-    for (const match of xml.matchAll(JSR223_BLOCK_RE)) {
-        const body = match[0];
-        blocks.push({
-            type: match[1],
-            testname: attr(body, 'testname') || '',
-            scriptLanguage: prop(body, 'scriptLanguage') || '',
-            start: match.index,
-            end: match.index + body.length,
-        });
+    for (const re of [JSR223_BLOCK_RE, BEANSHELL_BLOCK_RE]) {
+        for (const match of xml.matchAll(re)) {
+            const body = match[0];
+            blocks.push({
+                type: match[1],
+                testname: attr(body, 'testname') || '',
+                scriptLanguage: prop(body, 'scriptLanguage') || '',
+                start: match.index,
+                end: match.index + body.length,
+            });
+        }
     }
-    return blocks;
+    // Reconstruction slices depend on ascending start order across both scanners.
+    return blocks.sort((a, b) => a.start - b.start);
 }
 
 function attr(xml, name) {

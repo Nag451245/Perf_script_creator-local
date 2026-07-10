@@ -22,7 +22,7 @@ function flagsForRunMode(mode) {
 
 function flagsForRunRequest(request = {}) {
     const flags = [...flagsForRunMode(request.mode)];
-    if (request.force) flags.push('--force');
+    if (request.force || request.runSelected) flags.push('--force');
     pushPositiveIntFlag(flags, '--iterations', request.iterations, { max: 6 });
     pushPositiveIntFlag(flags, '--retry-failed', request.retryFailed);
     // AI assist: off by default (cost). 'on' or 'pro' enables paid LLM.

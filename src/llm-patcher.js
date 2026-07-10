@@ -113,6 +113,15 @@ function validateOne(raw) {
         if (raw.type === 'css' && !raw.selector) {
             return { ok: false, rejected: { reason: 'missing_field', kind, field: 'selector', raw } };
         }
+        // Validate the extractor EXPRESSION now, so a malformed regex/JSONPath is
+        // rejected here instead of silently extracting nothing (or throwing) at
+        // JMeter runtime and burning a full validation cycle.
+        if (raw.type === 'regex' && !isValidRegex(raw.regex)) {
+            return { ok: false, rejected: { reason: 'invalid_regex', kind, regex: raw.regex, raw } };
+        }
+        if (raw.type === 'json' && !isPlausibleJsonPath(raw.path)) {
+            return { ok: false, rejected: { reason: 'invalid_jsonpath', kind, path: raw.path, raw } };
+        }
     }
 
     if (kind === 'setSamplerEnabled' && typeof raw.enabled !== 'boolean') {
@@ -125,6 +134,26 @@ function validateOne(raw) {
 function isSafeVariableName(name) {
     const s = String(name || '');
     return /^[A-Za-z_][A-Za-z0-9_]*$/.test(s) && !s.startsWith('__');
+}
+
+function isValidRegex(pattern) {
+    const s = String(pattern == null ? '' : pattern);
+    if (!s) return false;
+    try { new RegExp(s); return true; } catch { return false; }
+}
+
+// JMeter JSONPath: must start with '$' and have balanced brackets. We don't
+// fully parse JSONPath, but we reject the obvious breakage (no root, unbalanced
+// brackets) that yields a runtime no-op extraction.
+function isPlausibleJsonPath(path) {
+    const s = String(path == null ? '' : path).trim();
+    if (!s.startsWith('$')) return false;
+    let depth = 0;
+    for (const ch of s) {
+        if (ch === '[') depth++;
+        else if (ch === ']') { depth--; if (depth < 0) return false; }
+    }
+    return depth === 0;
 }
 
 /**

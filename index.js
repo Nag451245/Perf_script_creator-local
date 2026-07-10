@@ -325,7 +325,7 @@ async function processUnit(unit) {
                 rec(`DONE — verdict=${verdict} · ` +
                     `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
                 rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
-                let reportPath = writeHtmlReport(outDir, name, {
+                const reportPath = writeHtmlReport(outDir, name, {
                     mode: `generate + run (${mode})`, verdict,
                     stats: out.stats, samples: out.result.samples || [],
                     baselineDiff: out.baselineDiff,
@@ -341,28 +341,6 @@ async function processUnit(unit) {
                 });
                 rec(`open ${name}_report.html for a summary`);
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
-                outputOrganizer.organizeOutput({
-                    outDir,
-                    name,
-                    verdict,
-                    finalJmxPath: finalMarker.finalCopyPath,
-                    reportPath,
-                    currentJtlPath: path.join(outDir, 'final.jtl'),
-                });
-                reportPath = writeHtmlReport(outDir, name, {
-                    mode: `generate + run (${mode})`, verdict,
-                    stats: out.stats, samples: out.result.samples || [],
-                    baselineDiff: out.baselineDiff,
-                    memoryMatches: out.memoryMatches || [],
-                    learnedLessons: out.learnedLessons || null,
-                    correlations: out.correlations || [],
-                    dualHar: notes.dualHar || null,
-                    loadProfile: (out.stats && out.stats.loadProfile) || null,
-                    reasoning: out.reasoning || [],
-                    businessVerification: out.businessVerification || null,
-                    disableDecisions: out.disableDecisions || null,
-                    failureForensics: out.failureForensics || null,
-                });
                 outputOrganizer.organizeOutput({
                     outDir,
                     name,
@@ -403,24 +381,8 @@ async function processUnit(unit) {
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
         rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
-        let reportPath = writeHtmlReport(outDir, name, {
-            mode: runAttemptError ? `${DO_AGENT ? 'agent validate' : 'generate + validate'} attempted (${mode})` : `generate only (${mode})`,
-            verdict: runAttemptError ? 'not verified' : 'generated',
-            stats: gen.stats, samples: [],
-            correlations: gen.correlations || [],
-            dualHar: notes.dualHar || null,
-            loadProfile: gen.loadProfile || null,
-            reasoning: gen.reasoning || [],
-        });
         const verdict = runAttemptError ? 'not verified' : 'generated';
-        outputOrganizer.organizeOutput({
-            outDir,
-            name,
-            verdict,
-            finalJmxPath: finalMarker.finalCopyPath,
-            reportPath,
-        });
-        reportPath = writeHtmlReport(outDir, name, {
+        const reportPath = writeHtmlReport(outDir, name, {
             mode: runAttemptError ? `${DO_AGENT ? 'agent validate' : 'generate + validate'} attempted (${mode})` : `generate only (${mode})`,
             verdict,
             stats: gen.stats, samples: [],

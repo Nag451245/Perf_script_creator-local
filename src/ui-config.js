@@ -34,6 +34,7 @@ function readConfigForUiObject(config = {}) {
         testObjective: run.testObjective || '',
         techStack: listToText(run.techStack),
         domainNotes: listToText(run.domainNotes),
+        transactionNames: listToText(run.transactionNames, { separator: '\n' }),
         slo: { p95Ms: slo.p95Ms || '', errorRatePct: slo.errorRatePct || '' },
         seniorMode: agent.seniorMode || 'strong',
         jmeterHome: config.jmeterHome || '',
@@ -61,6 +62,7 @@ function writeConfigFromUiObject(config = {}, body = {}) {
     if (typeof body.testObjective === 'string') c.run.testObjective = body.testObjective.trim();
     if (body.techStack != null) c.run.techStack = textToList(body.techStack);
     if (body.domainNotes != null) c.run.domainNotes = textToList(body.domainNotes, { splitComma: false });
+    if (body.transactionNames != null) c.run.transactionNames = textToList(body.transactionNames, { splitComma: false });
     if (body.slo && typeof body.slo === 'object') {
         const slo = {};
         putNumber(slo, 'p95Ms', body.slo.p95Ms);
@@ -79,8 +81,8 @@ function textToList(value, { splitComma = true } = {}) {
     return parts.map(v => v.trim()).filter(Boolean);
 }
 
-function listToText(value) {
-    if (Array.isArray(value)) return value.join(', ');
+function listToText(value, { separator = ', ' } = {}) {
+    if (Array.isArray(value)) return value.join(separator);
     return String(value || '');
 }
 

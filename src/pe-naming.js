@@ -14,17 +14,18 @@ const SEGMENTS = {
     general: { name: 'General', semantic: 'TX00_General' },
 };
 
-function buildPeNamingModel({ entries = [], flowName = '', pages = [], scenarioCode = DEFAULT_SCENARIO_CODE } = {}) {
+function buildPeNamingModel({ entries = [], flowName = '', pages = [], scenarioCode = DEFAULT_SCENARIO_CODE, transactionNames = [] } = {}) {
     const flowPrefix = normalizeFlowName(flowName);
     const pageById = new Map((pages || []).map(page => [page.id, page]));
     const groupPlan = buildGroupPlan(entries, pageById);
     const txByKey = new Map();
+    const overrides = normalizeTransactionNames(transactionNames);
     const groups = [];
     const labelByIndex = new Map();
     const requests = [];
 
     for (const group of groupPlan) {
-        const tx = transactionForGroup(group, txByKey, scenarioCode, flowPrefix);
+        const tx = transactionForGroup(group, txByKey, scenarioCode, flowPrefix, overrides);
         groups.push({
             name: tx.transactionLabel,
             type: 'transaction',
@@ -91,11 +92,12 @@ function buildGroupPlan(entries, pageById) {
     return groups.length ? groups : [{ key: 'general', segmentKey: 'general', name: SEGMENTS.general.name, semanticTransactionLabel: SEGMENTS.general.semantic, entries: [] }];
 }
 
-function transactionForGroup(group, txByKey, scenarioCode, flowPrefix) {
+function transactionForGroup(group, txByKey, scenarioCode, flowPrefix, overrides = []) {
     const key = group.key || 'general';
     if (!txByKey.has(key)) {
-        const code = `T${String(txByKey.size + 1).padStart(2, '0')}`;
-        const txName = `${flowPrefix}_${group.name || SEGMENTS.general.name}`;
+        const index = txByKey.size;
+        const code = `T${String(index + 1).padStart(2, '0')}`;
+        const txName = overrides[index] || `${flowPrefix}_${group.name || SEGMENTS.general.name}`;
         txByKey.set(key, {
             transactionCode: code,
             transactionName: txName,
@@ -104,6 +106,15 @@ function transactionForGroup(group, txByKey, scenarioCode, flowPrefix) {
         });
     }
     return txByKey.get(key);
+}
+
+function normalizeTransactionNames(value) {
+    const raw = Array.isArray(value)
+        ? value
+        : String(value || '').split(/\r?\n|[,;]+/);
+    return raw
+        .map(normalizeSegmentName)
+        .filter(Boolean);
 }
 
 function segmentForEntry(entry = {}) {
@@ -240,6 +251,7 @@ module.exports = {
     stepNumberFromLabel,
     _internal: {
         normalizeFlowName,
+        normalizeTransactionNames,
         normalizeRequestName,
         segmentForEntry,
         samplerLabel,

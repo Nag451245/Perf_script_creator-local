@@ -1,0 +1,25 @@
+{
+  "id": "sap",
+  "description": "SAP (Gateway OData, Fiori, x-csrf-token Fetch handshake) priors.",
+  "match": {
+    "hostsAny": ["sap", "hana.ondemand.com", "s4hana", "sapcloud", "ondemand.com"],
+    "pathsAny": ["/sap/opu/odata/", "/sap/bc/", "/sap/public/", "sap-client="],
+    "signalsAny": ["sap", "fiori", "odata"]
+  },
+  "protectedCalls": [
+    "/sap/opu/odata/",
+    "/sap/bc/",
+    "/sap/public/bc/icf/logoff"
+  ],
+  "disableCalls": [],
+  "oauth": {},
+  "llmFlowNotes": [
+    "SAP Gateway OData: the CSRF token is fetched with a GET carrying header 'X-CSRF-Token: Fetch'; the server returns it in the X-CSRF-Token RESPONSE header. Extract that response header and send it as the X-CSRF-Token request header on every following POST/PUT/DELETE. Replaying a recorded token gives 403 'CSRF token validation failed'.",
+    "SAP: session is carried by MYSAPSSO2 / SAP_SESSIONID_* cookies — let the HTTP Cookie Manager own them; do not correlate cookies manually.",
+    "SAP: sap-client and sap-language are static config — keep them as literals, do not parameterize."
+  ],
+  "expectations": [
+    "X-CSRF-Token fetched from response header and reused on mutating calls",
+    "SAP session cookies owned by the Cookie Manager"
+  ]
+}

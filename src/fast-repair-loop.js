@@ -239,32 +239,68 @@ function extractJsonPath(body, path) {
     let parsed;
     try { parsed = JSON.parse(body); } catch { return null; }
     const p = String(path || '');
-    if (p.startsWith('$..')) return findJsonKey(parsed, p.slice(3));
-    if (!p.startsWith('$.')) return null;
-    const parts = p.slice(2).split('.').filter(Boolean);
+    if (p.startsWith('$..')) {
+        // $..key or $..key[0] — recursive key search with optional index tail.
+        const tail = p.slice(3);
+        const m = tail.match(/^([^.[\]]+)(\[\d+\])?$/);
+        if (m) {
+            const found = findJsonKey(parsed, m[1], /* wantNode */ !!m[2]);
+            if (m[2] && Array.isArray(found)) {
+                const idx = Number(m[2].slice(1, -1));
+                const v = found[idx];
+                return v == null || typeof v === 'object' ? null : String(v);
+            }
+            return typeof found === 'object' ? null : found;
+        }
+        return findJsonKey(parsed, tail);
+    }
+    if (!p.startsWith('$.') && !p.startsWith('$[')) return null;
+    const tokens = tokenizeJsonPath(p.replace(/^\$/, ''));
+    if (!tokens) return null;
     let node = parsed;
-    for (const part of parts) {
-        if (node == null || typeof node !== 'object' || !(part in node)) return null;
-        node = node[part];
+    for (const key of tokens) {
+        if (node == null || typeof node !== 'object') return null;
+        node = node[key];
+        if (node === undefined) return null;
     }
     return node == null || typeof node === 'object' ? null : String(node);
 }
 
-function findJsonKey(node, key) {
+// Turn `.data.items[0]['x-token']` into ['data','items',0,'x-token'].
+// Supports dot keys, [n] array indexes, and ['quoted key'] / ["quoted key"].
+function tokenizeJsonPath(expr) {
+    const tokens = [];
+    const re = /\.([^.[\]]+)|\[(\d+)\]|\['([^']*)'\]|\["([^"]*)"\]/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = re.exec(expr)) !== null) {
+        if (match.index !== lastIndex) return null; // gap => malformed
+        if (match[1] != null) tokens.push(match[1]);
+        else if (match[2] != null) tokens.push(Number(match[2]));
+        else tokens.push(match[3] != null ? match[3] : match[4]);
+        lastIndex = re.lastIndex;
+    }
+    if (lastIndex !== expr.length || !tokens.length) return null;
+    return tokens;
+}
+
+function findJsonKey(node, key, wantNode = false) {
     if (node == null) return null;
     if (Array.isArray(node)) {
         for (const item of node) {
-            const found = findJsonKey(item, key);
+            const found = findJsonKey(item, key, wantNode);
             if (found != null) return found;
         }
         return null;
     }
     if (typeof node === 'object') {
-        if (Object.prototype.hasOwnProperty.call(node, key) && node[key] != null && typeof node[key] !== 'object') {
-            return String(node[key]);
+        if (Object.prototype.hasOwnProperty.call(node, key) && node[key] != null) {
+            const val = node[key];
+            if (wantNode) return val;                          // caller wants the array/object node
+            if (typeof val !== 'object') return String(val);   // scalar leaf
         }
         for (const value of Object.values(node)) {
-            const found = findJsonKey(value, key);
+            const found = findJsonKey(value, key, wantNode);
             if (found != null) return found;
         }
     }

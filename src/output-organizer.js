@@ -45,7 +45,11 @@ function organizeOutput({
     const currentJtlRelative = copy(currentJtlPath || path.join(outDir, 'final.jtl'), 'results');
     for (const file of rootFiles.filter(file => isResultArtifact(file))) copy(byName(file), 'results');
     for (const file of rootFiles.filter(file => isEvidenceArtifact(name, file))) copy(byName(file), 'evidence');
-    for (const file of rootFiles.filter(file => isDataArtifact(name, file))) copy(byName(file), 'data');
+    let dataCsvRelative = '';
+    for (const file of rootFiles.filter(file => isDataArtifact(name, file))) {
+        const relative = copy(byName(file), 'data');
+        if (!dataCsvRelative && file === `${name}_data.csv`) dataCsvRelative = relative;
+    }
 
     const manifest = {
         name,
@@ -62,6 +66,8 @@ function organizeOutput({
             finalJmx: finalJmxRelative || relativeIfExists(outDir, finalJmxPath),
             report: reportRelative || relativeIfExists(outDir, reportPath || path.join(outDir, `${name}_report.html`)),
             currentJtl: currentJtlRelative || relativeIfExists(outDir, currentJtlPath || path.join(outDir, 'final.jtl')),
+            dataCsv: dataCsvRelative || relativeIfExists(outDir, path.join(outDir, 'data', `${name}_data.csv`)) ||
+                relativeIfExists(outDir, path.join(outDir, `${name}_data.csv`)),
             labelMap: relativeIfExists(outDir, path.join(outDir, 'evidence', `${name}_label_map.json`)) ||
                 relativeIfExists(outDir, path.join(outDir, `${name}_label_map.json`)),
         },
@@ -135,6 +141,7 @@ function renderOutputIndex(manifest) {
         `- Final JMX: ${manifest.whatToOpen.finalJmx || 'not available'}`,
         `- HTML report: ${manifest.whatToOpen.report || 'not available'}`,
         `- Current JTL: ${manifest.whatToOpen.currentJtl || 'not available'}`,
+        `- Data CSV: ${manifest.whatToOpen.dataCsv || 'not available'}`,
         `- Label map: ${manifest.whatToOpen.labelMap || 'not available'}`,
         '',
         'Folders:',

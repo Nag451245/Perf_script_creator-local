@@ -27,7 +27,13 @@ function statusRelevance(code) {
     return 'unknown_status';
 }
 
-function classifyStatusTransition(recordedCode, observedCode) {
+// Success statuses that are semantically interchangeable for most flows: a
+// create that recorded 200 but replays 201 (or 202 async) is not a real
+// regression. Strict recording-first matching is the DEFAULT (senior-PE
+// principle); opts.lenientSuccessDrift lets an operator fold this benign drift.
+const SUCCESS_FAMILY = new Set([200, 201, 202, 203, 204, 205, 206]);
+
+function classifyStatusTransition(recordedCode, observedCode, opts = {}) {
     const recorded = Number(recordedCode || 0);
     const observed = Number(observedCode || 0);
     const recordedFamily = statusFamily(recorded);
@@ -59,6 +65,22 @@ function classifyStatusTransition(recordedCode, observedCode) {
             category: 'redirect_folded_by_replay',
             relevance: 'informational',
             repairHint: 'JMeter followed the recorded redirect; the 2xx landing is the expected replay shape — nothing to repair.',
+        };
+    }
+
+    // Benign success drift (200<->201<->202<->204) folds ONLY when the operator
+    // opts into lenient matching; strict recording-first remains the default.
+    if (opts.lenientSuccessDrift && SUCCESS_FAMILY.has(recorded) && SUCCESS_FAMILY.has(observed)) {
+        return {
+            recorded,
+            observed,
+            recordedFamily,
+            observedFamily,
+            matchesRecording: false,
+            folded: true,
+            category: 'success_code_drift_tolerated',
+            relevance: 'informational',
+            repairHint: `Recording expected ${recorded}, replay observed ${observed}; both are success statuses and run.strictStatusMatch is off, so this is treated as acceptable (e.g. async/create returning 201/202).`,
         };
     }
 
@@ -99,13 +121,13 @@ function classifyStatusTransition(recordedCode, observedCode) {
     };
 }
 
-function classifySampleReplay(entry = {}, sample = {}) {
+function classifySampleReplay(entry = {}, sample = {}, opts = {}) {
     const recorded = Number(entry && entry.response && entry.response.status || 0);
     const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
     if (!recorded || !observed) return null;
     const authBounce = classifyAuthBounce(entry, sample, recorded, observed);
     const loginBodyBounce = classifyLoginBodyBounce(entry, sample, recorded, observed);
-    return authBounce || loginBodyBounce || classifyStatusTransition(recorded, observed);
+    return authBounce || loginBodyBounce || classifyStatusTransition(recorded, observed, opts);
 }
 
 function classifyAuthBounce(entry, sample, recorded, observed) {
@@ -143,7 +165,7 @@ function parseUrl(value) {
 }
 
 function isAuthLikeHost(host) {
-    return /auth|login|sso|idp|okta|ping|iam/i.test(String(host || ''));
+    return /auth|login|logon|sso|idp|okta|ping|iam|keycloak|adfs|cognito|auth0|identity|account|oauth|oidc|saml|realms|microsoftonline|accounts\.google|onelogin|forgerock|duosecurity|salesforce|my\.salesforce|frontdoor/i.test(String(host || ''));
 }
 
 function classifyLoginBodyBounce(entry, sample, recorded, observed) {
@@ -177,13 +199,14 @@ function bodyOf(value) {
     return String(value || '');
 }
 
-function traceStatusRootCause({ entries = [], samples = [], evidence = null, failingIndex = null } = {}) {
+function traceStatusRootCause({ entries = [], samples = [], evidence = null, failingIndex = null, strictStatusMatch = true } = {}) {
     const pairs = evidence && Array.isArray(evidence.rows)
         ? pairsFromEvidence(evidence)
         : alignEntrySamplePairs(entries, normalizeSamples(samples));
     const explicitFailIndex = failingIndex == null
         ? null
         : (Number.isFinite(Number(failingIndex)) ? Number(failingIndex) : null);
+    const replayOpts = { lenientSuccessDrift: strictStatusMatch === false };
 
     const divergences = [];
     for (const { entry, sample, entryIndex } of pairs) {
@@ -191,7 +214,7 @@ function traceStatusRootCause({ entries = [], samples = [], evidence = null, fai
         const recorded = Number(entry && entry.response && entry.response.status || 0);
         const observed = Number(sample && (sample.responseCode || sample.code || sample.status) || 0);
         if (!recorded || !observed) continue;
-        const transition = classifySampleReplay(entry, sample);
+        const transition = classifySampleReplay(entry, sample, replayOpts);
         if (!transition) continue;
         if (!transition.matchesRecording && !transition.folded) {
             divergences.push({

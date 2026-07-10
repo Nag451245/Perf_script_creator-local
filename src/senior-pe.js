@@ -179,6 +179,22 @@ function buildValueLedger({ entries = [], correlations = [], parameterCandidates
     }
     for (const p of parameterCandidates || []) {
         const name = p.name || p.variableName || 'input';
+        // Static config (api version, locale, tenant/realm, region, public app/
+        // client id, channel) is a constant of the environment, not per-user test
+        // input. Keeping it a literal avoids both needless CSV parameterization
+        // and mistaken correlation of a value that never changes per session.
+        if (isStaticConfigName(name)) {
+            ledger.push({
+                value: redactValue(p.value || p.sample || ''),
+                name,
+                role: 'static_config',
+                native: null,
+                decision: 'keep_static_literal',
+                necessityRationale: 'Environment constant (version/locale/tenant/region/public id); do not parameterize or correlate — pin as a literal unless the objective targets multiple tenants/regions.',
+                provenance: { source: 'recorded request input', consumer: p.location || p.source || '' },
+            });
+            continue;
+        }
         ledger.push({
             value: redactValue(p.value || p.sample || ''),
             name,
@@ -281,8 +297,17 @@ function buildNegativeSpaceAudit({ objective, entries = [], polling = [], runCfg
     return gaps;
 }
 
+// Environment constants that are neither per-user input nor server-issued
+// correlation. Name-based (values of these are stable across the recording).
+const STATIC_CONFIG_NAME_RE = /^(?:api[_-]?version|version|ver|v|locale|lang|language|country|region|market|tenant|tenant[_-]?id|realm|environment|env|stage|channel|platform|device[_-]?type|os|app[_-]?id|application[_-]?id|client[_-]?id|product[_-]?id|edition|timezone|tz|currency|format|output|content[_-]?type)$/i;
+
+function isStaticConfigName(name) {
+    return STATIC_CONFIG_NAME_RE.test(String(name || '').trim());
+}
+
 function estimateCoverage({ valueLedger = [], correlations = [], plannedExtractors = [], stats = {} }) {
-    const dynamicCount = valueLedger.filter(v => v.role !== 'user_test_input').length;
+    const staticRoles = new Set(['user_test_input', 'static_config']);
+    const dynamicCount = valueLedger.filter(v => !staticRoles.has(v.role)).length;
     const resolved = valueLedger.filter(v => ['correlate', 'synthesize_or_native_function', 'native_managed_state'].includes(v.decision)).length;
     const dynamicCoveragePct = dynamicCount ? Math.round(resolved / dynamicCount * 100) : 100;
     return {
@@ -379,5 +404,6 @@ module.exports = {
         buildValueLedger,
         buildNegativeSpaceAudit,
         parameterDecisionForObjective,
+        isStaticConfigName,
     },
 };

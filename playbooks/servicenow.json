@@ -1,0 +1,26 @@
+{
+  "id": "servicenow",
+  "description": "ServiceNow (Now Platform REST/UI, g_ck CSRF token, AMB channel) priors.",
+  "match": {
+    "hostsAny": ["service-now.com", "servicenow.com"],
+    "pathsAny": ["/api/now/", "/now/", "/amb/", "sysparm_", "/login.do", "/ui_page"],
+    "signalsAny": ["servicenow"]
+  },
+  "protectedCalls": [
+    "/api/now/",
+    "/now/nav",
+    "/login.do",
+    "/amb/"
+  ],
+  "disableCalls": [],
+  "oauth": {},
+  "llmFlowNotes": [
+    "ServiceNow: the CSRF token g_ck is issued server-side and sent back as the X-UserToken header (and sysparm_ck body/query field). Extract the fresh g_ck from the page/bootstrap response and substitute it into X-UserToken and sysparm_ck everywhere — replaying the recorded g_ck yields 'Invalid transaction' 401/403.",
+    "ServiceNow: /login.do establishes the session (glide_user_session/glide_session_store cookies) — protect it as a session producer.",
+    "ServiceNow: /api/now/table and /api/now/* are the business REST calls — never disable them to reach green."
+  ],
+  "expectations": [
+    "g_ck / X-UserToken correlated from a server response",
+    "Now REST endpoints protected as business calls"
+  ]
+}

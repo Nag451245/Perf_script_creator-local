@@ -26,7 +26,7 @@ function classifyFirstFailure(result = {}) {
     if (/\$\{[A-Za-z_][A-Za-z0-9_]*\}/.test(message + ' ' + label)) {
         return { ...base, category: 'unresolved_variable' };
     }
-    if (/session expired|invalid_token|unauthorized|csrf|forbidden/i.test(message) && (code === '200' || code === '')) {
+    if (/session expired|invalid[_-]?token|unauthorized|unauthenticated|access denied|csrf|xsrf|forbidden|faultstring|permission denied|not authorized/i.test(message) && (code === '200' || code === '')) {
         return { ...base, category: 'soft_failure_200' };
     }
     if (code === '401' || code === '403') {

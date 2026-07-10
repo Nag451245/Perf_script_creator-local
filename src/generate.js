@@ -32,6 +32,7 @@ const { propagateGraphqlCsrfTokens } = require('./graphql-auth-repair');
 const { rewriteHost } = require('./host-rewrite');
 const { sanitizeJavaUnsafeJmx } = require('./java-safe');
 const volatileProtocol = require('./volatile-protocol');
+const pkce = require('./pkce');
 const seniorPe = require('./senior-pe');
 const playbooks = require('./playbooks');
 const scenario = require('./scenario');
@@ -51,6 +52,7 @@ const {
     repairAuth0LoginStateExtractors,
     correlateFormHiddenInputs,
     repairDeadExtractorConsumers,
+    rewireClientMintedOauthVars,
 } = require('./transforms');
 
 // Elastic polling (blueprint #3): a run of >=3 consecutive requests to the same
@@ -330,9 +332,10 @@ const DEFAULT_DISABLE_PATTERNS = [
 
 const AUTH_SESSION_DISABLE_PROTECT_RE = /\/(?:u\/login(?:\/|\?|$)|user\/login(?:\/|\?|$)|authorization(?:\/|\?|$)|user\/iam\/save(?:\/|\?|$)|jwt\/v2\/create-cookie(?:\/|\?|$)|iam\/callback(?:\/|\?|$))/i;
 const JWT_CREATE_COOKIE_RE = /\/jwt\/v2\/create-cookie(?:\/|\?|$)/i;
-const AUTH_HOST_RE = /(?:^|[.-])(?:login|auth|sso|iam)(?:[.-]|$)|webpt|stage|stg/i;
+const AUTH_HOST_RE = /(?:^|[.-])(?:login|logon|auth|sso|idp|iam|oauth|oidc|saml|identity|account|okta|ping|keycloak|adfs|cognito|auth0|onelogin|forgerock)(?:[.-]|$)|microsoftonline|accounts\.google|my\.salesforce|stage|stg/i;
 const SAFE_DISABLE_NOISE_RE = /ohttp|safebrowsing|domainreliability|beacon|gstatic|launchdarkly|\/sdk\/evalx|\/avatar\/|\/_next\/data\//i;
 const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
+const INTERCEPTOR_ROOT_RE = /\/s\/interceptor\/?(?:\?|$)/i;
 
 function filterParameterCandidates(candidates, policy = {}) {
     const include = toLowerList(policy.includeNames);
@@ -355,6 +358,22 @@ function isGraphqlOperationDocument(candidate) {
     if (String(candidate.name || '').toLowerCase() !== 'query') return false;
     const value = String(candidate.value || '').trim();
     return /^(query|mutation|subscription)\b/i.test(value) && /[{]/.test(value);
+}
+
+function shouldRepeatRecordedCredential(candidate, policy = {}) {
+    if (!candidate || policy.uniqueCredentials === true) return false;
+    const name = String(candidate.name || '').toLowerCase();
+    const path = String(candidate.urlPath || candidate.path || '').toLowerCase();
+    if (/^(password|passwd|pwd)$/.test(name)) return true;
+    if (/^(user(name)?|login|email)$/.test(name) && /login|auth|iam|sso|identifier|password/.test(path)) return true;
+    return false;
+}
+
+function valuesForParameterCandidate(candidate, rows, policy = {}) {
+    if (shouldRepeatRecordedCredential(candidate, policy)) {
+        return Array.from({ length: rows }, () => candidate.value);
+    }
+    return E.dataSynth.synthesizeValues(candidate.name, candidate.value, rows);
 }
 
 /**
@@ -419,6 +438,20 @@ function shouldProtectDisableTarget(sampler = {}, runCfg = {}, valueFlow = null)
     if (MUTATING_METHOD_RE.test(sampler.method || methodFromSamplerName(sampler.name)) && AUTH_HOST_RE.test(sampler.domain || '')) return true;
     if (/GraphQL mutation/i.test(sampler.name || '') && /(login|authenticate|verify|token|session)/i.test(hay)) return true;
     return false;
+}
+
+function isHardProtectedDisableTarget(sampler = {}, runCfg = {}, valueFlow = null) {
+    if (runCfg.allowUnsafeDisableProtected === true) return false;
+    const method = String(sampler.method || methodFromSamplerName(sampler.name)).toUpperCase();
+    const path = String(sampler.path || '');
+    if (!INTERCEPTOR_ROOT_RE.test(path) || method !== 'POST') return false;
+    const flow = valueFlowForSampler(sampler, valueFlow);
+    return !!(flow && flow.consumedOutputCount > 0) || hasTokenParameter(sampler.body);
+}
+
+function hasTokenParameter(body = '') {
+    return /<stringProp name="Argument\.name">token<\/stringProp>/i.test(String(body || '')) ||
+        /<elementProp name="token"\b/i.test(String(body || ''));
 }
 
 function matchesConfiguredPattern(hay, patterns) {
@@ -514,7 +547,12 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
 
     // 3. Group into PE-readable business transactions while preserving request
     // order and Step NN alignment through the label map.
-    const peModel = peNaming.buildPeNamingModel({ entries: flat, pages, flowName: name });
+    const peModel = peNaming.buildPeNamingModel({
+        entries: flat,
+        pages,
+        flowName: name,
+        transactionNames: runCfg.transactionNames,
+    });
     const groups = peModel.groups;
     fs.writeFileSync(path.join(outDir, `${name}_label_map.json`), JSON.stringify(peNaming.labelMapForArtifact(peModel), null, 2));
     if (peModel.requests.length) note('pe-naming',
@@ -568,9 +606,23 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     let csvFile = null;
     if (candidates.length) {
         csvFile = `${name}_data.csv`;
-        fs.writeFileSync(path.join(outDir, csvFile),
-            synthesizeCsv(candidates.map(c => ({ name: c.name, sample: c.value })),
-                Math.max(dataRows, (scenarioPlan && scenarioPlan.uniqueRows) || 0)));
+        const delimiter = '|';
+        const escape = (val) => {
+            const s = String(val == null ? '' : val);
+            const rx = new RegExp(`[\\"${delimiter}\\n\\r]`);
+            return rx.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        };
+        const rows = Math.max(dataRows, (scenarioPlan && scenarioPlan.uniqueRows) || 0);
+        const columns = candidates.map(c => ({
+            name: c.name,
+            values: valuesForParameterCandidate(c, rows, runCfg.parameterization || {}),
+        }));
+        const lines = [columns.map(c => escape(c.name)).join(delimiter)];
+        for (let r = 0; r < rows; r++) {
+            lines.push(columns.map(c => escape(c.values[r])).join(delimiter));
+        }
+        const pipeCsvContent = lines.join('\n') + '\n';
+        fs.writeFileSync(path.join(outDir, csvFile), pipeCsvContent);
         fs.writeFileSync(path.join(outDir, `${name}_parameters.json`), JSON.stringify(candidates, null, 2));
         params = candidates.map(c => ({
             variableName: c.name, name: c.name,
@@ -594,6 +646,9 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         config: { correlationThreshold: 0.75 },
     });
     let xml = getRenderer(DEFAULT_RENDERER_ID).render(ir).xml;
+    if (candidates.length) {
+        xml = xml.replace(/<stringProp name="delimiter">,<\/stringProp>/g, '<stringProp name="delimiter">|</stringProp>');
+    }
     const nativeManagers = applyForcedNativeManagers(xml, runCfg.forceNativeManagers || {});
     xml = nativeManagers.xml;
     if (nativeManagers.applied.length) note('native-managers',
@@ -717,6 +772,30 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         `Universal Login state is produced in /authorize Location, not a hidden input`,
         `replaced CSS hidden-input extractor with Location-header RegexExtractor`);
 
+    // Backstop: a BARE OAuth2 /authorize state/nonce is client-minted, so any
+    // RegexExtractor for it pulls from an unrelated response and yields ''. Strip
+    // the dud extractor and mint the value natively (__RandomString, Java-safe).
+    // Self-gating: no-op unless an /authorize?client_id... URL uses ${state}/
+    // ${nonce}, so it never touches server-issued suffixed session tokens.
+    const oauthRewire = rewireClientMintedOauthVars(xml);
+    xml = oauthRewire.xml;
+    if (oauthRewire.rewired && oauthRewire.rewired.length) note('oauth-client-minted-state',
+        `${oauthRewire.rewired.length} bare OAuth2 state/nonce value(s) minted client-side`,
+        `client-minted /authorize state/nonce have no server producer to extract from`,
+        `stripped dud extractor(s) and used native __RandomString: ${oauthRewire.rewired.join(', ')}`);
+
+    // PKCE (RFC 7636): 'plain' is Java-safe (challenge==verifier); 'S256' needs
+    // SHA-256(base64url) which JMeter cannot do Java-safe — flag it precisely
+    // rather than faking a challenge that the server will reject.
+    const pkceInfo = pkce.analyzePkce(flat);
+    if (pkceInfo.present && pkceInfo.note) {
+        note('oauth-pkce', pkceInfo.note.summary, pkceInfo.note.why, pkceInfo.note.action);
+    }
+    if (pkceInfo.present && pkceInfo.blocker) {
+        note('oauth-pkce-s256', pkceInfo.blocker.title, pkceInfo.blocker.detail,
+            `NEEDS ATTENTION — ${pkceInfo.blocker.options[0]}`);
+    }
+
     // Form hidden-input correlation (login state, SSO auto-POST bridge token).
     // The class the manually-fixed Tasking script solved by hand: a page body
     // carries <input type="hidden" name=X value=V> and later requests must
@@ -826,19 +905,22 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     };
 
     // TIER 1 — OPERATOR disables (config / steering / golden / playbook).
-    // The operator's explicit instruction is ABSOLUTE against heuristics: the
-    // live LOGI failure was this exact inversion — "/s/interceptor/authorize/"
-    // sat in run.disableCalls, and a "path looks session-like" prior vetoed
-    // it, run after run. Only an explicit operator protect (protectedCalls)
-    // may contradict an operator disable; when both match, protect wins with
-    // a note so the conflict is visible.
+    // Operator intent outranks heuristics for proven redirect plumbing (the
+    // live LOGI failure was "/s/interceptor/authorize/" being vetoed). It does
+    // not outrank evidence that a matched sampler is a token/session handoff;
+    // disabling that class requires allowUnsafeDisableProtected=true.
     const operatorPatterns = (runCfg && runCfg.disableCalls) || [];
     if (operatorPatterns.length) {
         const heuristicDisagreements = [];
+        const hardProtectedDisables = [];
         const dis = disableSamplersByPattern(xml, operatorPatterns, {
             protect: sampler => {
                 const hay = `${sampler.name || ''} ${sampler.domain || ''}${sampler.path || ''}`;
                 if (matchesConfiguredPattern(hay, runCfg.protectedCalls)) return true; // operator vs operator: protect wins
+                if (isHardProtectedDisableTarget(sampler, runCfg, disableValueFlow)) {
+                    hardProtectedDisables.push(sampler.name || sampler.path);
+                    return true;
+                }
                 // Heuristics may WARN about an operator disable, never veto it.
                 if (shouldProtectDisableTarget(sampler, runCfg, disableValueFlow)) {
                     heuristicDisagreements.push(sampler.name || sampler.path);
@@ -856,9 +938,11 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             `disabled anyway (operator wins): ${heuristicDisagreements.slice(0, 8).join(', ')}`,
             `if the run now fails at a downstream consumer, re-enable these or move them to protectedCalls`);
         if (dis.skippedProtected && dis.skippedProtected.length) note('disable-calls-conflict',
-            `${dis.skippedProtected.length} sampler(s) match BOTH disableCalls and protectedCalls`,
+            `${dis.skippedProtected.length} sampler(s) matched disableCalls but were kept enabled by protectedCalls or hard safety guards`,
             `kept enabled: ${dis.skippedProtected.slice(0, 8).join(', ')}`,
-            `explicit protect outranks explicit disable — resolve the conflict in config`);
+            hardProtectedDisables.length
+                ? `token/session handoff detected; set run.allowUnsafeDisableProtected=true only if you deliberately want to bypass this`
+                : `explicit protect outranks explicit disable — resolve the conflict in config`);
     }
 
     // TIER 3 — code-default noise patterns. These are priors, so the full

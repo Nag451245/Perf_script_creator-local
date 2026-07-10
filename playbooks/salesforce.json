@@ -1,0 +1,29 @@
+{
+  "id": "salesforce",
+  "description": "Salesforce (Lightning/Aura, REST/SOAP API, OAuth2) priors. Protects business API + auth producers and folds telemetry.",
+  "match": {
+    "hostsAny": ["salesforce.com", "force.com", "my.salesforce.com", "lightning.force.com", "cloudforce.com", "documentforce.com", "visualforce.com"],
+    "pathsAny": ["/services/data/", "/services/oauth2/", "/aura", "/services/soap/", "frontdoor.jsp"],
+    "signalsAny": ["salesforce", "aura", "lightning"]
+  },
+  "protectedCalls": [
+    "/services/oauth2/token",
+    "/services/data/",
+    "/services/apexrest/",
+    "/services/Soap/",
+    "/aura",
+    "frontdoor.jsp"
+  ],
+  "disableCalls": [],
+  "oauth": {},
+  "llmFlowNotes": [
+    "Salesforce: /services/oauth2/token is the OAuth2 grant — never fold it. The access_token feeds Authorization: Bearer on every /services/data call.",
+    "Salesforce Lightning/Aura: each Aura POST carries aura.token and aura.context (fwuid, app). fwuid and aura.token are server-issued per session — extract the fresh values from the bootstrap response; do not replay recorded literals.",
+    "Salesforce: frontdoor.jsp establishes the UI session (sid). Protect it; it is a session producer, not a redirect hop.",
+    "Salesforce: SOAP login returns a sessionId in the XML envelope — extract it and send as the Authorization/session header on subsequent calls."
+  ],
+  "expectations": [
+    "OAuth2 token + Aura framework token + frontdoor session protected as business/session producers",
+    "Aura fwuid/token correlated from bootstrap, not replayed as recorded literals"
+  ]
+}

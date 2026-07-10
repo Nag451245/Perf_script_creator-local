@@ -32,8 +32,22 @@ function operationName(block, fallback) {
         || 'graphql';
 }
 
+// Token key names seen in GraphQL/CSRF responses across stacks. The FIRST group
+// that matches names the extracted variable + JSONPath, so csrfToken stays
+// 'csrfToken' (backward compatible) while _csrf / xsrfToken are also handled.
+const CSRF_TOKEN_KEY_RE = /\b(csrfToken|csrf_token|xsrfToken|xsrf_token|_csrf|_xsrf|csrf)\b/i;
+// A GraphQL endpoint is any path containing '/graphql' (/, /api/graphql, /v1/graphql, ...).
+const GRAPHQL_PATH_RE = /\/graphql\b/i;
+// CSRF-bearing request headers across stacks.
+const CSRF_HEADER_RE = /^(?:x-csrf-token|x-xsrf-token|csrf-token|xsrf-token|x-csrftoken|x-csrf)$/i;
+
+function csrfTokenKey(block) {
+    const m = CSRF_TOKEN_KEY_RE.exec(block || '');
+    return m ? m[1] : null;
+}
+
 function isGraphqlCsrfProducer(block) {
-    return samplerPath(block).split('?')[0] === '/graphql' && /\bcsrfToken\b/.test(block);
+    return GRAPHQL_PATH_RE.test(samplerPath(block).split('?')[0]) && !!csrfTokenKey(block);
 }
 
 function buildProducerVars(xml) {
@@ -43,12 +57,13 @@ function buildProducerVars(xml) {
     for (const sampler of samplers) {
         const block = samplerBlock(samplerRegion(xml, sampler));
         if (!isGraphqlCsrfProducer(block)) continue;
-        const base = `gql_${sanitizeVarPart(operationName(block, sampler.name))}_csrfToken`;
+        const tokenKey = csrfTokenKey(block) || 'csrfToken';
+        const base = `gql_${sanitizeVarPart(operationName(block, sampler.name))}_${sanitizeVarPart(tokenKey)}`;
         let ref = base;
         let suffix = 2;
         while (used.has(ref)) ref = `${base}_${suffix++}`;
         used.add(ref);
-        producers.set(sampler.order, { ref, samplerName: sampler.name, operationName: operationName(block, sampler.name) });
+        producers.set(sampler.order, { ref, tokenKey, samplerName: sampler.name, operationName: operationName(block, sampler.name) });
     }
     return producers;
 }
@@ -58,7 +73,7 @@ function replaceCsrfHeader(region, ref) {
     const next = region.replace(
         /<elementProp\b[^>]*elementType="Header"[^>]*>[\s\S]*?<stringProp name="Header\.name">([^<]+)<\/stringProp>[\s\S]*?<stringProp name="Header\.value">([^<]*)<\/stringProp>[\s\S]*?<\/elementProp>/g,
         (block, name, value) => {
-            if (!/^x-csrf-token$/i.test(String(name || '').trim())) return block;
+            if (!CSRF_HEADER_RE.test(String(name || '').trim())) return block;
             const current = String(value || '');
             if (current === '${' + ref + '}') return block;
             if (/^\$\{[^}]+\}$/.test(current)) return block;
@@ -72,11 +87,11 @@ function replaceCsrfHeader(region, ref) {
     return { region: next, changed };
 }
 
-function jsonExtractorXml(ref) {
+function jsonExtractorXml(ref, tokenKey = 'csrfToken') {
     return `
-            <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="Extract ${escXml(ref)} (GraphQL csrfToken)" enabled="true">
+            <JSONPostProcessor guiclass="JSONPostProcessorGui" testclass="JSONPostProcessor" testname="Extract ${escXml(ref)} (GraphQL ${escXml(tokenKey)})" enabled="true">
               <stringProp name="JSONPostProcessor.referenceNames">${escXml(ref)}</stringProp>
-              <stringProp name="JSONPostProcessor.jsonPathExprs">$..csrfToken</stringProp>
+              <stringProp name="JSONPostProcessor.jsonPathExprs">$..${escXml(tokenKey)}</stringProp>
               <stringProp name="JSONPostProcessor.match_numbers">1</stringProp>
               <stringProp name="JSONPostProcessor.defaultValues">NOT_FOUND_${escXml(ref)}</stringProp>
             </JSONPostProcessor>
@@ -126,7 +141,7 @@ function propagateGraphqlCsrfTokens(jmxXml) {
         const currentSamplers = indexSamplers(xml);
         const region = currentSamplers[order] ? samplerRegion(xml, currentSamplers[order]) : '';
         if (!producer || hasExtractorFor(region, producer.ref)) continue;
-        const next = injectAfterSampler(xml, order, jsonExtractorXml(producer.ref));
+        const next = injectAfterSampler(xml, order, jsonExtractorXml(producer.ref, producer.tokenKey));
         if (next !== xml) {
             xml = next;
             extractors++;

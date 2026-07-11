@@ -111,15 +111,30 @@ function alignRecordingSamples(entries, samples) {
     const usedSampleIndexes = new Set();
     const usedEntryIndexes = new Set();
 
+    // final.jtl (SimpleDataWriter) APPENDS every engine iteration, so a step
+    // can appear multiple times. The FINAL iteration is what ships — pair each
+    // step against its LAST occurrence, not its first, or a stale iteration-1
+    // failure masquerades as the result on an otherwise-green re-run. Mark ALL
+    // occurrences of a paired step as used so the positional fallback below can
+    // never re-pair an earlier-iteration duplicate.
+    const lastByEntryIndex = new Map(); // entryIndex -> { sampleIndex, sample }
+    const occurrencesByEntryIndex = new Map(); // entryIndex -> sampleIndex[]
     for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
         const sample = samples[sampleIndex] || {};
         const stepNumber = stepNumberFromLabel(sample.label || sample.name);
         if (!stepNumber) continue;
         const entryIndex = stepNumber - 1;
-        if (entryIndex < 0 || entryIndex >= entries.length || usedEntryIndexes.has(entryIndex)) continue;
+        if (entryIndex < 0 || entryIndex >= entries.length) continue;
+        lastByEntryIndex.set(entryIndex, { sampleIndex, sample });
+        if (!occurrencesByEntryIndex.has(entryIndex)) occurrencesByEntryIndex.set(entryIndex, []);
+        occurrencesByEntryIndex.get(entryIndex).push(sampleIndex);
+    }
+    for (const [entryIndex, { sampleIndex, sample }] of lastByEntryIndex) {
         pairs.push({ entryIndex, sampleIndex, sample });
         usedEntryIndexes.add(entryIndex);
-        usedSampleIndexes.add(sampleIndex);
+    }
+    for (const indexes of occurrencesByEntryIndex.values()) {
+        for (const sampleIndex of indexes) usedSampleIndexes.add(sampleIndex);
     }
 
     let fallbackEntryIndex = 0;

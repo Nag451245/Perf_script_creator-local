@@ -6516,3 +6516,27 @@ test('non-load-bearing fold: no candidates when nothing failed', () => {
     ];
     assert.strictEqual(detectNonLoadBearingFailures({ evidence: { rows } }).length, 0);
 });
+
+// ── run evidence: appended-JTL last-iteration pairing ────────────────────
+const runEvidenceMod = require('../src/run-evidence');
+
+test('run evidence: appended JTL pairs each step to its LAST iteration, not a stale first', () => {
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/' }, response: { status: 200 } },
+        { request: { method: 'GET', url: 'https://app.test/authorize/resume' }, response: { status: 302 } },
+    ];
+    // final.jtl appended two iterations: iter-1 resume 401 (stale), iter-2 resume 200 (final).
+    const samples = [
+        { label: 'SC01_T01_GET_/-001', responseCode: '200', success: true, isTransaction: false },
+        { label: 'SC01_T02_/authorize/resume-002', responseCode: '401', success: false, isTransaction: false },
+        { label: 'SC01_T01_GET_/-001', responseCode: '200', success: true, isTransaction: false },
+        { label: 'SC01_T02_/authorize/resume-002', responseCode: '200', success: true, isTransaction: false },
+    ];
+    const { rows } = runEvidenceMod.buildRunEvidence({ entries, samples });
+    const resume = rows.find(r => r.label === 'SC01_T02_/authorize/resume-002');
+    assert.ok(resume, 'resume row present');
+    assert.strictEqual(resume.observedStatus, 200, 'uses the final iteration, not the stale 401');
+    assert.strictEqual(resume.success, true);
+    // exactly one row per step (no leftover duplicate re-paired via fallback)
+    assert.strictEqual(rows.filter(r => r.label === 'SC01_T02_/authorize/resume-002').length, 1);
+});

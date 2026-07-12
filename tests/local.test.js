@@ -6540,3 +6540,37 @@ test('run evidence: appended JTL pairs each step to its LAST iteration, not a st
     // exactly one row per step (no leftover duplicate re-paired via fallback)
     assert.strictEqual(rows.filter(r => r.label === 'SC01_T02_/authorize/resume-002').length, 1);
 });
+
+// ── adaptive stall watcher (fast, no JMeter) ─────────────────────────────
+test('stall watcher: recovers early once JMeter finished and the JTL goes idle', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stallwatch-'));
+    const it = path.join(dir, 'iteration_1');
+    fs.mkdirSync(it, { recursive: true });
+    const jtl = path.join(it, 'results.jtl');
+    const log = path.join(it, 'run.log');
+    fs.writeFileSync(jtl, '<a/>');
+    fs.writeFileSync(log, 'running\n');
+    const watch = runnerInternal.watchForStallOrCap(dir, { graceMs: 120, capMs: 60000, pollMs: 20 });
+    // simulate JMeter writing samples (grow) then finishing (end-of-test marker), then idle
+    setTimeout(() => fs.writeFileSync(jtl, '<a/><b/>'), 30);
+    setTimeout(() => fs.writeFileSync(jtl, '<a/><b/><c/>'), 60);
+    setTimeout(() => fs.appendFileSync(log, 'INFO o.a.j.e.StandardJMeterEngine: Notifying test listeners of end of test\n'), 80);
+    const res = await watch.promise;
+    watch.cancel();
+    assert.strictEqual(res.kind, 'watchdog');
+    assert.strictEqual(res.reason, 'stall');
+});
+
+test('stall watcher: a stale prior iteration with no fresh activity does not trip it', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stallwatch2-'));
+    const it = path.join(dir, 'iteration_1');
+    fs.mkdirSync(it, { recursive: true });
+    // already-ended iteration, static file: no growth observed while watching
+    fs.writeFileSync(path.join(it, 'results.jtl'), '<a/><b/><c/>');
+    fs.writeFileSync(path.join(it, 'run.log'), 'Notifying test listeners of end of test\n');
+    const watch = runnerInternal.watchForStallOrCap(dir, { graceMs: 60, capMs: 400, pollMs: 20 });
+    const res = await watch.promise;
+    watch.cancel();
+    // never saw the JTL grow -> must fall through to the cap, not a false 'stall'
+    assert.strictEqual(res.reason, 'cap');
+});

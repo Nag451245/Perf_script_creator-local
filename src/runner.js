@@ -716,6 +716,59 @@ function repointDataWriter(xml, fromPath, toPath) {
     return xml.replace(/(<stringProp name="filename">)([^<]*\bfinal\.jtl)(<\/stringProp>)/g, `$1${toPath}$3`);
 }
 
+/**
+ * Adaptive stall watcher for an engine run. The engine's JTL parse can DEADLOCK
+ * after JMeter finishes (SAX on malformed bodies), so the loop promise never
+ * resolves. Rather than blindly wait a fixed `timeoutMs + 90s` — dead time,
+ * because JMeter is already DONE and the results are fully written — watch the
+ * live iteration artifacts: once JMeter has PROVABLY finished the current
+ * iteration (the "end of test" marker in run.log) AND its results.jtl has been
+ * idle for `graceMs`, the parse is stalled → recover now. Resets per engine
+ * iteration (the engine runs its own repair iterations, so a new iteration_N
+ * dir clears the timer), and only trusts an iteration it watched go ACTIVE
+ * (results.jtl grew ≥2 observations) so a stale prior iteration can't trip it.
+ * `capMs` is the absolute backstop (the old behaviour) if the marker is missed.
+ * @returns {{ promise: Promise<{kind:string,reason?:string}>, cancel: Function }}
+ */
+function watchForStallOrCap(outDir, { graceMs = 60000, capMs = 330000, pollMs = 4000 } = {}) {
+    let cancelled = false;
+    const startedAt = Date.now();
+    let curName = null, lastSize = -1, lastGrowthAt = 0, sawActivity = false;
+    const promise = (async () => {
+        while (!cancelled) {
+            await new Promise(r => setTimeout(r, pollMs));
+            if (cancelled) break;
+            if (Date.now() - startedAt >= capMs) return { kind: 'watchdog', reason: 'cap' };
+            const it = latestIterationDirFor(outDir);
+            if (!it) continue;
+            if (it.name !== curName) { curName = it.name; lastSize = -1; lastGrowthAt = 0; sawActivity = false; }
+            const size = fileSizeOf(path.join(it.fullPath, 'results.jtl'));
+            if (size > lastSize) { if (lastSize >= 0) sawActivity = true; lastSize = size; lastGrowthAt = Date.now(); }
+            const ended = runLogShowsEndOfTest(path.join(it.fullPath, 'run.log'));
+            if (sawActivity && ended && lastGrowthAt && Date.now() - lastGrowthAt >= graceMs) {
+                return { kind: 'watchdog', reason: 'stall' };
+            }
+        }
+        return { kind: 'cancelled' };
+    })();
+    return { promise, cancel() { cancelled = true; } };
+}
+
+function latestIterationDirFor(outDir) {
+    try {
+        const dirs = fs.readdirSync(outDir, { withFileTypes: true })
+            .filter(e => e.isDirectory() && /^iteration_\d+$/i.test(e.name))
+            .map(e => ({ name: e.name, fullPath: path.join(outDir, e.name), index: Number((e.name.match(/\d+/) || ['0'])[0]) }))
+            .sort((a, b) => b.index - a.index);
+        return dirs[0] || null;
+    } catch { return null; }
+}
+function fileSizeOf(file) { try { return fs.statSync(file).size; } catch { return -1; } }
+function runLogShowsEndOfTest(file) {
+    try { return /Notifying test listeners of end of (?:test|run)/i.test(fs.readFileSync(file, 'utf8')); }
+    catch { return false; }
+}
+
 function recoverSamplesFromJtl(result, stableJtl, outDir, onLog, finalJmxPath) {
     if (!result) return result;
     try {
@@ -855,14 +908,17 @@ async function tryFoldNonLoadBearing({ evidence, guard, finalJmxPath, stableJtl,
         const foldedXml = disableByPatternTransform(fs.readFileSync(finalJmxPath, 'utf8'), candidates.map(c => c.label)).xml;
         fs.writeFileSync(probeJmx, repointDataWriter(foldedXml, stableJtl, probeJtl));
         try { applyJavaSafeGuard({ jmxPath: probeJmx, outDir, name, label: 'fold_probe', enabled: agent.javaSafeMode, onLog }); } catch { /* non-fatal */ }
-        // Same watchdog the main run needs: the engine's JTL parse can stall
-        // after JMeter finishes, so race it and, on timeout, recover the probe
-        // verdict straight from the JTL the SimpleDataWriter wrote.
+        // Same adaptive watchdog the main run uses: the engine's JTL parse can
+        // stall after JMeter finishes, so recover the probe verdict from its own
+        // JTL the moment JMeter is provably done rather than blocking for minutes.
         const PROBE_WATCHDOG_MS = (config.timeoutMs || 240000) + 90000;
+        const PROBE_GRACE_MS = Number(enrichedRunCfg.stallGraceMs) > 0 ? Number(enrichedRunCfg.stallGraceMs) : 60000;
+        const probeStallWatch = watchForStallOrCap(outDir, { graceMs: PROBE_GRACE_MS, capMs: PROBE_WATCHDOG_MS });
         const raced = await Promise.race([
             runFeedbackLoop({ ...config, jmxPath: probeJmx, maxIterations: 1 }, gen.flat, {}).then(r => ({ kind: 'loop', r })),
-            new Promise(res => setTimeout(() => res({ kind: 'watchdog' }), PROBE_WATCHDOG_MS)),
+            probeStallWatch.promise,
         ]);
+        probeStallWatch.cancel();
         let probeResult;
         if (raced.kind === 'loop') {
             probeResult = raced.r;
@@ -1870,7 +1926,9 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // a timer fires reliably; on timeout we recover the verdict with a body-
     // agnostic regex summary of the JTL. Engine untouched.
     const WATCHDOG_MS = (config.timeoutMs || 240000) + 90000;
+    const STALL_GRACE_MS = Number(enrichedRunCfg.stallGraceMs) > 0 ? Number(enrichedRunCfg.stallGraceMs) : 60000;
     let result;
+    const stallWatch = watchForStallOrCap(outDir, { graceMs: STALL_GRACE_MS, capMs: WATCHDOG_MS });
     const raced = await Promise.race([
         runFeedbackLoop(config, gen.flat, {
             applyPatch: guardedApplyPatch({
@@ -1884,8 +1942,9 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 adjudicationRecords: requestAdjudications,
             }),
         }).then(r => ({ kind: 'loop', r })),
-        new Promise(res => setTimeout(() => res({ kind: 'watchdog' }), WATCHDOG_MS)),
+        stallWatch.promise,
     ]);
+    stallWatch.cancel();
     if (raced.kind === 'loop') {
         result = raced.r;
     } else {
@@ -1898,7 +1957,10 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
             recoveredFromJtl: true,
             connectionError: `Engine result-parse stalled after JMeter ran; verdict recovered directly from ${jtl ? path.basename(jtl) : 'JTL'} (${reqs.length} requests).`,
         };
-        onLog(`engine parse stalled (>${Math.round(WATCHDOG_MS / 1000)}s after JMeter) — recovered verdict from JTL: ${reqs.filter(s => s.success).length}/${reqs.length} requests passed`);
+        const how = raced.reason === 'stall'
+            ? `JMeter finished but the engine's JTL parse stalled — recovered early (~${Math.round(STALL_GRACE_MS / 1000)}s idle) from`
+            : `engine parse stalled (cap ${Math.round(WATCHDOG_MS / 1000)}s) — recovered from`;
+        onLog(`${how} ${jtl ? path.basename(jtl) : 'JTL'}: ${reqs.filter(s => s.success).length}/${reqs.length} requests passed`);
     }
 
     let finalJmxPath = result.finalJmxPath || gen.jmxPath;
@@ -2269,6 +2331,9 @@ module.exports = {
     escalateToLlm,
     runLlmPatchRounds,
     _internal: {
+        watchForStallOrCap,
+        runLogShowsEndOfTest,
+        latestIterationDirFor,
         normalizeAgentCfg,
         normalizeLearningCfg,
         resolveJMeterBinPath,

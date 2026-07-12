@@ -6574,3 +6574,24 @@ test('stall watcher: a stale prior iteration with no fresh activity does not tri
     // never saw the JTL grow -> must fall through to the cap, not a false 'stall'
     assert.strictEqual(res.reason, 'cap');
 });
+
+// ── environment-vs-script classifier (gates expensive escalation) ────────
+test('environment classifier: network failure is environment, not script', () => {
+    const c = runnerInternal.classifyEnvironmentFailure({ connectionError: 'connect ECONNREFUSED 10.0.0.5:443' });
+    assert.strictEqual(c.environment, true);
+});
+
+test('environment classifier: the JTL parse-stall note is NOT an environment failure', () => {
+    const c = runnerInternal.classifyEnvironmentFailure({ connectionError: 'Engine result-parse stalled after JMeter ran; verdict recovered directly from final.jtl (103 requests).' });
+    assert.strictEqual(c.environment, false);
+});
+
+test('environment classifier: fix-environment forensics classes as environment', () => {
+    const c = runnerInternal.classifyEnvironmentFailure({ failureForensics: { recommendedAction: { id: 'fix-environment', reason: 'server error outside auth' } } });
+    assert.strictEqual(c.environment, true);
+});
+
+test('environment classifier: an auth/correlation gap is NOT environment (stay fixable)', () => {
+    const c = runnerInternal.classifyEnvironmentFailure({ failureForensics: { recommendedAction: { id: 'repair-auth-session-correlation' } } });
+    assert.strictEqual(c.environment, false);
+});

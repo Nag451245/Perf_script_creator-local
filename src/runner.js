@@ -1094,6 +1094,31 @@ function hasRealSamplerFailure(result = {}) {
         (s.success === false || Number(s.responseCode || s.code || s.status || 0) >= 400));
 }
 
+/**
+ * High-confidence "this is the environment, not the script" classifier. Used to
+ * SUPPRESS the expensive AI + replan escalation: no amount of correlation fixes
+ * a staging box that is down or 5xx-ing outside auth/session — the honest move
+ * is to ship the script and tell the operator to validate the environment,
+ * not to burn tokens and JVM boots re-deriving a script that is already correct.
+ * Deliberately narrow: a real correlation/auth gap is classed by forensics as
+ * auth/session or payload, NOT fix-environment, so this never gives up on a
+ * fixable script.
+ */
+function classifyEnvironmentFailure(result = {}) {
+    const conn = String(result.connectionError || result.error || '');
+    // Genuine network/DNS failures — but NOT the JTL-parse-stall recovery note,
+    // which sets connectionError yet is not an environment problem.
+    if (!/parse stalled|recovered/i.test(conn) &&
+        /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ECONNRESET|socket hang up|network is unreachable/i.test(conn)) {
+        return { environment: true, reason: `target not reachable: ${conn.slice(0, 140)}` };
+    }
+    const action = result.failureForensics && result.failureForensics.recommendedAction;
+    if (action && action.id === 'fix-environment') {
+        return { environment: true, reason: action.reason || 'earliest divergence is a server error outside proven auth/session setup' };
+    }
+    return { environment: false, reason: '' };
+}
+
 function isLogoutOnlyStatusRootCause(result = {}, statusRootCause = {}) {
     const failingIndex = Number(statusRootCause.failingIndex ?? statusRootCause.firstFailedIndex);
     const failingLabel = String((statusRootCause.failing && statusRootCause.failing.sampler) || statusRootCause.failingSampler || '');
@@ -2030,8 +2055,21 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         onLog(`senior PE analysis skipped: ${e.message}`);
     }
     blueprintEvidence = summarizeBlueprintEvidence(blueprintCtx);
+
+    // ENVIRONMENT vs SCRIPT gate. If the failure is the staging box (down, or
+    // 5xx-ing outside auth/session), correlation fixes and AI patches cannot
+    // help — suppress the expensive escalation, ship the script, and tell the
+    // operator to validate the environment. Narrow by construction: a real
+    // correlation/auth gap is classed as auth/session or payload, not
+    // fix-environment, so a fixable script is never abandoned here.
+    const envFailure = !finalResult.success ? classifyEnvironmentFailure(finalResult) : { environment: false };
+    if (envFailure.environment) {
+        finalResult.environmentFailure = envFailure;
+        onLog(`environment issue detected — ${envFailure.reason}. Skipping AI/replan escalation: this is the staging environment, not the script. Validate the target, then re-run.`);
+    }
+
     let llmPatch = null;
-    if (!finalResult.success) {
+    if (!finalResult.success && !envFailure.environment) {
         if (agent.enabled && targetBaseUrl) {
             try {
                 const failingResponses = await responseEvidence.collectFailingResponseEvidence({
@@ -2083,7 +2121,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // it). Feeds the auth-wall split: don't call a login failure irreducible if
     // Gate 0 proves it was mis-sent.
     let activeGate0 = gen.gate0 || null;
-    if (!finalResult.success && agent.enabled) {
+    if (!finalResult.success && agent.enabled && !envFailure.environment) {
         const triedStrategies = [];
         for (let attempt = 1; attempt <= agent.maxReplans && !finalResult.success; attempt++) {
             steeringTick('before replan');
@@ -2331,6 +2369,7 @@ module.exports = {
     escalateToLlm,
     runLlmPatchRounds,
     _internal: {
+        classifyEnvironmentFailure,
         watchForStallOrCap,
         runLogShowsEndOfTest,
         latestIterationDirFor,

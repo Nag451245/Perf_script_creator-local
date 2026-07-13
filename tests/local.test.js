@@ -6625,3 +6625,28 @@ test('filterParameterCandidates: an explicit includeNames override forces even a
     const kept = generateInternal.filterParameterCandidates(cands, { includeNames: ['includeDailyNoteClick'] }).map(c => c.name);
     assert.deepStrictEqual(kept, ['includeDailyNoteClick']);
 });
+
+// ── post-render corruption detector (defense-in-depth backstop) ──────────
+test('detectAndRevertParameterCorruption: reverts a value substituted as a substring', () => {
+    // "note" (6 chars — passes the length filter) got substituted globally and
+    // shredded "notes"/"footnote"; ${note} appears far more than its 2 fields.
+    const xml = [
+        '<stringProp name="Argument.value">${note}</stringProp>',
+        '<stringProp name="HTTPSampler.path">/foot${note}/save</stringProp>',
+        '<stringProp name="Header.value">${note}s are stored</stringProp>',
+        '<stringProp name="x">${note}${note}${note}${note}${note}${note}${note}</stringProp>',
+    ].join('');
+    const { xml: fixed, reverted } = generateInternal.detectAndRevertParameterCorruption(xml, [{ name: 'note', value: 'note', occurrences: 2 }]);
+    assert.strictEqual(reverted.length, 1);
+    assert.ok(!fixed.includes('${note}'), 'all ${note} reverted to literal');
+    assert.ok(fixed.includes('/footnote/save') && fixed.includes('notes are stored'), 'original text restored');
+});
+
+test('detectAndRevertParameterCorruption: leaves a legitimately-scoped parameter alone', () => {
+    const xml = [
+        '<stringProp name="Argument.value">${userName}</stringProp>',
+        '<stringProp name="Header.value">Referer: /login?u=${userName}</stringProp>',
+    ].join('');
+    const { reverted } = generateInternal.detectAndRevertParameterCorruption(xml, [{ name: 'userName', value: 'AshtonK', occurrences: 2 }]);
+    assert.strictEqual(reverted.length, 0);
+});

@@ -383,6 +383,34 @@ function candidateHasUnsafeValue(c) {
     return vals.some(isUnsafeParameterValue);
 }
 
+// Post-render corruption detector. A safely-substituted parameter replaces the
+// COMPLETE value of its own field, so its ${var} appears about as often as the
+// field occurs (a handful of times). A value substituted as a SUBSTRING
+// explodes far past that — the shredding signature. When a token appears grossly
+// more than the field's recorded occurrence count (or, absent that count, a
+// short value appears many times), restore the recorded literal everywhere:
+// replacing ${var} back with the value exactly reverses the global substitution.
+function detectAndRevertParameterCorruption(xml, params) {
+    let out = String(xml || '');
+    const reverted = [];
+    for (const p of params || []) {
+        const name = p.variableName || p.name;
+        const value = String(p.value == null ? '' : p.value);
+        if (!name || !value) continue;
+        const ref = '${' + name + '}';
+        const refCount = out.split(ref).length - 1;
+        if (refCount === 0) continue;
+        const expected = Number(p.occurrences) || null;
+        const suspicious = expected != null
+            ? refCount > Math.max(expected * 3, expected + 6)
+            : (value.length < 6 && refCount > 8);
+        if (!suspicious) continue;
+        out = out.split(ref).join(value);
+        reverted.push({ name, value, refCount, expected });
+    }
+    return { xml: out, reverted };
+}
+
 function filterParameterCandidates(candidates, policy = {}) {
     const include = toLowerList(policy.includeNames);
     const exclude = toLowerList(policy.excludeNames);
@@ -692,6 +720,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         params = candidates.map(c => ({
             variableName: c.name, name: c.name,
             originalValue: c.value, value: c.value,
+            occurrences: Number(c.occurrences) || null,
             source: 'csv', csvFilename: csvFile,
         }));
     }
@@ -711,6 +740,20 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         config: { correlationThreshold: 0.75 },
     });
     let xml = getRenderer(DEFAULT_RENDERER_ID).render(ir).xml;
+    // Safety net (defence-in-depth for the value guard above): if a parameter's
+    // value was substituted as a SUBSTRING and shredded the plan — its ${var}
+    // now appears far more often than the field could legitimately occur — undo
+    // it by restoring the recorded literal everywhere. Reverting the token
+    // exactly reverses the global substitution (authenticate.js${x} -> .json).
+    const corruptionCheck = detectAndRevertParameterCorruption(xml, params);
+    if (corruptionCheck.reverted.length) {
+        xml = corruptionCheck.xml;
+        params = params.filter(p => !corruptionCheck.reverted.some(r => r.name === (p.variableName || p.name)));
+        note('parameterization-corruption',
+            `${corruptionCheck.reverted.length} parameter(s) were substituted as substrings and shredded the plan — reverted to the recorded literal`,
+            corruptionCheck.reverted.map(r => `\${${r.name}} appeared ${r.refCount}× (field occurs ~${r.expected ?? '?'}×): value "${r.value}"`).join('; '),
+            `these values are too short/common to substitute safely; kept as literals. Force one back with run.parameterization.includeNames if you truly need it.`);
+    }
     if (candidates.length) {
         // Our synthesized data CSV is PIPE-delimited (so comma-bearing values —
         // date-column lists, address fields — never split a column). The
@@ -1422,4 +1465,4 @@ function lookupValueForVar(flat, varName, params) {
     return '';
 }
 
-module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectPolling } };
+module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectAndRevertParameterCorruption, detectPolling } };

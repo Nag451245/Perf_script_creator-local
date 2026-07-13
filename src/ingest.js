@@ -605,7 +605,27 @@ function analyzeInputFiles(files) {
             });
         }
     }
-    return { units, inventory, issues };
+    return { units: expandWithIndividuals(units), inventory, issues };
+}
+
+// Expose the individual members of each dual (variance) unit as their own
+// selectable single units, so an operator can run ONE recording on its own —
+// the merged pair stays for the variance run. Flagged `individual` so a
+// "run everything" pass skips them and executes only the canonical grouping
+// (otherwise a paired flow would run three times: the pair + each half).
+function expandWithIndividuals(units) {
+    const out = [];
+    for (const u of units) {
+        out.push(u);
+        if (u.kind === 'dual-jmx') {
+            out.push({ name: baseName(u.primary), kind: 'jmx', primary: u.primary, secondary: (u.sidecars && u.sidecars.primary) || undefined, individual: true, derivedFrom: u.name });
+            out.push({ name: baseName(u.secondary), kind: 'jmx', primary: u.secondary, secondary: (u.sidecars && u.sidecars.secondary) || undefined, individual: true, derivedFrom: u.name });
+        } else if (u.kind === 'dual-har') {
+            out.push({ name: baseName(u.primary), kind: 'har', primary: u.primary, individual: true, derivedFrom: u.name });
+            out.push({ name: baseName(u.secondary), kind: 'har', primary: u.secondary, individual: true, derivedFrom: u.name });
+        }
+    }
+    return out;
 }
 
 function inspectInputFile(file) {

@@ -4684,8 +4684,14 @@ test('ingest groups: same-flow HARs with user-dependent request drift still pair
 
     const analysis = analyzeInputFiles([one, two]);
 
-    assert.strictEqual(analysis.units.length, 1);
+    // The dual pair, plus each recording exposed as an individually-selectable
+    // single unit (flagged `individual`, skipped by a run-everything pass).
     assert.strictEqual(analysis.units[0].kind, 'dual-har');
+    assert.ok(!analysis.units[0].individual);
+    const individuals = analysis.units.filter(u => u.individual);
+    assert.strictEqual(individuals.length, 2);
+    assert.ok(individuals.every(u => u.kind === 'har' && u.derivedFrom === analysis.units[0].name));
+    assert.strictEqual(analysis.units.filter(u => !u.individual).length, 1);
     assert.deepStrictEqual(analysis.issues, []);
 });
 
@@ -4827,9 +4833,10 @@ test('ingest groups: same-flow JMXs with user-dependent drift pair with recordin
 
     const analysis = analyzeInputFiles([one, two, sidecarOne, sidecarTwo]);
 
-    assert.strictEqual(analysis.units.length, 1);
+    assert.strictEqual(analysis.units.filter(u => !u.individual).length, 1);
     assert.strictEqual(analysis.units[0].name, 'batch_print_recording_may15_filtered');
     assert.strictEqual(analysis.units[0].kind, 'dual-jmx');
+    assert.strictEqual(analysis.units.filter(u => u.individual && u.kind === 'jmx').length, 2);
     assert.strictEqual(analysis.units[0].primary, one);
     assert.strictEqual(analysis.units[0].secondary, two);
     assert.strictEqual(analysis.units[0].sidecars.primary, sidecarOne);
@@ -4888,7 +4895,7 @@ test('ingest analysis: paired JMX sidecars are not orphaned when paths use mixed
 
     const analysis = analyzeInputFiles(mixed);
 
-    assert.strictEqual(analysis.units.length, 1);
+    assert.strictEqual(analysis.units.filter(u => !u.individual).length, 1);
     assert.strictEqual(analysis.units[0].kind, 'dual-jmx');
     assert.ok(!analysis.issues.some(i => i.code === 'orphan_sidecar'));
 });

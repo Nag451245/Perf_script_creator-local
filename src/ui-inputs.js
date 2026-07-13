@@ -32,6 +32,8 @@ function projectUnit(unit, analysis, rootDir) {
         id: unitId(unit),
         name: unit.name,
         kind: unit.kind,
+        individual: !!unit.individual,
+        derivedFrom: unit.derivedFrom || undefined,
         primary: unit.primary,
         secondary: unit.secondary,
         sidecars: unit.sidecars || undefined,

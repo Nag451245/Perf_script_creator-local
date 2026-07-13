@@ -437,7 +437,10 @@ async function scanOnce() {
     for (const missing of selection.missing) {
         log(`INPUT ISSUE [warning] selected_input_not_found: ${missing} did not match any logical input unit or file.`);
     }
-    let units = SELECTED_INPUTS.length ? selection.selected : analysis.units;
+    // Explicit selection may pick an individual member of a pair; a "run
+    // everything" pass runs only the canonical grouping (skip the individuals
+    // exposed alongside each dual, or a paired flow would run three times).
+    let units = SELECTED_INPUTS.length ? selection.selected : analysis.units.filter(u => !u.individual);
     // Manual dual-recording pairing (--pair): merge exactly two selected
     // single-recording units into one variance unit (for recordings not named
     // __run1/__run2). Two JMX → dual-jmx (sidecars carried); two HAR → dual-har.

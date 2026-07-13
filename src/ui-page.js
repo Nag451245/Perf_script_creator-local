@@ -351,7 +351,9 @@ async function refresh(){
 }
 function unitLabel(u){
  var host=(u.hosts||[])[0]?' · '+u.hosts[0]:'';
- return u.name+'  ['+u.kind+', '+(u.requestCount||0)+' req'+(u.golden?', golden':'')+host+']';
+ var lead=u.individual?'↳ ':'';
+ var tail=u.individual&&u.derivedFrom?', single run of '+u.derivedFrom:'';
+ return lead+u.name+'  ['+u.kind+', '+(u.requestCount||0)+' req'+(u.golden?', golden':'')+tail+host+']';
 }
 function fillSelect(sel,units,keep,firstLabel){
  var prev=sel.value;

@@ -335,6 +335,48 @@ function detectPolling(flat) {
     return groups;
 }
 
+const NOISE_SESSION_COOKIE_RE = /(?:sess|session|csrf|xsrf|auth|iam|idem|sso|jwt|phpsessid|token)/i;
+/**
+ * Evidence-based noise detection from the RECORDING itself (not a path prior).
+ * A fire-and-forget telemetry beacon (RUM/analytics/domain-reliability) repeats
+ * the same endpoint many times, every recorded response carries a trivial/empty
+ * body, every one is 2xx, and none mints a session cookie — it produces nothing
+ * the flow consumes. A real business request does not repeat like that. Return
+ * the method+path keys that are safe to fold as noise; a one-off business POST
+ * (saveSOAP.php, authenticate.json) never qualifies.
+ */
+function detectRecordedNoiseBeacons(flat, opts = {}) {
+    const minRepeats = Number(opts.minRepeats) > 0 ? Number(opts.minRepeats) : 5;
+    const trivialLen = Number(opts.trivialBodyLen) > 0 ? Number(opts.trivialBodyLen) : 64;
+    const byKey = new Map();
+    for (const e of flat || []) {
+        const req = e && e.request; const resp = e && e.response;
+        if (!req || !resp) continue;
+        const method = String(req.method || 'GET').toUpperCase();
+        let path = '';
+        try { path = new URL(req.url).pathname; } catch { path = String(req.url || '').split('?')[0]; }
+        if (!path) continue;
+        const key = `${method} ${path}`;
+        const status = Number(resp.status || 0);
+        const body = String((resp.content && resp.content.text) || '');
+        const setsCookie = (resp.headers || []).some(h =>
+            /^set-cookie$/i.test(String(h.name || '')) && NOISE_SESSION_COOKIE_RE.test(String((h.value || '').split('=')[0])));
+        const g = byKey.get(key) || { count: 0, allTrivial: true, all2xx: true, anyCookie: false, path };
+        g.count++;
+        if (body.trim().length > trivialLen) g.allTrivial = false;
+        if (status < 200 || status >= 300) g.all2xx = false;
+        if (setsCookie) g.anyCookie = true;
+        byKey.set(key, g);
+    }
+    const beacons = [];
+    for (const g of byKey.values()) {
+        if (g.count >= minRepeats && g.allTrivial && g.all2xx && !g.anyCookie) {
+            beacons.push({ path: g.path, count: g.count });
+        }
+    }
+    return beacons;
+}
+
 // App-agnostic noise only: browser telemetry every Chrome recording picks up,
 // plus standard OIDC single-use plumbing (/authorize/resume, /oauth/token) and
 // logout, which are auto-followed redirect hops that never replay. Anything
@@ -1110,6 +1152,28 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         foldSafetyVetoes.slice(0, 6).map(v => `${v.sampler} [${v.verdict}]: ${v.reason}`).join('; '),
         `a request that generates a downstream-consumed value or a load-bearing navigation is never folded on a pattern hunch`);
 
+    // TIER 2b — EVIDENCE from the RECORDING body: fire-and-forget telemetry
+    // beacons (RUM/analytics like /enterprise/url/report, /domainreliability)
+    // repeat the same endpoint many times, every recorded response is a
+    // trivial/empty 2xx ack, and none mints a session cookie. They are noise —
+    // fold them so a first-party POST beacon is not mistaken for a business
+    // request and left to 401 the verdict. A one-off business POST never
+    // matches (repetition gate). Operator protectedCalls still wins.
+    if (runCfg.disableRecordedNoise !== false) {
+        const beacons = detectRecordedNoiseBeacons(flat, runCfg.recordedNoise || {});
+        const beaconPaths = beacons.map(b => b.path);
+        if (beaconPaths.length) {
+            const dis = disableSamplersByPattern(xml, beaconPaths, {
+                protect: sampler => matchesConfiguredPattern(`${sampler.name || ''} ${sampler.domain || ''}${sampler.path || ''}`, runCfg.protectedCalls),
+            });
+            xml = dis.xml; disabledCount += dis.disabled;
+            if (dis.disabled) note('recorded-noise-beacons',
+                `${dis.disabled} telemetry-beacon sampler(s) folded on recording evidence (repeated + trivial 2xx body + no session cookie)`,
+                beacons.map(b => `${b.path} ×${b.count}`).slice(0, 6).join('; '),
+                `fire-and-forget beacons produce nothing the flow consumes; folding them stops a first-party POST beacon from being protected and 401-ing the verdict`);
+        }
+    }
+
     // TIER 2 — EVIDENCE: duplicate redirect hops. The recording proves these
     // samplers re-execute a hop the parent's followed redirect chain already
     // performs; replaying them out of band re-fires single-use tokens and
@@ -1465,4 +1529,4 @@ function lookupValueForVar(flat, varName, params) {
     return '';
 }
 
-module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectAndRevertParameterCorruption, detectPolling } };
+module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectAndRevertParameterCorruption, detectRecordedNoiseBeacons, detectPolling } };

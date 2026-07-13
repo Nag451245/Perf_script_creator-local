@@ -6650,3 +6650,23 @@ test('detectAndRevertParameterCorruption: leaves a legitimately-scoped parameter
     const { reverted } = generateInternal.detectAndRevertParameterCorruption(xml, [{ name: 'userName', value: 'AshtonK', occurrences: 2 }]);
     assert.strictEqual(reverted.length, 0);
 });
+
+// ── recorded-noise beacon detection (empty/trivial body signal) ──────────
+test('detectRecordedNoiseBeacons: folds a repeated trivial-body 2xx beacon, keeps one-off business POSTs', () => {
+    const beacon = (i) => ({ request: { method: 'POST', url: 'https://app.test/enterprise/url/report' }, response: { status: 200, headers: [], content: { text: '{"ok":true}' } } });
+    const flat = [];
+    for (let i = 0; i < 12; i++) flat.push(beacon(i));                 // 12× trivial 2xx beacon
+    flat.push({ request: { method: 'POST', url: 'https://app.test/saveSOAP.php' }, response: { status: 200, headers: [], content: { text: '{"noteId":"abc123","saved":true,"body":"...long..."}'.padEnd(200,'x') } } });
+    flat.push({ request: { method: 'POST', url: 'https://app.test/service/authenticate.json' }, response: { status: 200, headers: [{ name: 'Set-Cookie', value: 'PHPSESSID=xyz; Path=/' }], content: { text: '{}' } } });
+    const beacons = generateInternal.detectRecordedNoiseBeacons(flat);
+    const paths = beacons.map(b => b.path);
+    assert.deepStrictEqual(paths, ['/enterprise/url/report']);          // only the beacon
+    assert.ok(!paths.includes('/saveSOAP.php'), 'one-off business POST kept');
+    assert.ok(!paths.includes('/service/authenticate.json'), 'session-cookie minter kept');
+});
+
+test('detectRecordedNoiseBeacons: a repeated endpoint that sets a session cookie is NOT folded', () => {
+    const flat = [];
+    for (let i = 0; i < 8; i++) flat.push({ request: { method: 'GET', url: 'https://app.test/keepalive' }, response: { status: 200, headers: [{ name: 'set-cookie', value: 'IDEM=abc' }], content: { text: '' } } });
+    assert.strictEqual(generateInternal.detectRecordedNoiseBeacons(flat).length, 0);
+});

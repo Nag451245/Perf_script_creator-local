@@ -6602,3 +6602,26 @@ test('environment classifier: an auth/correlation gap is NOT environment (stay f
     const c = runnerInternal.classifyEnvironmentFailure({ failureForensics: { recommendedAction: { id: 'repair-auth-session-correlation' } } });
     assert.strictEqual(c.environment, false);
 });
+
+// ── parameterization value safety (the "on" corruption) ──────────────────
+test('filterParameterCandidates: drops unsafe short/boolean values that would shred the JMX', () => {
+    const cands = [
+        { name: 'includeDailyNoteClick', value: 'on', distinctValues: ['on'] },
+        { name: 'rememberMe', value: '0' },
+        { name: 'agree', value: 'true' },
+        { name: 'userName', value: 'AshtonK' },
+        { name: 'password', value: 'Sup3rSecret!' },
+        { name: 'RecordIDT451', value: '451288parseKey' },
+    ];
+    const kept = generateInternal.filterParameterCandidates(cands, {}).map(c => c.name);
+    assert.ok(!kept.includes('includeDailyNoteClick'), 'checkbox "on" dropped');
+    assert.ok(!kept.includes('rememberMe'), 'numeric "0" dropped');
+    assert.ok(!kept.includes('agree'), 'boolean "true" dropped');
+    assert.deepStrictEqual(kept.sort(), ['RecordIDT451', 'password', 'userName']);
+});
+
+test('filterParameterCandidates: an explicit includeNames override forces even an unsafe value', () => {
+    const cands = [{ name: 'includeDailyNoteClick', value: 'on', distinctValues: ['on'] }];
+    const kept = generateInternal.filterParameterCandidates(cands, { includeNames: ['includeDailyNoteClick'] }).map(c => c.name);
+    assert.deepStrictEqual(kept, ['includeDailyNoteClick']);
+});

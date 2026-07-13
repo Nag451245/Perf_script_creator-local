@@ -362,14 +362,39 @@ const SAFE_DISABLE_NOISE_RE = /ohttp|safebrowsing|domainreliability|beacon|gstat
 const MUTATING_METHOD_RE = /^(POST|PUT|PATCH|DELETE)$/i;
 const INTERCEPTOR_ROOT_RE = /\/s\/interceptor\/?(?:\?|$)/i;
 
+// A parameter value that is short or a common boolean/enum token cannot be
+// substituted into the JMX safely: the engine replaces the recorded literal
+// wherever it appears, so a 2-char value like "on" (a checkbox default) shreds
+// unrelated text — "application/json" -> "applicati${x}/js${x}", the username
+// "AshtonK" -> "Asht${x}K", the path "authenticate.json" -> "authenticate.js${x}".
+// Such fields are constants, not per-user data, so dropping them from
+// parameterization loses nothing and prevents catastrophic corruption. An
+// operator can still force one back via run.parameterization.includeNames.
+const BOOLEAN_ENUM_VALUE_RE = /^(on|off|true|false|yes|no|nil|null|none|checked|unchecked|enabled|disabled|undefined)$/i;
+function isUnsafeParameterValue(value) {
+    const v = String(value == null ? '' : value).trim();
+    if (v.length < 4) return true;               // too short -> matches as a substring everywhere
+    if (BOOLEAN_ENUM_VALUE_RE.test(v)) return true; // boolean/checkbox/enum constant
+    if (/^\d{1,3}$/.test(v)) return true;         // "0".."999": ambiguous + low load value
+    return false;
+}
+function candidateHasUnsafeValue(c) {
+    const vals = Array.isArray(c.distinctValues) && c.distinctValues.length ? c.distinctValues : [c.value];
+    return vals.some(isUnsafeParameterValue);
+}
+
 function filterParameterCandidates(candidates, policy = {}) {
     const include = toLowerList(policy.includeNames);
     const exclude = toLowerList(policy.excludeNames);
     return (candidates || []).filter(c => {
         if (isGraphqlOperationDocument(c)) return false;
         const name = String(c.name || '').toLowerCase();
-        if (include.length && !include.some(term => name.includes(term))) return false;
+        const forced = include.length > 0 && include.some(term => name.includes(term));
+        if (include.length && !forced) return false;
         if (exclude.length && exclude.some(term => name.includes(term))) return false;
+        // Value safety: never parameterize a value too short/common to substitute
+        // without shredding unrelated text. An explicit include list overrides.
+        if (!forced && candidateHasUnsafeValue(c)) return false;
         return true;
     });
 }

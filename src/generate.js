@@ -336,18 +336,23 @@ function detectPolling(flat) {
 }
 
 const NOISE_SESSION_COOKIE_RE = /(?:sess|session|csrf|xsrf|auth|iam|idem|sso|jwt|phpsessid|token)/i;
+const BEACON_KEEP_PATH_RE = /(?:login|logon|auth|oauth|oidc|saml|sso|callback|token|session|authorize|verify|redirect|iam|jwt|logout|saveSOAP|save|create|update|submit|checkout|order|payment|patientChart)/i;
 /**
- * Evidence-based noise detection from the RECORDING itself (not a path prior).
- * A fire-and-forget telemetry beacon (RUM/analytics/domain-reliability) repeats
- * the same endpoint many times, every recorded response carries a trivial/empty
- * body, every one is 2xx, and none mints a session cookie — it produces nothing
- * the flow consumes. A real business request does not repeat like that. Return
- * the method+path keys that are safe to fold as noise; a one-off business POST
- * (saveSOAP.php, authenticate.json) never qualifies.
+ * Evidence-based noise detection from the RECORDING (not a path prior). A
+ * fire-and-forget telemetry/analytics beacon (RUM, domain-reliability, page-view
+ * reporting like /enterprise/url/report) repeats the same endpoint MANY times,
+ * every recorded response is 2xx, none mints a session cookie, and — critically
+ * — it PRODUCES NOTHING the flow consumes (no sampler for it owns an extractor).
+ * That last fact makes folding it provably correlation-safe: there is no value
+ * to break. A one-off business request never repeats like that, and an auth /
+ * session / business-action path is kept regardless.
+ * @param {Array} flat recording entries
+ * @param {Object} opts { producerPaths:Set<string>, minRepeats, keepPathRe }
  */
 function detectRecordedNoiseBeacons(flat, opts = {}) {
     const minRepeats = Number(opts.minRepeats) > 0 ? Number(opts.minRepeats) : 5;
-    const trivialLen = Number(opts.trivialBodyLen) > 0 ? Number(opts.trivialBodyLen) : 64;
+    const producerPaths = opts.producerPaths instanceof Set ? opts.producerPaths : new Set();
+    const keepRe = opts.keepPathRe instanceof RegExp ? opts.keepPathRe : BEACON_KEEP_PATH_RE;
     const byKey = new Map();
     for (const e of flat || []) {
         const req = e && e.request; const resp = e && e.response;
@@ -358,23 +363,36 @@ function detectRecordedNoiseBeacons(flat, opts = {}) {
         if (!path) continue;
         const key = `${method} ${path}`;
         const status = Number(resp.status || 0);
-        const body = String((resp.content && resp.content.text) || '');
         const setsCookie = (resp.headers || []).some(h =>
             /^set-cookie$/i.test(String(h.name || '')) && NOISE_SESSION_COOKIE_RE.test(String((h.value || '').split('=')[0])));
-        const g = byKey.get(key) || { count: 0, allTrivial: true, all2xx: true, anyCookie: false, path };
+        const g = byKey.get(key) || { count: 0, all2xx: true, anyCookie: false, path };
         g.count++;
-        if (body.trim().length > trivialLen) g.allTrivial = false;
         if (status < 200 || status >= 300) g.all2xx = false;
         if (setsCookie) g.anyCookie = true;
         byKey.set(key, g);
     }
     const beacons = [];
     for (const g of byKey.values()) {
-        if (g.count >= minRepeats && g.allTrivial && g.all2xx && !g.anyCookie) {
-            beacons.push({ path: g.path, count: g.count });
-        }
+        if (g.count < minRepeats || !g.all2xx || g.anyCookie) continue;
+        if (keepRe.test(g.path)) continue;         // never fold auth/session/business-action paths
+        if (producerPaths.has(g.path)) continue;    // never fold a correlation producer
+        beacons.push({ path: g.path, count: g.count });
     }
     return beacons;
+}
+
+/** Paths of samplers that own an extractor (produce a correlated value). */
+function extractorProducerPaths(xml) {
+    const set = new Set();
+    const re = /<HTTPSamplerProxy\b[^>]*>([\s\S]*?)<\/HTTPSamplerProxy>\s*<hashTree>([\s\S]*?)<\/hashTree>/g;
+    let m;
+    while ((m = re.exec(xml || '')) !== null) {
+        if (!/Extractor|PostProcessor/.test(m[2])) continue;
+        const path = (m[1].match(/<stringProp name="HTTPSampler\.path">([^<]*)</) || [])[1] || '';
+        let p = path; try { p = new URL(path, 'http://x').pathname; } catch { p = String(path).split('?')[0]; }
+        if (p) set.add(p);
+    }
+    return set;
 }
 
 // App-agnostic noise only: browser telemetry every Chrome recording picks up,
@@ -1160,7 +1178,10 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // request and left to 401 the verdict. A one-off business POST never
     // matches (repetition gate). Operator protectedCalls still wins.
     if (runCfg.disableRecordedNoise !== false) {
-        const beacons = detectRecordedNoiseBeacons(flat, runCfg.recordedNoise || {});
+        const beacons = detectRecordedNoiseBeacons(flat, {
+            ...(runCfg.recordedNoise || {}),
+            producerPaths: extractorProducerPaths(xml),
+        });
         const beaconPaths = beacons.map(b => b.path);
         if (beaconPaths.length) {
             const dis = disableSamplersByPattern(xml, beaconPaths, {

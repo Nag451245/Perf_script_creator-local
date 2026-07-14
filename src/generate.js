@@ -760,12 +760,63 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // ${password} read the username — the login silently sent garbage. One
     // name = one variable = one column.
     const seenNames = new Set();
-    const candidates = allCandidates.filter(c => {
+    const dedupedCandidates = allCandidates.filter(c => {
         if (dateNames.has(c.name)) return false;
         if (seenNames.has(c.name)) return false;
         seenNames.add(c.name);
         return true;
     });
+
+    // DATA LINEAGE — the senior's test-data strategy. An entity id the flow
+    // sends (patient ID, CaseID, appointment id) is NOT per-user input to ship
+    // as a stale CSV literal: the recording usually PROVES the flow itself
+    // fetched it from a listing/detail response minutes earlier (search
+    // patients → pick ID → open chart → CaseID). When planExtractor can locate
+    // a verified producer UPSTREAM of the value's first consumer, the value is
+    // correlated LIVE from that producer instead of parameterized — so the
+    // script always works on data that currently exists, exactly like an
+    // engineer picking a valid record from the live list. CSV keeps genuine
+    // user input (credentials, names, free text).
+    const ENTITY_ID_RE = /^(?:\d{5,12}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+    const lineagePlans = [];
+    const candidates = [];
+    const lineageEnabled = !runCfg.dataLineage || runCfg.dataLineage.enabled !== false;
+    const lineageMax = Number(runCfg.dataLineage && runCfg.dataLineage.max) > 0 ? Number(runCfg.dataLineage.max) : 12;
+    // Group by VALUE: the same entity id often rides under several field names
+    // (ID / patientId / patient_id all = the patient id; CaseID / case_id).
+    // One value gets ONE extractor; every alias leaves the CSV together — a
+    // stranded alias would make the engine substitute the literal to a stale
+    // CSV variable before the live correlation could claim it.
+    const byValue = new Map();
+    for (const c of dedupedCandidates) {
+        const value = String(c.value == null ? '' : c.value);
+        if (!byValue.has(value)) byValue.set(value, []);
+        byValue.get(value).push(c);
+    }
+    for (const [value, group] of byValue) {
+        const eligible = lineageEnabled && lineagePlans.length < lineageMax && ENTITY_ID_RE.test(value);
+        if (!eligible) { candidates.push(...group); continue; }
+        // first consumer = first entry whose REQUEST carries the value
+        let firstConsumer = -1;
+        for (let i = 0; i < flat.length; i++) {
+            const req = flat[i].request || {};
+            const hay = `${req.url || ''} ${(req.postData && req.postData.text) || ''} ${((req.postData && req.postData.params) || []).map(p => `${p.name}=${p.value}`).join('&')}`;
+            if (hay.includes(value)) { firstConsumer = i; break; }
+        }
+        const primary = group[0];
+        const plan = firstConsumer > 0
+            ? planExtractor(primary.name, [{ name: primary.name, value }], flat, firstConsumer)
+            : null;
+        if (plan) {
+            lineagePlans.push({ name: primary.name, aliases: group.map(g => g.name), value, plan, firstConsumer });
+        } else {
+            candidates.push(...group); // no provable lineage — stays CSV data
+        }
+    }
+    if (lineagePlans.length) note('data-lineage',
+        `${lineagePlans.length} entity id(s) will be picked from LIVE responses instead of replayed as recorded literals`,
+        lineagePlans.map(l => `${l.name}=${l.value} ← ${l.plan.sourceLabel}`).slice(0, 6).join('; '),
+        `the recording proves the flow itself fetched each id from an upstream listing/detail response; correlating it live means the script always operates on data that currently exists (stale-data saves stop failing silently)`);
     const skippedParameterCandidates = rawCandidates.length - allCandidates.length;
     if (datePlan.shifts.length) note('date-intent',
         `${datePlan.shifts.length} date field(s) made relative to run time (not hardcoded)`,
@@ -826,6 +877,31 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         config: { correlationThreshold: 0.75 },
     });
     let xml = getRenderer(DEFAULT_RENDERER_ID).render(ir).xml;
+
+    // DATA LINEAGE application: attach each verified extractor under its
+    // producer and swap the recorded literal for ${var} — but ONLY in samplers
+    // AFTER the producer (an occurrence before it would send an unset var).
+    // Digit-bounded replacement so id 46529865 can never shred a longer number.
+    for (const l of lineagePlans) {
+        xml = injectAfterSampler(xml, l.plan.sourceOrder, l.plan.block);
+        const bounded = new RegExp(`(?<![0-9A-Za-z])${l.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![0-9A-Za-z])`, 'g');
+        let order = -1;
+        let substituted = 0;
+        xml = xml.replace(/<HTTPSamplerProxy\b[\s\S]*?<\/HTTPSamplerProxy>/g, (block) => {
+            order++;
+            if (order <= l.plan.sourceOrder) return block;
+            return block.replace(/(<stringProp name="(?:HTTPSampler\.path|Argument\.value|Header\.value)">)([^<]*)(<\/stringProp>)/g,
+                (_m, open, content, close) => {
+                    const next = content.replace(bounded, () => { substituted++; return '${' + l.name + '}'; });
+                    return open + next + close;
+                });
+        });
+        note('data-lineage-apply',
+            `\${${l.name}} now extracted live from ${l.plan.sourceLabel}`,
+            `${substituted} downstream occurrence(s) of ${l.value} substituted`,
+            `the flow picks a CURRENTLY-VALID ${l.name} from the live response instead of replaying the recorded one`);
+    }
+
     // Safety net (defence-in-depth for the value guard above): if a parameter's
     // value was substituted as a SUBSTRING and shredded the plan — its ${var}
     // now appears far more often than the field could legitimately occur — undo

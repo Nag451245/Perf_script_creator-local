@@ -6759,3 +6759,18 @@ test('js-challenge: leaves an already-parameterized field alone (no half-rewire)
     assert.strictEqual(r.applied.length, 0);
     assert.strictEqual(r.xml, xml);
 });
+
+// ── repeat-navigation detection ───────────────────────────────────────────
+test('repeat navigation: exact-URL GET repeat with no new session material is flagged; minting repeat kept', () => {
+    const redirectHopsMod = require('../src/redirect-hops');
+    const e = (url, cookies = []) => ({ request: { method: 'GET', url }, response: { status: 200, headers: cookies.map(c => ({ name: 'Set-Cookie', value: c + '=v' })) } });
+    const entries = [
+        e('https://auth.test/redirect/', []),          // first — keep
+        e('https://auth.test/other'),
+        e('https://auth.test/redirect/', []),          // repeat, mints nothing — fold
+        e('https://auth.test/redirect/', ['appsess']), // repeat but mints a session cookie — keep
+    ];
+    const r = redirectHopsMod.detectRepeatNavigations(entries);
+    assert.deepStrictEqual(r.indexes, [2]);
+    assert.strictEqual(r.byIndex[2].firstIndex, 0);
+});

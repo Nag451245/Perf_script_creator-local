@@ -83,4 +83,37 @@ function headerValue(entry, name) {
     return '';
 }
 
-module.exports = { detectDuplicateRedirectHops, _internal: { sameRequest } };
+const SESSION_COOKIE_RE = /(?:sess|auth|token|iam|idem|csrf|jwt)/i;
+
+/**
+ * Repeat navigations: a GET to the EXACT same URL as an earlier kept entry,
+ * where the repeat's response mints no session-material cookie the first
+ * occurrence didn't. The first instance produces everything; the repeat is a
+ * browser artifact (SSO bridge revisits like a second bare GET /redirect/)
+ * that, replayed out of band, re-consumes a one-time grant and 500s. Folding
+ * is safe BY CONSTRUCTION — the first instance stays enabled.
+ */
+function detectRepeatNavigations(entries = []) {
+    const seen = new Map(); // href -> { index, cookies:Set }
+    const byIndex = {};
+    const indexes = [];
+    for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+        if (!e || methodOf(e) !== 'GET') continue;
+        const href = (e.request && e.request.url) || '';
+        if (!href) continue;
+        const cookies = new Set(((e.response && e.response.headers) || [])
+            .filter(h => /^set-cookie$/i.test(String(h.name || '')))
+            .map(h => String(h.value || '').split('=')[0])
+            .filter(n => SESSION_COOKIE_RE.test(n)));
+        const first = seen.get(href);
+        if (!first) { seen.set(href, { index: i, cookies }); continue; }
+        const mintsNew = [...cookies].some(c => !first.cookies.has(c));
+        if (mintsNew) continue; // the repeat produces new session material — keep it
+        byIndex[i] = { index: i, firstIndex: first.index, url: href, via: `repeat of entry ${first.index} (same URL, no new session material)` };
+        indexes.push(i);
+    }
+    return { byIndex, indexes };
+}
+
+module.exports = { detectDuplicateRedirectHops, detectRepeatNavigations, _internal: { sameRequest } };

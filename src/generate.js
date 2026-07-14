@@ -1192,6 +1192,35 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         foldSafetyVetoes.slice(0, 6).map(v => `${v.sampler} [${v.verdict}]: ${v.reason}`).join('; '),
         `a request that generates a downstream-consumed value or a load-bearing navigation is never folded on a pattern hunch`);
 
+    // TIER 2c — EVIDENCE: RECORDED failures. A request the user's own browser
+    // saw fail while recording (404 document probes, 502/504 flaky embeds) can
+    // never be a pass-requirement on replay — the recording proves the failure
+    // is the app's normal behaviour, not a correlation gap. Fold them so they
+    // don't block the verdict; an operator protect wins as always.
+    if (runCfg.disableRecordedFailures !== false) {
+        const recordedFailures = [];
+        for (const e of flat) {
+            const st = Number(e && e.response && e.response.status || 0);
+            if (st < 400) continue;
+            const mintsSession = ((e.response && e.response.headers) || []).some(h =>
+                /^set-cookie$/i.test(String(h.name || '')) && /(?:sess|auth|token|iam|idem|csrf)/i.test(String((h.value || '').split('=')[0])));
+            if (mintsSession) continue; // a 401/403 handshake step that still sets session material stays
+            let p = '';
+            try { const u = new URL(e.request.url); p = u.pathname + (u.search || ''); } catch { p = String(e.request && e.request.url || '').split('?')[0]; }
+            if (p) recordedFailures.push({ path: p, status: st });
+        }
+        if (recordedFailures.length) {
+            const dis = disableSamplersByPattern(xml, recordedFailures.map(f => f.path), {
+                protect: sampler => matchesConfiguredPattern(`${sampler.name || ''} ${sampler.domain || ''}${sampler.path || ''}`, runCfg.protectedCalls),
+            });
+            xml = dis.xml; disabledCount += dis.disabled;
+            if (dis.disabled) note('recorded-failures',
+                `${dis.disabled} sampler(s) folded because the RECORDING itself shows them failing`,
+                recordedFailures.slice(0, 6).map(f => `${f.status} ${f.path.slice(0, 60)}`).join('; '),
+                `the user's own browser got these failures while recording — they are the app's normal behaviour, not something replay must fix`);
+        }
+    }
+
     // TIER 2b — EVIDENCE from the RECORDING body: fire-and-forget telemetry
     // beacons (RUM/analytics like /enterprise/url/report, /domainreliability)
     // repeat the same endpoint many times, every recorded response is a
@@ -1254,6 +1283,38 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             keptForSafety.slice(0, 6).join(', '),
             `fold-safety Check 2 outranks the duplicate-hop heuristic`);
         disabledCount += folded;
+    }
+
+    // TIER 2d — EVIDENCE: repeat navigations. A second bare GET to the exact
+    // URL an earlier kept sampler already hits (SSO bridge revisits like a
+    // second GET /redirect/) mints nothing new per the recording; replayed out
+    // of band it re-consumes a one-time grant and 500s. Fold the repeat — the
+    // FIRST instance stays and produces everything. Folded labels merge into
+    // duplicateHopLabels so the business guard exempts them like other hops.
+    {
+        const repeats = redirectHops.detectRepeatNavigations(flat);
+        const repeatFolded = [];
+        if (repeats.indexes.length) {
+            const samplerIndex2 = indexSamplersForGenerate(xml);
+            for (const idx of repeats.indexes) {
+                if (dupHops.byIndex[idx]) continue; // already handled as a duplicate hop
+                const s = samplerIndex2[idx];
+                if (!s) continue;
+                if (matchesConfiguredPattern(`${s.name} ${s.path || ''}`, runCfg.protectedCalls)) continue;
+                const flipped = flipEnabledAtPosition(xml, s);
+                if (flipped.changed) {
+                    xml = flipped.xml;
+                    disabledCount++;
+                    repeatFolded.push(s.name);
+                    dupHops.byIndex[idx] = repeats.byIndex[idx];
+                    dupHops.indexes.push(idx);
+                }
+            }
+            if (repeatFolded.length) note('repeat-navigation',
+                `${repeatFolded.length} repeat navigation(s) folded — same URL as an earlier kept request, no new session material`,
+                repeatFolded.slice(0, 6).join(', '),
+                `an out-of-band bridge revisit re-consumes a one-time grant (the recorded 200 becomes a replay 500); the first instance still runs`);
+        }
     }
 
     // Golden-script learning: a human-fixed WORKING script for this flow was

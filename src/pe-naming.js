@@ -70,6 +70,14 @@ function buildPeNamingModel({ entries = [], flowName = '', pages = [], scenarioC
 }
 
 function buildGroupPlan(entries, pageById) {
+    // OPERATOR-AUTHORED transaction boundaries beat every heuristic: recording
+    // tools (Fiddler/Charles) let the engineer mark each business step with a
+    // comment ("Login", "Display_Patients", …). When the recording carries such
+    // markers, each commented entry STARTS a transaction named from it — the
+    // grouping the user recorded is the grouping the script gets.
+    if ((entries || []).some(e => e && e.comment && String(e.comment).trim())) {
+        return buildCommentGroupPlan(entries);
+    }
     const groups = [];
     let current = null;
     for (const entry of entries || []) {
@@ -92,12 +100,43 @@ function buildGroupPlan(entries, pageById) {
     return groups.length ? groups : [{ key: 'general', segmentKey: 'general', name: SEGMENTS.general.name, semanticTransactionLabel: SEGMENTS.general.semantic, entries: [] }];
 }
 
+function buildCommentGroupPlan(entries) {
+    const groups = [];
+    let current = null;
+    const leading = []; // requests before the first marker belong to the first step
+    for (const entry of entries || []) {
+        const comment = entry && entry.comment && String(entry.comment).trim();
+        if (comment) {
+            const name = normalizeSegmentName(comment);
+            current = {
+                key: `comment:${groups.length}`,
+                segmentKey: 'comment',
+                name,
+                semanticTransactionLabel: name,
+                fromRecordingComment: true,
+                entries: groups.length === 0 ? leading.splice(0) : [],
+            };
+            groups.push(current);
+        }
+        if (!current) { leading.push(entry); continue; }
+        current.entries.push(entry);
+    }
+    if (!groups.length) {
+        return [{ key: 'general', segmentKey: 'general', name: SEGMENTS.general.name, semanticTransactionLabel: SEGMENTS.general.semantic, entries: leading }];
+    }
+    return groups;
+}
+
 function transactionForGroup(group, txByKey, scenarioCode, flowPrefix, overrides = []) {
     const key = group.key || 'general';
     if (!txByKey.has(key)) {
         const index = txByKey.size;
         const code = `T${String(index + 1).padStart(2, '0')}`;
-        const txName = overrides[index] || `${flowPrefix}_${group.name || SEGMENTS.general.name}`;
+        // A comment-derived group already carries the OPERATOR'S business name —
+        // use it directly (SC01_T02_Login), not prefixed with the whole flow
+        // filename. Explicit transactionNames overrides still win by index.
+        const txName = overrides[index] ||
+            (group.fromRecordingComment ? group.name : `${flowPrefix}_${group.name || SEGMENTS.general.name}`);
         txByKey.set(key, {
             transactionCode: code,
             transactionName: txName,

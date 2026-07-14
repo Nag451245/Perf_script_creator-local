@@ -656,14 +656,23 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     }
 
     // 1. Filter noise (background auth, static assets, analytics, tunnels).
+    //    Operator transaction markers (HAR entry comments — "Login",
+    //    "Display_Patients") are boundaries, not requests: when the entry
+    //    CARRYING a comment gets filtered as noise, the comment must survive
+    //    onto the next kept entry or the transaction grouping loses that step.
     const filter = new FilterEngine();
     const bgAuth = filter.detectBackgroundAuthIndices(entriesRaw);
     const flat = [];
+    let pendingComment = '';
     entriesRaw.forEach((e, i) => {
         const u = e.request?.url || '';
-        if (bgAuth.has(i)) return;
-        if (filter.isTunnelRequest(e) || filter.isStaticAsset(u) || filter.isExcludedPath(u) ||
-            filter.isAnalyticsDomain(u) || filter.isBrowserNoise(u)) return;
+        const comment = e && e.comment && String(e.comment).trim();
+        const dropped = bgAuth.has(i) ||
+            filter.isTunnelRequest(e) || filter.isStaticAsset(u) || filter.isExcludedPath(u) ||
+            filter.isAnalyticsDomain(u) || filter.isBrowserNoise(u);
+        if (dropped) { if (comment) pendingComment = comment; return; }
+        if (pendingComment && !comment) { e.comment = pendingComment; }
+        pendingComment = '';
         flat.push(e);
     });
 

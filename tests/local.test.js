@@ -6670,3 +6670,55 @@ test('detectRecordedNoiseBeacons: a repeated endpoint that sets a session cookie
     for (let i = 0; i < 8; i++) flat.push({ request: { method: 'GET', url: 'https://app.test/keepalive' }, response: { status: 200, headers: [{ name: 'set-cookie', value: 'IDEM=abc' }], content: { text: '' } } });
     assert.strictEqual(generateInternal.detectRecordedNoiseBeacons(flat).length, 0);
 });
+
+// ── ship-point final sanitizer ────────────────────────────────────────────
+const finalArtifactMod = require('../src/final-artifact');
+
+test('final sanitizer: reverts substring corruption and re-asserts generation folds', () => {
+    const dir = tmp();
+    const name = 'flow';
+    // current parameters.json: only userName (occurrences 2)
+    fs.writeFileSync(path.join(dir, 'flow_parameters.json'), JSON.stringify([
+        { name: 'userName', value: 'AshtonK', occurrences: 2 },
+    ]));
+    // recording carries the dropped checkbox literal
+    fs.writeFileSync(path.join(dir, 'flow.recording.xml'), '<testResults><httpSample lb="POST /save"><queryString>includeDailyNoteClick=on&amp;userName=AshtonK</queryString></httpSample></testResults>');
+    // base jmx: beacon folded
+    fs.writeFileSync(path.join(dir, 'flow.jmx'), '<jmeterTestPlan><HTTPSamplerProxy testname="T01_/report-001" enabled="false"></HTTPSamplerProxy></jmeterTestPlan>');
+    // shipped final: corrupted + beacon re-enabled
+    const refs = Array(45).fill('${includeDailyNoteClick}').join('x');
+    const finalXml = '<jmeterTestPlan><HTTPSamplerProxy testname="T01_/report-001" enabled="true"></HTTPSamplerProxy>' +
+        '<stringProp name="HTTPSampler.path">/authenticate.js${includeDailyNoteClick}</stringProp>' +
+        '<stringProp name="x">' + refs + '</stringProp></jmeterTestPlan>';
+    const r = finalArtifactMod._internal.sanitizeFinalXml(finalXml, { outDir: dir, name });
+    assert.ok(!r.xml.includes('${includeDailyNoteClick}'), 'orphan corruption reverted');
+    assert.ok(r.xml.includes('/authenticate.json'), 'path restored via recorded literal "on"');
+    assert.ok(/testname="T01_\/report-001" enabled="false"/.test(r.xml), 'generation fold re-asserted');
+});
+
+test('final sanitizer: leaves a healthy final untouched', () => {
+    const dir = tmp();
+    fs.writeFileSync(path.join(dir, 'flow_parameters.json'), JSON.stringify([{ name: 'userName', value: 'AshtonK', occurrences: 2 }]));
+    fs.writeFileSync(path.join(dir, 'flow.jmx'), '<jmeterTestPlan><HTTPSamplerProxy testname="a" enabled="true"></HTTPSamplerProxy></jmeterTestPlan>');
+    const finalXml = '<jmeterTestPlan><HTTPSamplerProxy testname="a" enabled="true"></HTTPSamplerProxy><stringProp name="Argument.value">${userName}</stringProp></jmeterTestPlan>';
+    const r = finalArtifactMod._internal.sanitizeFinalXml(finalXml, { outDir: dir, name: 'flow' });
+    assert.strictEqual(r.xml, finalXml);
+    assert.strictEqual(r.notes.length, 0);
+});
+
+// ── HAR comment-based transaction grouping ───────────────────────────────
+test('pe-naming: recording comments define transaction boundaries and names', () => {
+    const peNamingMod = require('../src/pe-naming');
+    const e = (url, comment) => ({ request: { method: 'GET', url }, response: { status: 200 }, ...(comment ? { comment } : {}) });
+    const entries = [
+        e('https://app.test/boot'),                       // pre-boundary -> merged into first step
+        e('https://app.test/', 'Launch'),
+        e('https://app.test/home'),
+        e('https://app.test/login', 'Login'),
+        e('https://app.test/auth'),
+        e('https://app.test/patients', 'Display_Patients'),
+    ];
+    const model = peNamingMod.buildPeNamingModel({ entries, flowName: 'flow', pages: [], transactionNames: [] });
+    assert.deepStrictEqual(model.groups.map(g => g.name), ['SC01_T01_Launch', 'SC01_T02_Login', 'SC01_T03_Display_Patients']);
+    assert.strictEqual(model.groups[0].entries.length, 3, 'pre-boundary request merged into first step');
+});

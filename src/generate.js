@@ -1234,6 +1234,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         if (failExact.size || failFamilies.size) {
             const samplerIndexRF = indexSamplersForGenerate(xml);
             let foldedRF = 0;
+            const targets = [];
             for (let i = 0; i < flat.length; i++) {
                 let host = '', pathname = '', exact = '';
                 try { const u = new URL(flat[i].request.url); host = u.hostname; pathname = u.pathname; exact = host + pathname + (u.search || ''); }
@@ -1242,6 +1243,13 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
                 const s = samplerIndexRF[i];
                 if (!s) continue;
                 if (matchesConfiguredPattern(`${s.name} ${s.path || ''}`, runCfg.protectedCalls)) continue;
+                targets.push(s);
+            }
+            // Flip DESCENDING by position: each flip lengthens the xml by one
+            // char ("true"->"false"), so ascending order strands every later
+            // cached position one char off target (a third fold silently missed).
+            targets.sort((a, b) => b.position - a.position);
+            for (const s of targets) {
                 const flipped = flipEnabledAtPosition(xml, s);
                 if (flipped.changed) { xml = flipped.xml; foldedRF++; }
             }
@@ -1290,6 +1298,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         const samplerIndex = indexSamplersForGenerate(xml);
         let folded = 0;
         const keptForSafety = [];
+        const foldTargets = [];
         for (const idx of dupHops.indexes) {
             const s = samplerIndex[idx];
             if (!s) continue;
@@ -1303,6 +1312,12 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
                 keptForSafety.push(s.name);
                 continue;
             }
+            foldTargets.push(s);
+        }
+        // Descending position: each flip lengthens the xml by one char, so
+        // ascending order strands later cached positions off target.
+        foldTargets.sort((a, b) => b.position - a.position);
+        for (const s of foldTargets) {
             const flipped = flipEnabledAtPosition(xml, s);
             if (flipped.changed) { xml = flipped.xml; folded++; }
         }
@@ -1328,11 +1343,17 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         const repeatFolded = [];
         if (repeats.indexes.length) {
             const samplerIndex2 = indexSamplersForGenerate(xml);
+            const repeatTargets = [];
             for (const idx of repeats.indexes) {
                 if (dupHops.byIndex[idx]) continue; // already handled as a duplicate hop
                 const s = samplerIndex2[idx];
                 if (!s) continue;
                 if (matchesConfiguredPattern(`${s.name} ${s.path || ''}`, runCfg.protectedCalls)) continue;
+                repeatTargets.push({ s, idx });
+            }
+            // Descending position — flips lengthen the xml by one char each.
+            repeatTargets.sort((a, b) => b.s.position - a.s.position);
+            for (const { s, idx } of repeatTargets) {
                 const flipped = flipEnabledAtPosition(xml, s);
                 if (flipped.changed) {
                     xml = flipped.xml;

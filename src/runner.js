@@ -431,9 +431,17 @@ function isAmbiguousRootSamplerName(sampler) {
     return /^Step\s+\d+\s+-\s+(GET|POST|PUT|PATCH|DELETE)\s+\/$/i.test(String(sampler || '').trim());
 }
 
-function guardedApplyPatch({ guard, blockedDisables, onLog, valueFlow = null, stableJtl = '', outDir = '', name = '', adjudicationRecords = [] }) {
+function guardedApplyPatch({ guard, blockedDisables, onLog, valueFlow = null, stableJtl = '', outDir = '', name = '', adjudicationRecords = [], abortRef = null }) {
     let pendingFoldProbes = [];
     return async (jmxPath, failureReport, harEntries, options = {}) => {
+        // Once stall recovery has adopted a verdict, the ABANDONED engine loop
+        // must stop dead: left running, it patches/reruns for minutes after the
+        // final artifact shipped and has resurrected a stale corrupted JMX over
+        // the sanitized final. Throwing here terminates the engine loop cleanly
+        // (its catch finalizes) instead of letting it write anything further.
+        if (abortRef && abortRef.aborted) {
+            throw new Error('stall recovery already adopted this run’s verdict — abandoned feedback loop halted');
+        }
         const probeResult = evaluateFoldProbes({ pending: pendingFoldProbes, failureReport, guard });
         pendingFoldProbes = probeResult.pending;
         if (probeResult.accepted.length) {
@@ -1953,6 +1961,11 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     const WATCHDOG_MS = (config.timeoutMs || 240000) + 90000;
     const STALL_GRACE_MS = Number(enrichedRunCfg.stallGraceMs) > 0 ? Number(enrichedRunCfg.stallGraceMs) : 60000;
     let result;
+    // Kill-switch for the loop we may abandon: when stall recovery adopts the
+    // verdict, the still-running engine loop must not patch, rerun, or write
+    // ANYTHING further (it has resurrected stale corrupted JMX bytes over the
+    // shipped final minutes after the run "finished").
+    const patchAbortRef = { aborted: false };
     const stallWatch = watchForStallOrCap(outDir, { graceMs: STALL_GRACE_MS, capMs: WATCHDOG_MS });
     const raced = await Promise.race([
         runFeedbackLoop(config, gen.flat, {
@@ -1965,6 +1978,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 outDir,
                 name,
                 adjudicationRecords: requestAdjudications,
+                abortRef: patchAbortRef,
             }),
         }).then(r => ({ kind: 'loop', r })),
         stallWatch.promise,
@@ -1973,6 +1987,8 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     if (raced.kind === 'loop') {
         result = raced.r;
     } else {
+        patchAbortRef.aborted = true;
+        onLog('stall recovery adopted the verdict — abandoned engine loop halted (no further patches or writes)');
         const jtl = fs.existsSync(stableJtl) ? stableJtl : findLastJtl(outDir);
         const samples = jtl ? summarizeJtlFast(jtl) : [];
         const reqs = samples.filter(s => !s.isTransaction);

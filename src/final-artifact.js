@@ -158,7 +158,13 @@ function writeFinalJmxPointer({
     // repair rounds can hand back a re-substituted / re-enabled JMX even when
     // the generated base was clean.
     const sanitized = sanitizeFinalXml(fs.readFileSync(finalJmxPath, 'utf8'), { outDir, name });
+    try { if (fs.existsSync(finalCopyPath)) fs.chmodSync(finalCopyPath, 0o666); } catch { /* first write */ }
     fs.writeFileSync(finalCopyPath, sanitized.xml);
+    // Lock the shipped final READ-ONLY: an abandoned patch loop has silently
+    // replaced it with stale corrupted bytes minutes after the run finished.
+    // Any late writer now fails with EPERM instead of corrupting the artifact;
+    // the next legitimate run clears the flag above before rewriting.
+    try { fs.chmodSync(finalCopyPath, 0o444); } catch { /* lock is best-effort */ }
     if (sanitized.notes.length) {
         fs.writeFileSync(path.join(outDir, `${safeName}_final_sanitizer.json`), JSON.stringify(sanitized.notes, null, 2));
     }

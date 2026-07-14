@@ -6722,3 +6722,40 @@ test('pe-naming: recording comments define transaction boundaries and names', ()
     assert.deepStrictEqual(model.groups.map(g => g.name), ['SC01_T01_Launch', 'SC01_T02_Login', 'SC01_T03_Display_Patients']);
     assert.strictEqual(model.groups[0].entries.length, 3, 'pre-boundary request merged into first step');
 });
+
+// ── js-embedded challenge token (rotating CSRF name+value) ───────────────
+const jsChallengeMod = require('../src/js-challenge-token');
+
+test('js-challenge: correlates rotating name+value pair from inline script, proves regex first', () => {
+    const flat = [
+        { request: { method: 'GET', url: 'https://app.test/' }, response: { status: 200, content: { text: "<script>\nwindow.abCdEf12Challenge = 'TOK$en=With$pecials123456';\n</script>" } } },
+        { request: { method: 'POST', url: 'https://app.test/service/authenticate.json', postData: { text: 'userName=U&password=P&abCdEf12=' + encodeURIComponent('TOK$en=With$pecials123456') } }, response: { status: 200 } },
+    ];
+    const xml = [
+        '<HTTPSamplerProxy testname="T01_GET_/-001" enabled="true"><stringProp name="HTTPSampler.method">GET</stringProp><stringProp name="HTTPSampler.path">/</stringProp></HTTPSamplerProxy>',
+        '<hashTree></hashTree>',
+        '<HTTPSamplerProxy testname="T01_/service/authenticate.json-002" enabled="true"><stringProp name="HTTPSampler.method">POST</stringProp><stringProp name="HTTPSampler.path">/service/authenticate.json</stringProp>',
+        '<elementProp name="abCdEf12" elementType="HTTPArgument"><stringProp name="Argument.name">abCdEf12</stringProp><stringProp name="Argument.value">TOK$en=With$pecials123456</stringProp></elementProp>',
+        '<elementProp name="userName" elementType="HTTPArgument"><stringProp name="Argument.name">userName</stringProp><stringProp name="Argument.value">${userName}</stringProp></elementProp>',
+        '</HTTPSamplerProxy><hashTree></hashTree>',
+    ].join('\n');
+    const r = jsChallengeMod.correlateJsChallengeToken(xml, flat);
+    assert.strictEqual(r.applied.length, 1);
+    assert.ok(r.xml.includes('Argument.name">${js_challenge_1_name}'), 'param NAME rewired');
+    assert.ok(r.xml.includes('Argument.value">${js_challenge_1_value}'), 'param VALUE rewired');
+    assert.ok(r.xml.includes('RegexExtractor.refname">js_challenge_1_name'), 'name extractor attached');
+    assert.ok(r.xml.includes('RegexExtractor.refname">js_challenge_1_value'), 'value extractor attached');
+    assert.ok(r.xml.includes('Argument.value">${userName}'), 'existing parameterization untouched');
+});
+
+test('js-challenge: leaves an already-parameterized field alone (no half-rewire)', () => {
+    const flat = [
+        { request: { method: 'GET', url: 'https://app.test/d.php' }, response: { status: 200, content: { text: "wpt.agenda.startDate = '2026-05-18T00:00:00-07:00';" } } },
+        { request: { method: 'POST', url: 'https://app.test/sched' , postData: { text: 'startDate=' + encodeURIComponent('2026-05-18T00:00:00-07:00') } }, response: { status: 200 } },
+    ];
+    const xml = '<HTTPSamplerProxy testname="a" enabled="true"><stringProp name="HTTPSampler.method">GET</stringProp><stringProp name="HTTPSampler.path">/d.php</stringProp></HTTPSamplerProxy><hashTree></hashTree>' +
+        '<elementProp name="startDate" elementType="HTTPArgument"><stringProp name="Argument.name">startDate</stringProp><stringProp name="Argument.value">${startDate}</stringProp></elementProp>';
+    const r = jsChallengeMod.correlateJsChallengeToken(xml, flat);
+    assert.strictEqual(r.applied.length, 0);
+    assert.strictEqual(r.xml, xml);
+});

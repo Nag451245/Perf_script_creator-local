@@ -41,6 +41,7 @@ const redirectHops = require('./redirect-hops');
 const foldSafetyModule = require('./fold-safety');
 const renderedRequestCheck = require('./rendered-request-check');
 const dateIntent = require('./date-intent');
+const jsChallengeToken = require('./js-challenge-token');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
 const peNaming = require('./pe-naming');
@@ -748,7 +749,19 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     const dateRef = dateIntent.recordingReference(flat);
     const datePlan = dateIntent.planDateShifts(allCandidates, dateRef, runCfg.dates || {});
     const dateNames = new Set(datePlan.shifts.map(s => s.name));
-    const candidates = allCandidates.filter(c => !dateNames.has(c.name));
+    // DEDUPE by variable name — the advisor can emit the SAME field name from
+    // different pages ("ID" twice, "CaseID" twice). The CSV writer emits one
+    // column per candidate but the CSVDataSet deduplicates variableNames, so
+    // duplicates SHIFT every later column: ${userName} read a comment field and
+    // ${password} read the username — the login silently sent garbage. One
+    // name = one variable = one column.
+    const seenNames = new Set();
+    const candidates = allCandidates.filter(c => {
+        if (dateNames.has(c.name)) return false;
+        if (seenNames.has(c.name)) return false;
+        seenNames.add(c.name);
+        return true;
+    });
     const skippedParameterCandidates = rawCandidates.length - allCandidates.length;
     if (datePlan.shifts.length) note('date-intent',
         `${datePlan.shifts.length} date field(s) made relative to run time (not hardcoded)`,
@@ -1284,6 +1297,23 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         `${deadFix.dead.length} extractor(s) sit under disabled sampler(s) and can never populate their variable`,
         deadFix.restored.map(r => `\${${r.var}} in "${r.sampler}"`).slice(0, 6).join('; '),
         `restored the recorded literal at ${deadFix.restored.length} consumer field(s) (recorded value beats a variable that cannot resolve)`);
+
+    // JS-embedded challenge tokens (rotating CSRF name+value pairs echoed from
+    // inline page script). The variance diff misses them when both recordings
+    // sit inside one deployment window (identical values), so the engine ships
+    // a stale literal and the server fails the login SILENTLY (200, no session
+    // cookie). Evidence-based: the pair must appear adjacently in an earlier
+    // response, and the derived regex must reproduce it before wiring.
+    try {
+        const chal = jsChallengeToken.correlateJsChallengeToken(xml, flat);
+        if (chal.applied.length) {
+            xml = chal.xml;
+            note('js-challenge-token',
+                `${chal.applied.length} inline-script challenge pair(s) correlated (rotating param NAME + VALUE)`,
+                chal.applied.map(a => `${a.name} ← ${a.producerPath} → ${a.consumerPath} (${a.rewired} consumer arg(s))`).join('; '),
+                `extracts both halves from the live page each run — a stale recorded challenge makes the login fail silently with 200 and no session cookie`);
+        }
+    } catch (e) { note('js-challenge-token', 'skipped (non-fatal)', e.message); }
 
     // Convergence pass — fold in the body/session correlations the engine's
     // pass misses. Uses the SECOND recording (variance) to find dynamics that

@@ -1212,32 +1212,44 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         }
         const primaryHost = [...hostTally.entries()].sort((a, b) => b[1] - a[1]).map(x => x[0])[0] || '';
         const primaryApex = primaryHost.split('.').slice(-2).join('.');
+        // Fold by ENTRY INDEX, not text patterns — generated samplers carry the
+        // host as a ${SERVER} variable, so host-based patterns never match.
+        // Family membership is decided on the RECORDING entries themselves.
         const recordedFailures = [];
-        const patterns = new Set();
+        const failFamilies = new Set();   // third-party host+pathname (all query variants)
+        const failExact = new Set();      // host + pathname + query (any host)
         for (const e of flat) {
             const st = Number(e && e.response && e.response.status || 0);
             if (st < 400) continue;
             const mintsSession = ((e.response && e.response.headers) || []).some(h =>
                 /^set-cookie$/i.test(String(h.name || '')) && /(?:sess|auth|token|iam|idem|csrf)/i.test(String((h.value || '').split('=')[0])));
             if (mintsSession) continue; // a 401/403 handshake step that still sets session material stays
-            let host = '', pathname = '', full = '';
-            try { const u = new URL(e.request.url); host = u.hostname; pathname = u.pathname; full = u.pathname + (u.search || ''); }
-            catch { full = String(e.request && e.request.url || '').split('?')[0]; }
-            if (!full) continue;
-            recordedFailures.push({ path: full, status: st });
-            patterns.add(full); // the exact instance
-            // third-party family: fold every query-variant of the failing path
-            if (host && pathname && !host.endsWith(primaryApex)) patterns.add(host + pathname);
+            try {
+                const u = new URL(e.request.url);
+                recordedFailures.push({ path: u.pathname + (u.search || ''), status: st });
+                failExact.add(u.hostname + u.pathname + (u.search || ''));
+                if (!u.hostname.endsWith(primaryApex)) failFamilies.add(u.hostname + u.pathname);
+            } catch { /* skip unparseable */ }
         }
-        if (patterns.size) {
-            const dis = disableSamplersByPattern(xml, [...patterns], {
-                protect: sampler => matchesConfiguredPattern(`${sampler.name || ''} ${sampler.domain || ''}${sampler.path || ''}`, runCfg.protectedCalls),
-            });
-            xml = dis.xml; disabledCount += dis.disabled;
-            if (dis.disabled) note('recorded-failures',
-                `${dis.disabled} sampler(s) folded because the RECORDING itself shows them failing`,
+        if (failExact.size || failFamilies.size) {
+            const samplerIndexRF = indexSamplersForGenerate(xml);
+            let foldedRF = 0;
+            for (let i = 0; i < flat.length; i++) {
+                let host = '', pathname = '', exact = '';
+                try { const u = new URL(flat[i].request.url); host = u.hostname; pathname = u.pathname; exact = host + pathname + (u.search || ''); }
+                catch { continue; }
+                if (!failExact.has(exact) && !failFamilies.has(host + pathname)) continue;
+                const s = samplerIndexRF[i];
+                if (!s) continue;
+                if (matchesConfiguredPattern(`${s.name} ${s.path || ''}`, runCfg.protectedCalls)) continue;
+                const flipped = flipEnabledAtPosition(xml, s);
+                if (flipped.changed) { xml = flipped.xml; foldedRF++; }
+            }
+            disabledCount += foldedRF;
+            if (foldedRF) note('recorded-failures',
+                `${foldedRF} sampler(s) folded because the RECORDING itself shows them failing`,
                 recordedFailures.slice(0, 6).map(f => `${f.status} ${f.path.slice(0, 60)}`).join('; '),
-                `the user's own browser got these failures while recording — they are the app's normal behaviour, not something replay must fix (third-party families folded across query variants)`);
+                `the user's own browser got these failures while recording — they are the app's normal behaviour, not something replay must fix (third-party host+path families folded across query variants)`);
         }
     }
 

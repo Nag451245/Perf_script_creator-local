@@ -681,6 +681,28 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         flat.push(e);
     });
 
+    // CORRELATION-BLIND CHECK. Correlation reads values OUT of responses; if
+    // the recording carries none (a JMX whose sidecar never paired), every
+    // dynamic token ships as the recorded literal and the script cannot work.
+    // The pipeline used to sail through this silently and hand over a
+    // hardcoded-token script, which is the worst possible outcome: it looks
+    // finished. Say it loudly, at the top, where it is still fixable.
+    {
+        const withBody = flat.filter(e => String((e.response && e.response.content && e.response.content.text) || '')).length;
+        const pct = flat.length ? Math.round((withBody / flat.length) * 100) : 0;
+        if (flat.length && withBody === 0) {
+            note('correlation-blind',
+                'NO response bodies in the recording — correlation is IMPOSSIBLE, every dynamic value will ship as the recorded literal',
+                `${flat.length} request(s), 0 with a response body`,
+                'a JMX holds only REQUESTS: pair it with the recording.xml/JTL captured during that session (the response side). Without it this script cannot replay — tokens, session ids and CSRF values stay hardcoded.');
+        } else if (flat.length >= 10 && pct < 25) {
+            note('correlation-blind',
+                `only ${pct}% of requests have a response body — correlation coverage will be poor`,
+                `${withBody}/${flat.length} request(s) carry a response`,
+                'values produced by the bodyless requests cannot be extracted; check the recording captured responses');
+        }
+    }
+
     // 2. Correlate + relevance gate.
     const rawCorrs = new CorrelationEngine().detectCorrelations(flat);
     let { kept: corrs } = filterForGeneration(rawCorrs);

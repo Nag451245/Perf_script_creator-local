@@ -46,12 +46,19 @@ function pathKey(file) {
     return path.normalize(String(file || '')).replace(/\\/g, '/').toLowerCase();
 }
 
-function findSidecarFor(jmxFile, allFiles) {
+/** Path-keys already claimed, so no sidecar is handed to two scripts. */
+function takenKeys(consumed, ...extra) {
+    const set = new Set([...(consumed || [])].map(pathKey));
+    for (const e of extra) if (e) set.add(pathKey(e));
+    return set;
+}
+
+function findSidecarFor(jmxFile, allFiles, taken = new Set()) {
     const dir = path.dirname(jmxFile);
     const stem = path.basename(jmxFile).replace(/\.jmx$/i, '');
     for (const suf of JTL_SIDECAR_SUFFIXES) {
         const candidate = path.join(dir, stem + suf);
-        if (fs.existsSync(candidate)) return candidate;
+        if (fs.existsSync(candidate) && !taken.has(pathKey(candidate))) return candidate;
     }
     // Also accept any same-stem .xml/.jtl uploaded into the SAME folder even
     // if naming differs slightly (case-insensitive prefix match).
@@ -59,8 +66,9 @@ function findSidecarFor(jmxFile, allFiles) {
     return allFiles.find(f =>
         path.dirname(f) === dir &&
         /\.(xml|jtl)$/i.test(f) &&
+        !taken.has(pathKey(f)) &&
         path.basename(f).toLowerCase().startsWith(stemLc)
-    ) || findSidecarByContent(jmxFile, allFiles) || null;
+    ) || findSidecarByContent(jmxFile, allFiles, taken) || null;
 }
 
 /**
@@ -155,8 +163,10 @@ function groupInputs(files) {
     }
     for (const [stem, p] of jmxPairs.entries()) {
         if (!(p.run1 && p.run2)) continue;
-        const s1 = findSidecarFor(p.run1, files);
-        const s2 = findSidecarFor(p.run2, files);
+        // run2 must not claim run1's sidecar: content matching alone cannot tell
+        // two captures of the same journey apart, so each claim is exclusive.
+        const s1 = findSidecarFor(p.run1, files, takenKeys(consumed));
+        const s2 = findSidecarFor(p.run2, files, takenKeys(consumed, s1));
         units.push({
             name: stem, kind: 'dual-jmx',
             primary: p.run1, secondary: p.run2,
@@ -169,8 +179,8 @@ function groupInputs(files) {
 
     const contentJmxPair = inferContentJmxPair(files.filter(f => !consumed.has(f) && JMX_RE.test(f)));
     if (contentJmxPair) {
-        const s1 = findSidecarFor(contentJmxPair.primary, files);
-        const s2 = findSidecarFor(contentJmxPair.secondary, files);
+        const s1 = findSidecarFor(contentJmxPair.primary, files, takenKeys(consumed));
+        const s2 = findSidecarFor(contentJmxPair.secondary, files, takenKeys(consumed, s1));
         units.push({
             name: contentJmxPair.stem,
             kind: 'dual-jmx',
@@ -188,7 +198,7 @@ function groupInputs(files) {
     //    consumed so they don't also surface as standalone inputs.
     for (const f of files) {
         if (consumed.has(f) || !JMX_RE.test(f)) continue;
-        const sidecar = findSidecarFor(f, files);
+        const sidecar = findSidecarFor(f, files, takenKeys(consumed));
         units.push({ name: baseName(f), kind: 'jmx', primary: f, secondary: sidecar || undefined });
         consumed.add(f);
         if (sidecar) consumed.add(sidecar);
@@ -541,24 +551,75 @@ function inferContentJmxPair(jmxs) {
     };
 }
 
-function findSidecarByContent(jmxFile, allFiles) {
+/**
+ * The recording ordinal a file name carries: Rec1/R1/run1/_1 -> 1. The whole
+ * point of a dual recording is two captures of the SAME flow, so the ordinal —
+ * not the stem — is what says which sidecar belongs to which script
+ * (Smart_Text_Rec1_14July.jmx <-> Smart_Text_R1_14July.xml).
+ */
+function recordingOrdinal(file) {
+    const stem = path.basename(String(file || '')).replace(/\.(jmx|xml|jtl)$/i, '');
+    const m = stem.match(/(?:^|[_\-\s])(?:rec|run|r)\s*[_\-]?(\d{1,2})(?:[_\-\s]|$)/i);
+    return m ? Number(m[1]) : null;
+}
+
+/**
+ * Content-based sidecar match. RANKS candidates instead of demanding a unique
+ * one: two recordings of the same journey both fingerprint-match every script
+ * of that journey, so "exactly one match" is precisely the case that never
+ * happens for a dual recording — and returning null there left the JMX with no
+ * responses at all, which silently produces a script with every dynamic token
+ * hardcoded. Rank by matching recording ordinal first, then by sequence
+ * similarity (a script's own capture matches its own request sequence best).
+ */
+function findSidecarByContent(jmxFile, allFiles, taken = new Set()) {
     if (!fs.existsSync(jmxFile)) return null;
     const jmx = readJmxFingerprint(jmxFile);
     if (!jmx.ok) return null;
-    const matches = [];
+    const wantOrdinal = recordingOrdinal(jmxFile);
+    const scored = [];
     for (const file of allFiles) {
         if (!/\.(xml|jtl)$/i.test(file) || !fs.existsSync(file)) continue;
+        if (taken.has(pathKey(file))) continue;
         const fp = readSidecarFingerprint(file);
-        if (fp.ok && fingerprintsLookSameFlow(jmx, fp)) matches.push(file);
+        if (!fp.ok || !fingerprintsLookSameFlow(jmx, fp)) continue;
+        const ordinal = recordingOrdinal(file);
+        scored.push({
+            file,
+            ordinalMatch: wantOrdinal != null && ordinal === wantOrdinal ? 1 : 0,
+            similarity: sequenceSimilarity(jmx.sequence, fp.sequence),
+        });
     }
-    return matches.length === 1 ? matches[0] : null;
+    if (!scored.length) return null;
+    scored.sort((a, b) => (b.ordinalMatch - a.ordinalMatch) || (b.similarity - a.similarity));
+    return scored[0].file;
 }
 
 function fingerprintsLookSameFlow(a, b) {
     if (!a || !b || !a.sequence || !b.sequence) return false;
     if (Math.min(a.sequence.length, b.sequence.length) < 1) return false;
     if (!hostsOverlap(a.hosts, b.hosts)) return false;
-    return sequenceSimilarity(a.sequence, b.sequence) >= 0.7;
+    if (sequenceSimilarity(a.sequence, b.sequence) >= 0.7) return true;
+    // METHOD-BLIND retry. A proxy recording labels samples by raw path
+    // ("/log?format=json"), so the JTL carries no method and every sample reads
+    // as GET — comparing "POST /log" to "GET /log" then fails a script against
+    // its OWN capture (measured live: 0.53 with methods, 0.99 on paths alone).
+    // Paths in order are identity enough; demand a higher bar to compensate.
+    if (!methodsAreKnown(a) || !methodsAreKnown(b)) {
+        return sequenceSimilarity(pathsOf(a.sequence), pathsOf(b.sequence)) >= 0.85;
+    }
+    return false;
+}
+
+/** A fingerprint whose samples are ALL GET almost certainly never knew any. */
+function methodsAreKnown(fp) {
+    const seq = (fp && fp.sequence) || [];
+    if (seq.length < 3) return true;
+    return !seq.every(s => String(s).startsWith('GET '));
+}
+
+function pathsOf(sequence) {
+    return (sequence || []).map(s => String(s).replace(/^[A-Z]+\s+/, ''));
 }
 
 function hostsOverlap(a = [], b = []) {
@@ -600,8 +661,12 @@ function analyzeInputFiles(files) {
             issues.push({
                 code: 'jmx_missing_sidecar',
                 file: u.primary,
-                severity: 'warning',
-                message: `Found JMX ${path.basename(u.primary)} but no matching response sidecar (recording.xml/JTL) by name or request sequence.`,
+                // NOT a warning: without responses, correlation is not merely
+                // degraded, it is IMPOSSIBLE — every dynamic token ships as the
+                // recorded literal and the script cannot work on any replay.
+                // Shipping that quietly is worse than refusing to ship.
+                severity: 'error',
+                message: `${path.basename(u.primary)} has no response sidecar (recording.xml/JTL): a JMX carries only REQUESTS, so there is nothing to correlate FROM and every dynamic value (tokens, session ids) would ship hardcoded. Upload the recording XML/JTL captured with this script.`,
             });
         }
     }

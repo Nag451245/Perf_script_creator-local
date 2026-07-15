@@ -6970,3 +6970,53 @@ test('final green gate: auth wall is hoisted to a TOP-LEVEL category and leads t
     assert.match(gate.reason, /LOGIN page/);
     assert.match(gate.reason, /counted as PASSING/);
 });
+
+// ── sidecar pairing: proxy recordings carry no method, names may differ ───
+test('ingest: pairs Rec1.jmx<->R1.xml by content when methods are unknowable and names differ', () => {
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_pair_'));
+    const sampler = (method, p) => `<HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${p}" enabled="true">
+        <stringProp name="HTTPSampler.domain">app.test</stringProp>
+        <stringProp name="HTTPSampler.path">${p}</stringProp>
+        <stringProp name="HTTPSampler.method">${method}</stringProp></HTTPSamplerProxy>`;
+    // The script knows its methods (POST login); the proxy JTL labels by path only.
+    const paths = ['/', '/login', '/dashboard', '/patients', '/chart', '/save'];
+    const jmx = `<jmeterTestPlan><hashTree>${paths.map((p, i) => sampler(i === 1 || i === 5 ? 'POST' : 'GET', p)).join('')}</hashTree></jmeterTestPlan>`;
+    const jtl = `<?xml version="1.0"?><testResults version="1.2">${paths.map(p =>
+        `<httpSample t="1" ts="1" s="true" lb="${p}"><java.net.URL>https://app.test${p}</java.net.URL></httpSample>`).join('')}</testResults>`;
+    fs.writeFileSync(path.join(dir, 'Smart_Text_Rec1_14July.jmx'), jmx);
+    fs.writeFileSync(path.join(dir, 'Smart_Text_R1_14July.xml'), jtl);
+    fs.writeFileSync(path.join(dir, 'Smart_Text_Rec2_14July.jmx'), jmx);
+    fs.writeFileSync(path.join(dir, 'Smart_Text_R2_14July.xml'), jtl);
+
+    const files = fs.readdirSync(dir).map(f => path.join(dir, f));
+    const a = analyzeInputFiles(files);
+    // Two captures of one journey pair up as a dual-jmx unit; what matters is
+    // that each script got its OWN ordinal-matched capture and none was shared.
+    const dual = a.units.find(u => u.kind === 'dual-jmx');
+    assert.ok(dual, 'two recordings of the same flow form a dual unit');
+    assert.strictEqual(path.basename(dual.sidecars.primary || ''), 'Smart_Text_R1_14July.xml');
+    assert.strictEqual(path.basename(dual.sidecars.secondary || ''), 'Smart_Text_R2_14July.xml');
+    // The per-script (individual) view pairs by ordinal too.
+    const singles = a.units.filter(u => u.individual && /Smart_Text_Rec/i.test(u.name));
+    assert.deepStrictEqual(
+        singles.map(u => `${path.basename(u.primary)}=>${path.basename(u.secondary || 'NONE')}`),
+        ['Smart_Text_Rec1_14July.jmx=>Smart_Text_R1_14July.xml', 'Smart_Text_Rec2_14July.jmx=>Smart_Text_R2_14July.xml']);
+    assert.ok(!a.issues.some(i => i.code === 'jmx_missing_sidecar'), 'both scripts paired');
+    fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('ingest: a JMX with no response side is an ERROR, not a warning (correlation is impossible)', () => {
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_nosidecar_'));
+    fs.writeFileSync(path.join(dir, 'lonely.jmx'), `<jmeterTestPlan><hashTree>
+        <HTTPSamplerProxy testclass="HTTPSamplerProxy" testname="/x"><stringProp name="HTTPSampler.domain">a.test</stringProp>
+        <stringProp name="HTTPSampler.path">/x</stringProp><stringProp name="HTTPSampler.method">GET</stringProp></HTTPSamplerProxy>
+        </hashTree></jmeterTestPlan>`);
+    const a = analyzeInputFiles([path.join(dir, "lonely.jmx")]);
+    const issue = a.issues.find(i => i.code === 'jmx_missing_sidecar');
+    assert.ok(issue, 'must be reported');
+    assert.strictEqual(issue.severity, 'error');
+    assert.match(issue.message, /nothing to correlate FROM/);
+    fs.rmSync(dir, { recursive: true, force: true });
+});

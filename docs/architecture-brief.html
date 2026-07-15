@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PerfScript Studio — In Brief</title>
+<meta name="description" content="PerfScript Studio in brief — what the JMeter correlation agent does, in one screen.">
+<style>*,*::before,*::after{box-sizing:border-box} html{-webkit-text-size-adjust:100%}</style>
+<style>
+  :root{
+    --ink:#0E2A30; --teal:#028090; --seafoam:#00A896; --mint:#02C39A;
+    --coral:#FF6B6B; --gold:#F2B705; --ice:#CBE6E2;
+
+    --ground:#EDF3F3; --surface:#FFFFFF; --surface-2:#F5F9F9;
+    --line:#D3E2E1; --line-soft:#E3EDEC;
+    --text:#0E2A30; --text-2:#41626A; --text-3:#6E888D; --chip:#F0F6F5;
+    --shadow:0 1px 0 rgba(14,42,48,.03), 0 10px 30px rgba(14,42,48,.07);
+
+    --display:Cambria,Georgia,"Times New Roman",serif;
+    --body:"Segoe UI",Calibri,system-ui,-apple-system,sans-serif;
+    --mono:Consolas,"Cascadia Mono","Courier New",monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ground:#08171B; --surface:#0E262C; --surface-2:#123037; --line:#1E4048;
+      --line-soft:#173840; --text:#E4F0EE; --text-2:#A9C6C6; --text-3:#7A9A9C;
+      --chip:#123037; --ice:#9FC8C4;
+      --shadow:0 1px 0 rgba(255,255,255,.02), 0 14px 34px rgba(0,0,0,.42);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#08171B; --surface:#0E262C; --surface-2:#123037; --line:#1E4048;
+    --line-soft:#173840; --text:#E4F0EE; --text-2:#A9C6C6; --text-3:#7A9A9C;
+    --chip:#123037; --ice:#9FC8C4;
+    --shadow:0 1px 0 rgba(255,255,255,.02), 0 14px 34px rgba(0,0,0,.42);
+  }
+  :root[data-theme="light"]{
+    --ground:#EDF3F3; --surface:#FFFFFF; --surface-2:#F5F9F9; --line:#D3E2E1;
+    --line-soft:#E3EDEC; --text:#0E2A30; --text-2:#41626A; --text-3:#6E888D;
+    --chip:#F0F6F5; --ice:#CBE6E2;
+    --shadow:0 1px 0 rgba(14,42,48,.03), 0 10px 30px rgba(14,42,48,.07);
+  }
+
+  body{
+    margin:0; background:var(--ground); color:var(--text);
+    font-family:var(--body); font-size:15px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px; margin:0 auto; padding:26px 24px 28px;}
+
+  .top{display:flex; flex-direction:column; gap:8px; margin-bottom:20px;}
+  .eyebrow{
+    margin:0; font-family:var(--mono); font-size:11px; letter-spacing:.17em;
+    text-transform:uppercase; color:var(--teal);
+  }
+  h1{
+    margin:0; font-family:var(--display); font-weight:700;
+    font-size:clamp(26px,3.3vw,36px); line-height:1.08; letter-spacing:-.015em;
+    text-wrap:balance; max-width:20ch;
+  }
+  .sub{margin:0; color:var(--text-2); font-size:15px; max-width:64ch;}
+
+  /* ── the five beats ─────────────────────────────── */
+  .chain{
+    display:grid; grid-template-columns:repeat(5,1fr); gap:11px; margin-bottom:12px;
+  }
+  .beat{
+    position:relative; background:var(--surface); border:1px solid var(--line);
+    border-radius:13px; padding:13px 13px 12px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; gap:7px;
+  }
+  .beat::after{
+    content:""; position:absolute; right:-12px; top:50%; width:12px; height:2px;
+    background:var(--seafoam); opacity:.55; z-index:1;
+  }
+  .beat:last-child::after{display:none;}
+  .beat-top{display:flex; align-items:center; gap:9px;}
+  .pin{width:8px; height:8px; border-radius:50%; background:var(--teal); flex:none;}
+  .beat h2{
+    margin:0; font-family:var(--display); font-size:17px; font-weight:700;
+    letter-spacing:-.01em;
+  }
+  .beat p{margin:0; font-size:13.5px; color:var(--text-2);}
+  .beat code{
+    font-family:var(--mono); font-size:11px; color:var(--text-3);
+    background:var(--chip); border:1px solid var(--line-soft); border-radius:6px;
+    padding:2px 7px; align-self:flex-start; margin-top:auto;
+  }
+
+  .flowline{
+    display:flex; align-items:center; gap:10px; margin:0 0 14px;
+    font-family:var(--mono); font-size:11.5px; color:var(--text-3);
+  }
+  .flowline::before, .flowline::after{
+    content:""; height:1px; background:var(--line); flex:1;
+  }
+
+  /* ── gates ──────────────────────────────────────── */
+  .gates{
+    background:color-mix(in srgb, var(--coral) 6%, var(--surface));
+    border:1px solid color-mix(in srgb, var(--coral) 38%, var(--line));
+    border-radius:13px; padding:13px 15px; margin-bottom:12px;
+  }
+  .gates h3{
+    margin:0 0 3px; font-family:var(--display); font-size:17px; letter-spacing:-.01em;
+  }
+  .gates > p{margin:0 0 9px; font-size:13.5px; color:var(--text-2); max-width:76ch;}
+  .gate-row{display:grid; grid-template-columns:repeat(4,1fr); gap:9px;}
+  .g{
+    background:var(--surface); border:1px solid var(--line-soft);
+    border-left:2px solid var(--coral); border-radius:8px; padding:9px 11px;
+  }
+  .g b{display:block; font-size:13px; margin-bottom:2px;}
+  .g span{font-size:12px; color:var(--text-3); line-height:1.4;}
+
+  /* ── three facts ────────────────────────────────── */
+  .facts{display:grid; grid-template-columns:repeat(3,1fr); gap:11px; margin-bottom:12px;}
+  .f{
+    background:var(--surface); border:1px solid var(--line); border-radius:13px;
+    padding:12px 14px; display:flex; flex-direction:column; gap:3px;
+  }
+  .f b{
+    font-family:var(--display); font-size:15.5px; display:flex; align-items:center; gap:8px;
+  }
+  .f b::before{content:""; width:14px; height:2px; border-radius:2px; flex:none;}
+  .f.loop b::before{background:var(--gold);}
+  .f.mem b::before{background:var(--mint);}
+  .f.free b::before{background:var(--teal);}
+  .f p{margin:0; font-size:13px; color:var(--text-2);}
+
+  .out{
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    background:var(--ink); border-radius:13px; padding:13px 17px; color:var(--ice);
+    box-shadow:var(--shadow);
+  }
+  .out .dot{width:9px; height:9px; border-radius:50%; background:var(--mint); flex:none;}
+  .out b{font-family:var(--mono); font-size:14px; color:#fff;}
+  .out span{font-size:13.5px;}
+
+  @media (max-width:960px){
+    .chain{grid-template-columns:repeat(2,1fr);}
+    .beat::after{display:none;}
+    .gate-row{grid-template-columns:repeat(2,1fr);}
+    .facts{grid-template-columns:1fr;}
+  }
+  @media (max-width:560px){
+    .wrap{padding:24px 14px 34px;}
+    .chain{grid-template-columns:1fr;}
+    .gate-row{grid-template-columns:1fr;}
+  }
+  @media print{
+    :root{--ground:#fff; --surface:#fff;}
+    @page{margin:12mm; size:landscape;}
+    body{background:#fff;}
+    .wrap{padding:0; max-width:none;}
+    .beat,.gates,.f,.out{break-inside:avoid; box-shadow:none;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <p class="eyebrow">PerfScript Studio · in brief</p>
+    <h1>Drop in a recording. Get back a JMeter script that actually runs.</h1>
+    <p class="sub">
+      A recording replays perfectly once, then dies — every token in it was single-use.
+      Fixing that by hand is days of work. This does it, and proves it.
+    </p>
+  </header>
+
+  <div class="chain">
+    <div class="beat">
+      <div class="beat-top"><span class="pin"></span><h2>Read</h2></div>
+      <p>Pairs your script with the recording that captured it, and strips the secrets.</p>
+      <code>ingest.js</code>
+    </div>
+    <div class="beat">
+      <div class="beat-top"><span class="pin"></span><h2>Understand</h2></div>
+      <p>Works out the business journey, names each step, and reads what it's about to hammer.</p>
+      <code>senior-pe.js</code>
+    </div>
+    <div class="beat">
+      <div class="beat-top"><span class="pin"></span><h2>Correlate</h2></div>
+      <p>Finds every value that changes per session and wires it to the response that makes it.</p>
+      <code>generate.js</code>
+    </div>
+    <div class="beat">
+      <div class="beat-top"><span class="pin"></span><h2>Prove</h2></div>
+      <p>Runs it in real JMeter, reads the responses, and fixes what it can explain.</p>
+      <code>runner.js</code>
+    </div>
+    <div class="beat">
+      <div class="beat-top"><span class="pin"></span><h2>Ship</h2></div>
+      <p>Hands over the script, the verdict, and the honest list of what's left for you.</p>
+      <code>final-artifact.js</code>
+    </div>
+  </div>
+
+  <div class="flowline">evidence accumulates left to right — nothing is assumed</div>
+
+  <section class="gates">
+    <h3>Four gates decide whether it ships</h3>
+    <p>This is the difference between a script generator and an engineer: a passing status code is not success.</p>
+    <div class="gate-row">
+      <div class="g"><b>Will it even send?</b><span>Proves every variable resolves before spending a run.</span></div>
+      <div class="g"><b>Is anyone logged in?</b><span>Catches the 200 that quietly returns the login page.</span></div>
+      <div class="g"><b>Did the work happen?</b><span>Checks the business outcome, not just the response code.</span></div>
+      <div class="g"><b>Are these the right bytes?</b><span>Verifies the exact file handed to you, and fingerprints it.</span></div>
+    </div>
+  </section>
+
+  <div class="facts">
+    <div class="f loop">
+      <b>It changes its mind</b>
+      <p>When fixes run out it re-plans and rebuilds a different way, rather than patching harder.</p>
+    </div>
+    <div class="f mem">
+      <b>It remembers</b>
+      <p>Only fixes proven green are kept — and applied before the first request next time.</p>
+    </div>
+    <div class="f free">
+      <b>It costs nothing to run</b>
+      <p>The whole pipeline is deterministic and local. AI is optional and off by default.</p>
+    </div>
+  </div>
+
+  <div class="out">
+    <span class="dot"></span>
+    <b>00_USE_THIS_FINAL_VALIDATED.jmx</b>
+    <span>— plus a debrief explaining every decision it made, in plain language.</span>
+  </div>
+</div>
+</body>
+</html>

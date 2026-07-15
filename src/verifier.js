@@ -76,6 +76,13 @@ function diffRunAgainstRecording({ outDir, flatEntries, jtlPath: explicitJtlPath
     if (!jtlPath) return { jtlPath: null, samplesCompared: 0, drift: [] };
 
     const evidence = runEvidence.buildRunEvidence({ entries: flatEntries || [], jtlPath });
+    // This evidence becomes the runner's currentEvidence (it supersedes the
+    // attempt evidence), so it must carry bodies too — otherwise the body-based
+    // gates (auth wall, soft failures) silently see nothing and pass.
+    const bodySource = findLastJtl(outDir);
+    if (bodySource && bodySource !== jtlPath) {
+        runEvidence.backfillObservedBodies({ evidence, sourceJtlPath: bodySource });
+    }
     const rows = evidence.rows.filter(r => !r.isTransaction);
     const drift = [];
     const folded = [];

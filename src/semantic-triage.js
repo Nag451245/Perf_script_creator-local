@@ -21,6 +21,13 @@
  * lineage variable Z — re-record or refresh the data."
  */
 
+// A login page, recognised by shape rather than by any app's wording: a
+// password field, or a login form/title. Deliberately narrow — the recording
+// comparison below is what makes a hit conclusive.
+const PASSWORD_INPUT_RE = /<input[^>]+type\s*=\s*["']?password["']?/i;
+const LOGIN_TITLE_RE = /<title>[^<]*\b(?:log\s?in|sign\s?in|authentication|anmelden|connexion)\b[^<]*<\/title>/i;
+const LOGIN_FORM_RE = /<form[^>]+action\s*=\s*["'][^"']*\b(?:login|signin|authenticate|session)\b/i;
+
 const ERROR_FIELD_RE = /"(?:error|error_message|errorMessage|message|detail|details|reason|fault|faultstring)"\s*:\s*"([^"]{4,300})"/gi;
 const HTML_TITLE_RE = /<title>([^<]{4,120})<\/title>/i;
 const PHRASE_RE = /((?:[A-Za-z][\w\s]{2,40})?(?:not\s+found|no\s+longer\s+(?:exists|available)|does\s+not\s+exist|expired|invalid|locked|denied|unauthoriz|forbidden|deleted|missing|already\s+(?:exists|used))[^.<"{}]{0,80})/gi;
@@ -95,6 +102,66 @@ function buildSentSources({ csvHeader = [], csvRow = [], lineage = [], extraLite
     return map;
 }
 
+function loginMarkers(body) {
+    const text = String(body || '');
+    const hits = [];
+    if (PASSWORD_INPUT_RE.test(text)) hits.push('a password input');
+    if (LOGIN_TITLE_RE.test(text)) hits.push(`the page title "${(text.match(/<title>([^<]*)<\/title>/i) || [])[1] || ''}"`.slice(0, 60));
+    if (LOGIN_FORM_RE.test(text)) hits.push('a form posting to a login/authenticate action');
+    return hits;
+}
+
+/**
+ * THE AUTH WALL — the failure mode that makes a green run a lie.
+ *
+ * When a session isn't established, most apps don't answer 401: they answer
+ * 200 and hand back the LOGIN PAGE. JMeter records rc=200, s=true, and the
+ * whole flow "passes" while never touching the application. This is the single
+ * most dangerous false pass in load testing, and no status-code check can see
+ * it — only the body can.
+ *
+ * The verdict is evidence-based, so it needs no app knowledge and can't fire on
+ * a genuine login page: the LIVE body shows login markers that the RECORDED
+ * body for the SAME request did not. The recording proves what this endpoint
+ * looks like when authenticated; anything else is the wall.
+ */
+function detectAuthWall({ label = '', observedBody = '', recordedBody = '' } = {}) {
+    const live = loginMarkers(observedBody);
+    if (!live.length) return null;
+    const recorded = loginMarkers(recordedBody);
+    // The recorded response for this very request already looked like a login
+    // page (this IS the login screen) — not a wall, just the flow.
+    const newMarkers = live.filter(m => !recorded.includes(m));
+    if (!newMarkers.length) return null;
+    if (!String(recordedBody || '').trim()) return null; // no baseline => no claim
+    return {
+        label,
+        category: 'auth_wall',
+        evidence: `live response shows ${newMarkers.join(' and ')}; the recorded response for this request did not`,
+        recordedTitle: (String(recordedBody).match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
+        observedTitle: (String(observedBody).match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
+        ask: `The server returned the LOGIN page for "${label}" with an HTTP 200, so JMeter counted it as a pass. The session is not established — every "passing" sampler after login is measuring the login page, not the application. Fix the authentication handshake before trusting any number from this run.`,
+    };
+}
+
+/**
+ * Scan aligned evidence rows for the auth wall. Returns the affected rows plus
+ * the earliest one — the place to actually fix.
+ */
+function findAuthWall(rows = []) {
+    const walls = [];
+    for (const r of rows || []) {
+        if (!r || r.isTransaction) continue;
+        const hit = detectAuthWall({ label: r.label, observedBody: r.observedBody, recordedBody: r.recordedBody });
+        if (hit) walls.push({ ...hit, entryIndex: r.entryIndex, observedStatus: r.observedStatus, passed: r.success !== false });
+    }
+    return {
+        walls,
+        earliest: walls.length ? walls.slice().sort((a, b) => (a.entryIndex || 0) - (b.entryIndex || 0))[0] : null,
+        falsePasses: walls.filter(w => w.passed).length,
+    };
+}
+
 /**
  * Triage one failing sample: reasons + classification + named data sources.
  */
@@ -119,4 +186,7 @@ function triageFailure({ label = '', responseBody = '', sentSources = {} } = {})
     };
 }
 
-module.exports = { triageFailure, serverReasons, buildSentSources, _internal: { classify, crossReference } };
+module.exports = {
+    triageFailure, serverReasons, buildSentSources, detectAuthWall, findAuthWall,
+    _internal: { classify, crossReference, loginMarkers },
+};

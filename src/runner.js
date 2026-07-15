@@ -912,9 +912,22 @@ function runSemanticTriage({ result = {}, evidence = null, gen = {}, outDir = ''
         }
     } catch { /* best effort */ }
     const sentSources = semanticTriage.buildSentSources({ csvHeader, csvRow, lineage: gen.lineage || [] });
-    const rows = (evidence && evidence.rows) || [];
+    // Response bodies live in the ITERATION jtl, not the SimpleDataWriter
+    // final.jtl (which stores none) — read the last iteration's, and fall back
+    // to whatever the evidence rows captured.
     const bodyByLabel = new Map();
-    for (const r of rows) if (r && r.observedBody) bodyByLabel.set(String(r.label || '').trim(), r.observedBody);
+    for (const r of (evidence && evidence.rows) || []) {
+        if (r && r.observedBody) bodyByLabel.set(String(r.label || '').trim(), r.observedBody);
+    }
+    try {
+        const iterJtl = findLastJtl(outDir);
+        if (iterJtl && fs.existsSync(iterJtl)) {
+            for (const s of runEvidence.summarizeJtlXml(fs.readFileSync(iterJtl, 'utf8')) || []) {
+                const label = String(s.label || '').trim();
+                if (s.responseBody && !bodyByLabel.has(label)) bodyByLabel.set(label, s.responseBody);
+            }
+        }
+    } catch { /* best effort — triage is evidence, never a blocker */ }
     const out = [];
     for (const s of result.samples || []) {
         if (!s || s.isTransaction || s.success !== false) continue;
@@ -931,11 +944,29 @@ function buildAttemptRunEvidence({ entries = [], stableJtl = '', outDir = '', on
     try {
         const jtlPath = stableJtl && fs.existsSync(stableJtl) ? stableJtl : findLastJtl(outDir);
         if (!jtlPath) return null;
-        return runEvidence.buildRunEvidence({ entries, jtlPath });
+        const evidence = runEvidence.buildRunEvidence({ entries, jtlPath });
+        backfillObservedBodies({ evidence, outDir, jtlPath });
+        // Say out loud whether the body-based gates (auth wall, soft failures)
+        // can see anything: a gate that silently had no bodies is a gate that
+        // passed everything for the wrong reason.
+        const real = (evidence.rows || []).filter(r => !r.isTransaction);
+        const withBody = real.filter(r => String(r.observedBody || '')).length;
+        const comparable = real.filter(r => String(r.observedBody || '') && String(r.recordedBody || '')).length;
+        onLog(`run evidence: ${real.length} row(s) from ${path.basename(jtlPath)} · ${withBody} with a response body` +
+            `${evidence.observedBodiesBackfilled ? ` (${evidence.observedBodiesBackfilled} backfilled from the iteration JTL)` : ''}` +
+            ` · ${comparable} comparable to the recording`);
+        return evidence;
     } catch (e) {
         onLog(`run evidence skipped: ${e.message}`);
         return null;
     }
+}
+
+/** Fill body-less rows from the iteration JTL (see run-evidence for why). */
+function backfillObservedBodies({ evidence, outDir = '', jtlPath = '' }) {
+    const iterJtl = findLastJtl(outDir);
+    if (!iterJtl || iterJtl === jtlPath) return;
+    runEvidence.backfillObservedBodies({ evidence, sourceJtlPath: iterJtl });
 }
 
 /**
@@ -2428,6 +2459,10 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         }
     }
 
+    {
+        const gr = (currentEvidence && currentEvidence.rows || []).filter(r => !r.isTransaction);
+        onLog(`green gate input: ${gr.length} evidence row(s) · ${gr.filter(r => String(r.observedBody || '')).length} with bodies · ${gr.filter(r => String(r.observedBody || '') && String(r.recordedBody || '')).length} comparable`);
+    }
     const finalGate = finalGreenGate.evaluateFinalGreenGate({
         result: finalResult,
         baselineDiff,
@@ -2536,6 +2571,9 @@ module.exports = {
     runLlmPatchRounds,
     _internal: {
         classifyEnvironmentFailure,
+        backfillObservedBodies,
+        enabledSamplerSurface,
+        runSemanticTriage,
         watchForStallOrCap,
         runLogShowsEndOfTest,
         latestIterationDirFor,

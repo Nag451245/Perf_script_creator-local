@@ -6776,14 +6776,14 @@ test('repeat navigation: exact-URL GET repeat with no new session material is fl
 });
 
 // ── semantic triage: server said ↔ script sent ────────────────────────────
-const semanticTriageMod = require('../src/semantic-triage');
+const semanticTriage = require('../src/semantic-triage');
 
 test('semantic triage: names the CSV column behind a stale-data rejection', () => {
-    const sentSources = semanticTriageMod.buildSentSources({
+    const sentSources = semanticTriage.buildSentSources({
         csvHeader: ['userName', 'AptID'], csvRow: ['AshtonK', '844599527'],
         lineage: [{ name: 'CaseID', value: '59341829' }],
     });
-    const t = semanticTriageMod.triageFailure({
+    const t = semanticTriage.triageFailure({
         label: 'T07_/saveSOAP.php-071',
         responseBody: '{"error":"Appointment 844599527 not found or no longer exists"}',
         sentSources,
@@ -6795,9 +6795,9 @@ test('semantic triage: names the CSV column behind a stale-data rejection', () =
 });
 
 test('semantic triage: classifies auth and validation reasons without data matches', () => {
-    const a = semanticTriageMod.triageFailure({ label: 'x', responseBody: '{"message":"session expired, please login"}', sentSources: {} });
+    const a = semanticTriage.triageFailure({ label: 'x', responseBody: '{"message":"session expired, please login"}', sentSources: {} });
     assert.strictEqual(a.category, 'auth');
-    const v = semanticTriageMod.triageFailure({ label: 'y', responseBody: '{"detail":"field startDate is invalid"}', sentSources: {} });
+    const v = semanticTriage.triageFailure({ label: 'y', responseBody: '{"detail":"field startDate is invalid"}', sentSources: {} });
     assert.strictEqual(v.category, 'validation');
 });
 
@@ -6901,4 +6901,72 @@ test('computed-value source: points at the JS file and line that computes an unc
     assert.match(src.snippet, /sha256/);
     assert.match(src.ask, /JSR223 pre-processor/);
     assert.strictEqual(topologyMod.findComputedValueSource(entries, 'nothingHere'), null);
+});
+
+// ── auth wall: the 200-OK login page that fakes a green run ───────────────
+test('auth wall: login page where the recording had app content is caught, even at HTTP 200/pass', () => {
+    const rows = [
+        { label: 'T01_/dashboard.php-034', entryIndex: 34, observedStatus: 200, success: true,
+          recordedBody: '<html><head><title>WebPT Dashboard</title></head><body>real content</body></html>',
+          observedBody: '<html><head><title>Login</title></head><body><input type="password" name="pw"></body></html>' },
+        { label: 'T01_/user/login-031', entryIndex: 31, observedStatus: 200, success: true,
+          recordedBody: '<html><head><title>Login</title></head><body><input type="password"></body></html>',
+          observedBody: '<html><head><title>Login</title></head><body><input type="password"></body></html>' },
+    ];
+    const r = semanticTriage.findAuthWall(rows);
+    assert.strictEqual(r.walls.length, 1, 'the real login screen is not a wall; the dashboard turning into login is');
+    assert.strictEqual(r.earliest.label, 'T01_/dashboard.php-034');
+    assert.strictEqual(r.falsePasses, 1, 'it PASSED in JMeter — that is the danger');
+    assert.match(r.earliest.ask, /session is not established/);
+});
+
+test('auth wall: no recorded baseline or no login markers means no claim', () => {
+    assert.strictEqual(semanticTriage.detectAuthWall({ label: 'x', observedBody: '<input type="password">', recordedBody: '' }), null);
+    assert.strictEqual(semanticTriage.detectAuthWall({ label: 'x', observedBody: '<p>data</p>', recordedBody: '<p>data</p>' }), null);
+});
+
+test('final green gate: an auth wall fails the gate outright', () => {
+    const evidence = { rows: [
+        { label: 'T01_/dashboard.php-034', entryIndex: 34, observedStatus: 200, success: true, recordedStatus: 200,
+          recordedBodyLength: 40, observedBodyLength: 40,
+          recordedBody: '<title>WebPT Dashboard</title>', observedBody: '<title>Login</title><input type="password">' },
+    ] };
+    const gate = finalGreenGate._internal.evaluateEvidenceGate(evidence, {});
+    const wall = gate.failures.find(f => f.category === 'auth_wall');
+    assert.ok(wall, 'gate must fail on an auth wall');
+    assert.match(wall.detail, /counted as PASSING/);
+});
+
+test('run evidence: successful rows get bodies backfilled from the iteration JTL (on-error capture blinds the gates)', () => {
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_backfill_'));
+    fs.mkdirSync(path.join(dir, 'iteration_1'));
+    // The engine's iteration JTL carries bodies even for successful samples.
+    fs.writeFileSync(path.join(dir, 'iteration_1', 'results.jtl'),
+        `<?xml version="1.0"?><testResults version="1.2">
+<httpSample t="5" lb="T01_/dashboard.php-002" rc="200" s="true">
+<responseData class="java.lang.String">&lt;title&gt;Login&lt;/title&gt;&lt;input type="password"&gt;</responseData>
+</httpSample>
+</testResults>`);
+    const evidence = { rows: [
+        { label: 'T01_/dashboard.php-002', isTransaction: false, observedBody: '', observedBodyLength: 0, success: true },
+    ] };
+    runnerInternal.backfillObservedBodies({ evidence, outDir: dir, jtlPath: path.join(dir, 'final.jtl') });
+    assert.strictEqual(evidence.observedBodiesBackfilled, 1);
+    assert.match(evidence.rows[0].observedBody, /Login/);
+    assert.strictEqual(evidence.rows[0].observedBodyBackfilled, true);
+    fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('final green gate: auth wall is hoisted to a TOP-LEVEL category and leads the reason', () => {
+    const evidence = { rows: [
+        { label: 'T01_/dashboard.php-034', entryIndex: 34, observedStatus: 200, success: true, recordedStatus: 200,
+          recordedBodyLength: 40, observedBodyLength: 40,
+          recordedBody: '<title>WebPT Dashboard</title>', observedBody: '<title>Login</title><input type="password">' },
+    ] };
+    const gate = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence });
+    assert.strictEqual(gate.ok, false, 'an unauthenticated run can never be green');
+    assert.strictEqual(gate.failures[0].category, 'auth_wall', 'must lead, not be buried in drift details');
+    assert.match(gate.reason, /LOGIN page/);
+    assert.match(gate.reason, /counted as PASSING/);
 });

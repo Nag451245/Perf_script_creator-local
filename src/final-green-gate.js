@@ -1,6 +1,7 @@
 'use strict';
 
 const statusAnalysis = require('./status-analysis');
+const semanticTriage = require('./semantic-triage');
 
 // 200-status responses that carry an application-level failure. These are the
 // "everything 200 but nothing worked" bodies: GraphQL error envelopes, SOAP
@@ -85,11 +86,23 @@ function evaluateFinalGreenGate({
     }
 
     const evidenceGate = evaluateEvidenceGate(evidence, { softFailurePatterns });
-    if (evidenceGate.failures.length) {
+    // The auth wall is hoisted to its own TOP-LEVEL category and put FIRST: it
+    // is not "drift", it is the whole run being a lie, and burying it inside a
+    // details[] array of a generic drift failure is how a false green survives.
+    const authWalls = evidenceGate.failures.filter(f => f.category === 'auth_wall');
+    const otherEvidenceFailures = evidenceGate.failures.filter(f => f.category !== 'auth_wall');
+    if (authWalls.length) {
+        failures.unshift({
+            category: 'auth_wall',
+            reason: authWalls[0].reason,
+            details: authWalls,
+        });
+    }
+    if (otherEvidenceFailures.length) {
         failures.push({
             category: 'recording_evidence_drift',
-            reason: evidenceGate.failures[0].reason,
-            details: evidenceGate.failures,
+            reason: otherEvidenceFailures[0].reason,
+            details: otherEvidenceFailures,
         });
     }
     if (evidenceGate.businessErrors.length) {
@@ -121,6 +134,28 @@ function evaluateEvidenceGate(evidence, opts = {}) {
     const softFailureRes = compileSoftFailurePatterns(opts.softFailurePatterns);
     if (!evidence || !Array.isArray(evidence.rows)) return { failures, warnings, businessErrors };
     const rows = evidence.rows || [];
+
+    // THE AUTH WALL outranks every other check. An unauthenticated run answers
+    // 200 with the login page, so JMeter passes every sampler and the verdict
+    // reads green while the script never touched the application. Any sampler
+    // whose live body is a login page its RECORDED body was not proves the
+    // session is gone — no number from this run means anything.
+    const authWall = semanticTriage.findAuthWall(rows);
+    if (authWall.walls.length) {
+        const e = authWall.earliest;
+        const detail = `${authWall.walls.length} sampler(s) returned the LOGIN page instead of application content` +
+            (authWall.falsePasses ? ` — ${authWall.falsePasses} of them counted as PASSING (HTTP ${e.observedStatus})` : '') +
+            `. Earliest: "${e.label}" (recorded "${e.recordedTitle || 'app content'}", observed "${e.observedTitle || 'login'}"). The session is not established; every downstream "pass" is measuring the login page, not the application.`;
+        failures.push({
+            category: 'auth_wall',
+            index: e.entryIndex,
+            sampler: e.label,
+            reason: detail,
+            detail,
+            walls: authWall.walls.map(w => ({ sampler: w.label, passed: w.passed, observedTitle: w.observedTitle })),
+        });
+    }
+
     let bodyComparable = 0;
     for (const row of rows) {
         if (row.isTransaction) continue;

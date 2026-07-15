@@ -41,6 +41,39 @@ function buildRunEvidence({ entries = [], jtlPath = '', samples = [] } = {}) {
     return { rows, samples: observedSamples, jtlPath: jtlPath || null };
 }
 
+/**
+ * Body capture defaults to ON-ERROR, so a sampler that "succeeds" stores no
+ * response body in the SimpleDataWriter JTL — exactly backwards for the checks
+ * that matter, because an auth wall or a soft business failure IS a 200. The
+ * engine's per-iteration JTL does carry bodies, so fill the empty rows from it
+ * by label (last occurrence wins, as elsewhere). Every consumer of evidence
+ * must go through here: a gate that silently had no bodies passes everything
+ * for the wrong reason.
+ * @returns {number} how many rows were filled
+ */
+function backfillObservedBodies({ evidence, sourceJtlPath = '' } = {}) {
+    const rows = (evidence && evidence.rows) || [];
+    if (!rows.length || !sourceJtlPath || !fs.existsSync(sourceJtlPath)) return 0;
+    if (!rows.some(r => !r.isTransaction && !String(r.observedBody || ''))) return 0;
+    const bodyByLabel = new Map();
+    for (const s of summarizeJtlXml(fs.readFileSync(sourceJtlPath, 'utf8')) || []) {
+        if (s && s.label && s.responseBody) bodyByLabel.set(String(s.label).trim(), s.responseBody);
+    }
+    if (!bodyByLabel.size) return 0;
+    let filled = 0;
+    for (const r of rows) {
+        if (r.isTransaction || String(r.observedBody || '')) continue;
+        const body = bodyByLabel.get(String(r.label || '').trim());
+        if (!body) continue;
+        r.observedBody = body;
+        r.observedBodyLength = String(body).length;
+        r.observedBodyBackfilled = true;
+        filled++;
+    }
+    if (filled) evidence.observedBodiesBackfilled = (evidence.observedBodiesBackfilled || 0) + filled;
+    return filled;
+}
+
 function summarizeJtlFast(jtlPath) {
     if (!jtlPath || !fs.existsSync(jtlPath)) return [];
     const xml = fs.readFileSync(jtlPath, 'utf8');
@@ -279,6 +312,7 @@ function unescapeXml(value) {
 
 module.exports = {
     buildRunEvidence,
+    backfillObservedBodies,
     summarizeJtlFast,
     summarizeJtlXml,
     _internal: {

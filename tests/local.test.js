@@ -6862,3 +6862,43 @@ test('proactive lessons: no appHost means no proactive application at all', () =
     assert.deepStrictEqual(
         learningStore.findProactiveLessons({ samplers: [{ name: 'x' }], appHost: '' }), []);
 });
+
+// ── dev-eye evidence: topology + computed-value source ───────────────────
+const topologyMod = require('../src/topology');
+
+test('topology: F5 affinity cookies group into ONE high-severity finding with the load implication', () => {
+    const resp = (cookies, extra = []) => ({ response: { status: 200, headers: [
+        ...cookies.map(c => ({ name: 'Set-Cookie', value: `${c}=abc; path=/` })), ...extra,
+    ], content: { mimeType: 'text/html', text: '' } } });
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/a' }, ...resp(['TS01dc4fc6'], [{ name: 'Server', value: 'volt-adc' }]) },
+        { request: { method: 'GET', url: 'https://app.test/b' }, ...resp(['TS016becb2'], [{ name: 'Server', value: 'volt-adc' }]) },
+        { request: { method: 'GET', url: 'https://app.test/c' }, ...resp(['sessionid']) },
+    ];
+    const { findings } = topologyMod.analyzeTopology(entries);
+    const affinity = findings.filter(f => f.signal === 'session_affinity');
+    assert.strictEqual(affinity.length, 1, 'two TS* cookies from one balancer = one topology fact');
+    assert.strictEqual(affinity[0].severity, 'high');
+    assert.match(affinity[0].implication, /per-thread/);
+    assert.ok(findings.some(f => f.signal === 'edge_tier' && f.tech === 'volt-adc'));
+});
+
+test('topology: cacheable API flagged; no-store API not flagged', () => {
+    const api = (cc) => ({ request: { method: 'GET', url: 'https://app.test/api/x' }, response: { status: 200,
+        headers: [{ name: 'Cache-Control', value: cc }], content: { mimeType: 'application/json', text: '{}' } } });
+    assert.ok(topologyMod.analyzeTopology([api('max-age=28800')]).findings.some(f => f.signal === 'cacheable_api'));
+    assert.ok(!topologyMod.analyzeTopology([api('no-store')]).findings.some(f => f.signal === 'cacheable_api'));
+});
+
+test('computed-value source: points at the JS file and line that computes an uncorrelatable value', () => {
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/js/sign.js' }, response: { status: 200,
+            content: { mimeType: 'application/javascript', text: 'function f(){\n  var sigHash = sha256(user + nonce);\n  return sigHash;\n}' } } },
+    ];
+    const src = topologyMod.findComputedValueSource(entries, 'sigHash');
+    assert.strictEqual(src.file, '/js/sign.js');
+    assert.strictEqual(src.line, 2);
+    assert.match(src.snippet, /sha256/);
+    assert.match(src.ask, /JSR223 pre-processor/);
+    assert.strictEqual(topologyMod.findComputedValueSource(entries, 'nothingHere'), null);
+});

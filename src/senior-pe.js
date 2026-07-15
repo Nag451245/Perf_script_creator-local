@@ -2,6 +2,7 @@
 
 const { _internal: { samplerLabel } } = require('./value-flow-decisions');
 const domainKnowledge = require('./domain-knowledge');
+const topology = require('./topology');
 
 const DEFAULT_OBJECTIVE = 'mixed-load capacity';
 
@@ -33,6 +34,16 @@ function buildSeniorPeDebrief({
     const validityGates = buildValidityGates({ objective, flow, nativeManagers, stats, domainProfile });
     const negativeSpace = buildNegativeSpaceAudit({ objective, entries, polling, runCfg, domainProfile });
     const coverage = estimateCoverage({ valueLedger, correlations, plannedExtractors, stats });
+    // What am I about to hammer? Session affinity, edge/CDN tiers and cacheable
+    // APIs don't change whether the script REPLAYS, but they decide whether the
+    // eventual numbers mean anything — the question a dev-savvy PE asks first.
+    const infrastructure = topology.analyzeTopology(entries).findings;
+    // For values nobody can correlate (the browser computed them), name the code
+    // that computes them so the ask is "port this", not "we couldn't find it".
+    const computedValueSources = (ghosts || [])
+        .map(g => topology.findComputedValueSource(entries, g && (g.name || g.variable || g.param)))
+        .filter(Boolean)
+        .slice(0, 6);
 
     return {
         name,
@@ -41,6 +52,8 @@ function buildSeniorPeDebrief({
         stackFingerprint,
         domainProfile,
         nativeManagers,
+        infrastructure,
+        computedValueSources,
         valueLedger,
         validityGates,
         negativeSpace,
@@ -343,6 +356,29 @@ function renderSeniorPeDebriefMarkdown(debrief) {
         lines.push(`- Application key: ${debrief.domainProfile.applicationKey}`);
         if (debrief.domainProfile.slo && Object.keys(debrief.domainProfile.slo).length) lines.push(`- SLO: ${JSON.stringify(debrief.domainProfile.slo)}`);
         if (debrief.domainProfile.domainNotes.length) lines.push(`- Notes: ${debrief.domainProfile.domainNotes.join('; ')}`);
+        lines.push('');
+    }
+    if ((debrief.infrastructure || []).length) {
+        lines.push('## What You Are About To Hammer');
+        lines.push('');
+        lines.push('Read off the recording\'s own response headers/cookies. None of this affects whether the');
+        lines.push('script replays — all of it affects whether the resulting numbers mean anything.');
+        lines.push('');
+        for (const f of debrief.infrastructure) {
+            lines.push(`- **${f.signal}** (${f.tech}) — _${f.severity}_`);
+            lines.push(`  - evidence: ${f.evidence}`);
+            lines.push(`  - ${f.implication}`);
+        }
+        lines.push('');
+    }
+    if ((debrief.computedValueSources || []).length) {
+        lines.push('## Client-Computed Values (no extractor can capture these)');
+        lines.push('');
+        for (const c of debrief.computedValueSources) {
+            lines.push(`- **${c.param}** — computed at \`${c.file}:${c.line}\``);
+            lines.push(`  - code: \`${String(c.snippet).slice(0, 160)}\``);
+            lines.push(`  - ${c.ask}`);
+        }
         lines.push('');
     }
     lines.push('## Value Ledger');

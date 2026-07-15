@@ -2000,6 +2000,14 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         }
     }
 
+    // Infrastructure facts that decide whether the eventual numbers mean
+    // anything (session affinity above all) belong in the operator's face, not
+    // only in a debrief file they may never open.
+    for (const f of ((gen.seniorPeDebrief && gen.seniorPeDebrief.infrastructure) || []).filter(x => x.severity === 'high')) {
+        onLog(`topology: ${f.tech} — ${f.evidence}`);
+        onLog(`  → ${f.implication.split('.')[0]}.`);
+    }
+
     // ── PROACTIVE EXPERIENCE: apply what we already proved on THIS host ────
     // A senior returning to an app they scripted last month doesn't re-suffer
     // the same failures to re-derive the same fixes. Host-scoped, >=0.9

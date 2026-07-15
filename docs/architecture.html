@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PerfScript Studio — Agent Architecture</title>
+<meta name="description" content="Architecture of the PerfScript Studio JMeter correlation agent — 70 modules, six stages, four gates.">
+<style>*,*::before,*::after{box-sizing:border-box} html{-webkit-text-size-adjust:100%}</style>
+<style>
+  :root{
+    /* Carried from the PerfScript demo deck so the diagram sits with it. */
+    --ink:#0E2A30; --teal:#028090; --seafoam:#00A896; --mint:#02C39A;
+    --coral:#FF6B6B; --gold:#F2B705; --ice:#CBE6E2;
+
+    --ground:#EDF3F3;          /* cool ground, biased toward the teal accent */
+    --surface:#FFFFFF;
+    --surface-2:#F5F9F9;
+    --line:#D3E2E1;
+    --line-soft:#E3EDEC;
+    --text:#0E2A30;
+    --text-2:#41626A;
+    --text-3:#6E888D;
+    --chip:#F0F6F5;
+    --shadow:0 1px 0 rgba(14,42,48,.03), 0 10px 30px rgba(14,42,48,.07);
+
+    --display:Cambria,Georgia,"Times New Roman",serif;
+    --body:"Segoe UI",Calibri,system-ui,-apple-system,sans-serif;
+    --mono:Consolas,"Cascadia Mono","Courier New",monospace;
+
+    --rail:2px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ground:#08171B; --surface:#0E262C; --surface-2:#123037; --line:#1E4048;
+      --line-soft:#173840; --text:#E4F0EE; --text-2:#A9C6C6; --text-3:#7A9A9C;
+      --chip:#123037; --ice:#9FC8C4;
+      --shadow:0 1px 0 rgba(255,255,255,.02), 0 14px 34px rgba(0,0,0,.42);
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#08171B; --surface:#0E262C; --surface-2:#123037; --line:#1E4048;
+    --line-soft:#173840; --text:#E4F0EE; --text-2:#A9C6C6; --text-3:#7A9A9C;
+    --chip:#123037; --ice:#9FC8C4;
+    --shadow:0 1px 0 rgba(255,255,255,.02), 0 14px 34px rgba(0,0,0,.42);
+  }
+  :root[data-theme="light"]{
+    --ground:#EDF3F3; --surface:#FFFFFF; --surface-2:#F5F9F9; --line:#D3E2E1;
+    --line-soft:#E3EDEC; --text:#0E2A30; --text-2:#41626A; --text-3:#6E888D;
+    --chip:#F0F6F5; --ice:#CBE6E2;
+    --shadow:0 1px 0 rgba(14,42,48,.03), 0 10px 30px rgba(14,42,48,.07);
+  }
+
+  body{
+    margin:0; background:var(--ground); color:var(--text);
+    font-family:var(--body); font-size:15px; line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1120px; margin:0 auto; padding:40px 24px 72px;}
+
+  /* ── masthead ─────────────────────────────────────────── */
+  .masthead{display:flex; flex-direction:column; gap:14px; margin-bottom:34px;}
+  .eyebrow{
+    font-family:var(--mono); font-size:11.5px; letter-spacing:.16em;
+    text-transform:uppercase; color:var(--teal); margin:0;
+  }
+  h1{
+    font-family:var(--display); font-weight:700; font-size:clamp(30px,4.4vw,46px);
+    line-height:1.06; letter-spacing:-.015em; margin:0; text-wrap:balance;
+  }
+  .standfirst{
+    margin:0; max-width:64ch; color:var(--text-2); font-size:16.5px;
+  }
+  .facts{display:flex; flex-wrap:wrap; gap:10px; margin-top:6px;}
+  .fact{
+    display:flex; align-items:baseline; gap:7px; background:var(--surface);
+    border:1px solid var(--line); border-radius:999px; padding:5px 13px;
+  }
+  .fact b{font-family:var(--mono); font-size:13px; font-variant-numeric:tabular-nums; color:var(--teal);}
+  .fact span{font-size:12.5px; color:var(--text-3);}
+
+  /* ── legend ───────────────────────────────────────────── */
+  .legend{
+    display:flex; flex-wrap:wrap; gap:18px; padding:13px 16px; margin-bottom:26px;
+    background:var(--surface-2); border:1px solid var(--line-soft); border-radius:12px;
+  }
+  .key{display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--text-2);}
+  .swatch{width:22px; height:10px; border-radius:3px; flex:none;}
+  .swatch.det{background:var(--teal);}
+  .swatch.gate{background:var(--coral);}
+  .swatch.ai{background:transparent; border:1.5px dashed var(--gold);}
+  .swatch.mem{background:var(--mint);}
+
+  /* ── the spine ────────────────────────────────────────── */
+  .spine{position:relative; display:flex; flex-direction:column; gap:0;}
+
+  .stage{
+    position:relative; background:var(--surface); border:1px solid var(--line);
+    border-radius:14px; box-shadow:var(--shadow); overflow:hidden;
+  }
+  .stage-h{
+    display:flex; align-items:flex-start; gap:14px; padding:16px 18px 14px;
+    border-bottom:1px solid var(--line-soft); background:var(--surface-2);
+  }
+  .stage-mark{
+    width:var(--rail); align-self:stretch; border-radius:2px; background:var(--teal); flex:none;
+  }
+  .stage-title{display:flex; flex-direction:column; gap:3px; min-width:0;}
+  .stage-title h2{
+    font-family:var(--display); font-size:19px; font-weight:700; margin:0; letter-spacing:-.01em;
+  }
+  .stage-title p{margin:0; color:var(--text-2); font-size:13.5px; max-width:78ch;}
+  .conductor{
+    margin-left:auto; font-family:var(--mono); font-size:11.5px; color:var(--text-3);
+    background:var(--chip); border:1px solid var(--line); border-radius:7px;
+    padding:4px 9px; white-space:nowrap; align-self:center;
+  }
+  .mods{
+    display:grid; grid-template-columns:repeat(auto-fill,minmax(232px,1fr));
+    gap:9px; padding:15px 18px 18px;
+  }
+  .mod{
+    background:var(--chip); border:1px solid var(--line-soft); border-radius:9px;
+    padding:9px 11px; display:flex; flex-direction:column; gap:3px; min-width:0;
+  }
+  .mod code{
+    font-family:var(--mono); font-size:12.5px; color:var(--text); word-break:break-word;
+  }
+  .mod span{font-size:12px; color:var(--text-3); line-height:1.42;}
+  .mod.hero{border-color:var(--teal); background:color-mix(in srgb, var(--teal) 8%, var(--chip));}
+  .mod.hero code{color:var(--teal); font-weight:700;}
+  .mod.ai{border-style:dashed; border-color:var(--gold);}
+  .mod.ai code{color:var(--gold);}
+
+  /* flow connector between stages */
+  .flow{
+    display:flex; flex-direction:column; align-items:center; gap:0;
+    height:34px; justify-content:center; position:relative;
+  }
+  .flow::before{
+    content:""; width:2px; height:100%; background:linear-gradient(var(--teal),var(--seafoam));
+    opacity:.5;
+  }
+  .flow-label{
+    position:absolute; left:50%; transform:translateX(14px);
+    font-family:var(--mono); font-size:11px; color:var(--text-3); white-space:nowrap;
+  }
+
+  /* ── gates cut across the flow ─────────────────────────── */
+  .gate{
+    display:flex; align-items:flex-start; gap:13px; padding:13px 16px;
+    border:1px solid color-mix(in srgb, var(--coral) 45%, var(--line));
+    background:color-mix(in srgb, var(--coral) 7%, var(--surface));
+    border-radius:12px;
+  }
+  .gate-mark{width:var(--rail); align-self:stretch; background:var(--coral); border-radius:2px; flex:none;}
+  .gate-b{display:flex; flex-direction:column; gap:2px; min-width:0;}
+  .gate-b h3{
+    margin:0; font-size:14px; font-family:var(--body); font-weight:700;
+    display:flex; align-items:baseline; gap:9px; flex-wrap:wrap;
+  }
+  .gate-b h3 code{font-family:var(--mono); font-size:12px; font-weight:400; color:var(--coral);}
+  .gate-b p{margin:0; font-size:13px; color:var(--text-2); max-width:82ch;}
+
+  /* ── loop + memory rails ──────────────────────────────── */
+  .rail{
+    border-radius:12px; padding:14px 16px; display:flex; gap:13px; align-items:flex-start;
+  }
+  .rail.loop{
+    border:1.5px dashed color-mix(in srgb, var(--gold) 60%, var(--line));
+    background:color-mix(in srgb, var(--gold) 6%, var(--surface));
+  }
+  .rail.mem{
+    border:1px solid color-mix(in srgb, var(--mint) 40%, var(--line));
+    background:color-mix(in srgb, var(--mint) 6%, var(--surface));
+  }
+  .rail-mark{width:var(--rail); align-self:stretch; border-radius:2px; flex:none;}
+  .rail.loop .rail-mark{background:var(--gold);}
+  .rail.mem .rail-mark{background:var(--mint);}
+  .rail-b{display:flex; flex-direction:column; gap:8px; min-width:0; width:100%;}
+  .rail-b h2{
+    font-family:var(--display); font-size:17px; margin:0; letter-spacing:-.01em;
+    display:flex; align-items:baseline; gap:10px; flex-wrap:wrap;
+  }
+  .rail-b h2 em{
+    font:400 11.5px/1 var(--mono); font-style:normal; letter-spacing:.1em;
+    text-transform:uppercase; color:var(--text-3);
+  }
+  .rail-b > p{margin:0; font-size:13.5px; color:var(--text-2); max-width:80ch;}
+  .rail .mods{padding:4px 0 0; grid-template-columns:repeat(auto-fill,minmax(228px,1fr));}
+
+  .endcap{
+    display:flex; align-items:center; gap:12px; padding:14px 18px; border-radius:12px;
+    background:var(--ink); color:var(--ice); border:1px solid var(--ink);
+  }
+  :root[data-theme="dark"] .endcap, .endcap{box-shadow:var(--shadow);}
+  .endcap .dot{width:9px; height:9px; border-radius:50%; background:var(--mint); flex:none;}
+  .endcap b{font-family:var(--display); font-size:16px; color:#fff;}
+  .endcap span{font-size:13px; color:var(--ice);}
+  .endcap code{font-family:var(--mono); font-size:12px; color:var(--gold);}
+
+  .foot{
+    margin-top:30px; padding-top:16px; border-top:1px solid var(--line);
+    font-size:12.5px; color:var(--text-3); display:flex; gap:8px; flex-wrap:wrap;
+  }
+  .foot code{font-family:var(--mono);}
+
+  @media (max-width:640px){
+    .wrap{padding:26px 14px 50px;}
+    .mods{grid-template-columns:1fr;}
+    .conductor{display:none;}
+    .stage-h{flex-wrap:wrap;}
+  }
+  @media (prefers-reduced-motion:no-preference){
+    .stage,.gate,.rail{transition:border-color .15s ease;}
+  }
+</style>
+
+<style media="print">
+  /* Print: commit to the light ground, keep every accent, never split a stage. */
+  :root{ --ground:#FFFFFF; --surface:#FFFFFF; --surface-2:#F5F9F9; --line:#C7DAD9;
+         --line-soft:#E3EDEC; --text:#0E2A30; --text-2:#41626A; --text-3:#5E7C82; --chip:#F4F8F8; }
+  @page{ margin:14mm; }
+  body{ background:#fff; font-size:11.5pt; }
+  .wrap{ max-width:none; padding:0; }
+  .stage,.gate,.rail,.endcap{ break-inside:avoid; page-break-inside:avoid; box-shadow:none; }
+  .stage{ margin:0; }
+  .mods{ grid-template-columns:repeat(3,1fr); }
+  .conductor{ display:inline-block; }
+  .flow{ height:18px; }
+  .masthead{ margin-bottom:18px; }
+  a{ text-decoration:none; color:inherit; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Architecture · 70 modules · deterministic core</p>
+    <h1>How PerfScript Studio turns a recording into a script that actually runs</h1>
+    <p class="standfirst">
+      Recordings go in at the top. Every stage below adds evidence, and four gates refuse to let
+      an unproven script through. Nothing here needs an LLM — the gold, dashed modules are the
+      only ones that ever call one, and they stay off unless you turn them on.
+    </p>
+    <div class="facts">
+      <div class="fact"><b>70</b><span>modules</span></div>
+      <div class="fact"><b>~20k</b><span>lines</span></div>
+      <div class="fact"><b>335</b><span>tests pinning behaviour</span></div>
+      <div class="fact"><b>0</b><span>LLM calls by default</span></div>
+    </div>
+  </header>
+
+  <div class="legend">
+    <div class="key"><span class="swatch det"></span> Deterministic — always runs, free</div>
+    <div class="key"><span class="swatch gate"></span> Gate — can stop the script shipping</div>
+    <div class="key"><span class="swatch ai"></span> AI-optional — off unless enabled</div>
+    <div class="key"><span class="swatch mem"></span> Memory — survives the run</div>
+  </div>
+
+  <div class="spine">
+
+    <!-- INTAKE -->
+    <section class="stage">
+      <div class="stage-h">
+        <div class="stage-mark"></div>
+        <div class="stage-title">
+          <h2>Intake</h2>
+          <p>Read what you dropped in, pair each script with the recording that captured it, and strip the secrets before anything is written to disk.</p>
+        </div>
+        <div class="conductor">ingest.js</div>
+      </div>
+      <div class="mods">
+        <div class="mod hero"><code>ingest.js</code><span>Pairs a JMX with its recording XML — by name, then by content when names differ (Rec1 ↔ R1). No recording means no responses, which it now calls an error, not a warning.</span></div>
+        <div class="mod"><code>scrubber.js</code><span>Removes passwords and tokens from the stored recording.</span></div>
+        <div class="mod"><code>input-state.js</code><span>Remembers which files were already processed.</span></div>
+        <div class="mod"><code>upload-files.js</code><span>Carries file uploads through into the script.</span></div>
+        <div class="mod"><code>engine.js</code><span>Bridge to the read-only correlation engine underneath.</span></div>
+        <div class="mod"><code>agent-config.js</code><span>Resolves run options and modes.</span></div>
+        <div class="mod"><code>gemini-model.js</code><span>Picks the model, only if AI is switched on.</span></div>
+        <div class="mod"><code>ui-server.js</code><span>The local web app; spawns each run as its own process.</span></div>
+        <div class="mod"><code>ui-page.js</code><span>The interface you click — inputs, run panel, history.</span></div>
+        <div class="mod"><code>ui-inputs.js</code><span>Which recordings a run should use.</span></div>
+        <div class="mod"><code>ui-run-mode.js</code><span>Turns your choices into run flags (scenario code is per-run here).</span></div>
+        <div class="mod"><code>ui-config.js</code><span>Saved settings: target URL, credentials, load profile.</span></div>
+        <div class="mod"><code>ui-process-control.js</code><span>Start, stop and follow a running agent.</span></div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="flow-label">requests + responses</span></div>
+
+    <!-- UNDERSTAND -->
+    <section class="stage">
+      <div class="stage-h">
+        <div class="stage-mark"></div>
+        <div class="stage-title">
+          <h2>Understand</h2>
+          <p>Work out what the journey actually is, what it runs on, and what to call each step — before touching a single request.</p>
+        </div>
+        <div class="conductor">senior-pe.js</div>
+      </div>
+      <div class="mods">
+        <div class="mod hero"><code>senior-pe.js</code><span>The debrief a senior would write: objective, every value and why it was kept, coverage.</span></div>
+        <div class="mod hero"><code>topology.js</code><span>Reads the infrastructure off the recording's own headers — F5 session affinity, CDN tiers, cacheable APIs — and says what each means for your numbers.</span></div>
+        <div class="mod"><code>flow-understanding.js</code><span>Reconstructs the business journey from raw traffic.</span></div>
+        <div class="mod"><code>pe-naming.js</code><span>Names transactions and samplers (SC01_T02_Login). Scenario code lives here.</span></div>
+        <div class="mod"><code>playbooks.js</code><span>Known patterns for common stacks.</span></div>
+        <div class="mod"><code>domain-knowledge.js</code><span>Your SLOs and domain notes.</span></div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="flow-label">a named, understood flow</span></div>
+
+    <!-- BUILD -->
+    <section class="stage">
+      <div class="stage-h">
+        <div class="stage-mark"></div>
+        <div class="stage-title">
+          <h2>Build the script</h2>
+          <p>The correlation craft: find every value that changes per session, wire it to the response that produces it, and fold away what should never be replayed.</p>
+        </div>
+        <div class="conductor">generate.js</div>
+      </div>
+      <div class="mods">
+        <div class="mod hero"><code>generate.js</code><span>Conducts the whole build and writes the JMX.</span></div>
+        <div class="mod hero"><code>transforms.js</code><span>The correlation rules that rewrite recorded values into live ones.</span></div>
+        <div class="mod"><code>extractors.js</code><span>Picks and proves the right extractor (JSON, regex, CSS) against the recording.</span></div>
+        <div class="mod"><code>auto-correlate.js</code><span>Finds value → consumer pairs automatically.</span></div>
+        <div class="mod"><code>correlation-hypotheses.js</code><span>Proposes candidates when the obvious link is missing.</span></div>
+        <div class="mod"><code>replay-correlate.js</code><span>Confirms a correlation by replaying it.</span></div>
+        <div class="mod hero"><code>js-challenge-token.js</code><span>Rotating anti-automation tokens whose parameter <em>name and value</em> both change each deploy — extracted live from the page.</span></div>
+        <div class="mod"><code>pkce.js</code><span>OAuth PKCE verifier/challenge pairs.</span></div>
+        <div class="mod"><code>graphql-auth-repair.js</code><span>GraphQL auth bodies and headers.</span></div>
+        <div class="mod"><code>volatile-protocol.js</code><span>Values that must never be replayed as recorded.</span></div>
+        <div class="mod"><code>date-intent.js</code><span>Recorded dates become relative to run time, not stale literals.</span></div>
+        <div class="mod"><code>host-rewrite.js</code><span>Points the script at your target environment.</span></div>
+        <div class="mod"><code>redirect-hops.js</code><span>Spots duplicate redirect hops and repeat navigations the browser recorded.</span></div>
+        <div class="mod"><code>fold-safety.js</code><span>Refuses to fold anything that uniquely produces a downstream value.</span></div>
+        <div class="mod"><code>outcome-probe.js</code><span>Adds the assertion that proves the business step really happened.</span></div>
+        <div class="mod"><code>scenario.js</code><span>Thread group, pacing and load profile.</span></div>
+        <div class="mod"><code>upload-files.js</code><span>Re-attaches uploaded documents.</span></div>
+        <div class="mod"><code>golden-diff.js</code><span>Learns from a script a human already fixed by hand.</span></div>
+        <div class="mod"><code>java-safe.js</code><span>Keeps the JMX safe for the installed Java/JMeter.</span></div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="flow-label">a script — not yet trusted</span></div>
+
+    <div class="gate">
+      <div class="gate-mark"></div>
+      <div class="gate-b">
+        <h3>Gate 0 — will it even send? <code>rendered-request-check.js · live-probe.js</code></h3>
+        <p>Statically proves every <code>${variable}</code> resolves before a single request is fired, then asks the live site whether the values the recording captured have rotated since. Cheap answers first; JMeter time is expensive.</p>
+      </div>
+    </div>
+
+    <div class="flow"></div>
+
+    <!-- VALIDATE -->
+    <section class="stage">
+      <div class="stage-h">
+        <div class="stage-mark"></div>
+        <div class="stage-title">
+          <h2>Run &amp; observe</h2>
+          <p>Run it in real JMeter against your environment and gather evidence — not just status codes, but what the server actually sent back.</p>
+        </div>
+        <div class="conductor">runner.js</div>
+      </div>
+      <div class="mods">
+        <div class="mod hero"><code>runner.js</code><span>Drives the run→diagnose→fix→re-run loop and every gate around it.</span></div>
+        <div class="mod hero"><code>run-evidence.js</code><span>Pairs each replayed request with its recorded twin — and backfills response bodies, because a "successful" sampler stores none.</span></div>
+        <div class="mod"><code>verifier.js</code><span>Diffs the run against the recording.</span></div>
+        <div class="mod"><code>request-diff.js</code><span>What the script sent vs what the browser sent.</span></div>
+        <div class="mod"><code>status-analysis.js</code><span>Traces a failure back to its earliest cause.</span></div>
+        <div class="mod"><code>response-evidence.js</code><span>Quotes the response that justifies each decision.</span></div>
+        <div class="mod"><code>semantic-response.js</code><span>Reads a body for meaning, not just its status.</span></div>
+        <div class="mod"><code>fast-replay.js</code><span>Tests a hypothesis in seconds instead of a full run.</span></div>
+        <div class="mod"><code>fast-repair-loop.js</code><span>Applies quick, provable repairs.</span></div>
+        <div class="mod"><code>run-progress.js</code><span>Live progress, and notices a stalled parse.</span></div>
+        <div class="mod"><code>steering.js</code><span>Lets you talk to the agent mid-run.</span></div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="flow-label">samples + response bodies</span></div>
+
+    <!-- JUDGE -->
+    <section class="stage">
+      <div class="stage-h">
+        <div class="stage-mark"></div>
+        <div class="stage-title">
+          <h2>Judge the evidence</h2>
+          <p>Decide what each failure means — a real defect, harmless noise, a sick environment, or stale data — and never disable something the business needs.</p>
+        </div>
+        <div class="conductor">post-run-adjudicator.js</div>
+      </div>
+      <div class="mods">
+        <div class="mod hero"><code>semantic-triage.js</code><span>Reads what the server <em>said</em> and cross-references the ids in its complaint against what the script sent — naming the CSV column behind a rejection. Also catches the auth wall.</span></div>
+        <div class="mod hero"><code>business-guard.js</code><span>Protects requests the business outcome depends on — nothing may disable them to force a green.</span></div>
+        <div class="mod"><code>post-run-adjudicator.js</code><span>Weighs every failure and decides the action.</span></div>
+        <div class="mod"><code>nonloadbearing-fold.js</code><span>A step that failed while everything after it passed isn't load-bearing — proven by re-running without it.</span></div>
+        <div class="mod"><code>value-flow-decisions.js</code><span>Does anything downstream actually consume this?</span></div>
+        <div class="mod"><code>sampler-decision.js</code><span>Keep, fold, or fix — per sampler.</span></div>
+        <div class="mod"><code>failure-classifier.js</code><span>Script bug, environment, or data?</span></div>
+        <div class="mod"><code>failure-forensics.js</code><span>Builds the evidence trail behind each verdict.</span></div>
+      </div>
+    </section>
+
+    <div class="flow"></div>
+
+    <div class="gate">
+      <div class="gate-mark"></div>
+      <div class="gate-b">
+        <h3>The auth wall — the 200 that lies <code>semantic-triage.js → final-green-gate.js</code></h3>
+        <p>An unauthenticated app doesn't answer 401; it answers 200 with the login page, and JMeter passes every sampler. If a response looks like a login page where the recording's did not, the session is gone and no number from that run means anything. This one fails the gate outright.</p>
+      </div>
+    </div>
+
+    <div class="flow"></div>
+
+    <div class="gate">
+      <div class="gate-mark"></div>
+      <div class="gate-b">
+        <h3>Green gate — is it really green? <code>final-green-gate.js</code></h3>
+        <p>Green means the shipped script passed, verified the business outcome, and matched the recording — judged only on the samplers that actually ship. A passing HTTP status is not enough.</p>
+      </div>
+    </div>
+
+    <div class="flow"></div>
+
+    <div class="gate">
+      <div class="gate-mark"></div>
+      <div class="gate-b">
+        <h3>Ship-point sanitizer — the bytes you open <code>final-artifact.js</code></h3>
+        <p>Checks the exact file being handed to you: reverts any corrupted substitution, re-asserts every fold, then fingerprints it — so if anything rewrites your script later (a JMeter save from a stale tab), the next run says so by name.</p>
+      </div>
+    </div>
+
+    <div class="flow"></div>
+
+    <!-- SHIP -->
+    <section class="stage">
+      <div class="stage-h">
+        <div class="stage-mark"></div>
+        <div class="stage-title">
+          <h2>Ship &amp; explain</h2>
+          <p>Hand over the script, the verdict, and the honest list of what a human still needs to decide.</p>
+        </div>
+        <div class="conductor">final-artifact.js</div>
+      </div>
+      <div class="mods">
+        <div class="mod hero"><code>final-artifact.js</code><span>Writes 00_USE_THIS_FINAL — sanitized, fingerprinted, with the guide.</span></div>
+        <div class="mod"><code>blockers.js</code><span>Precise asks for a human, when the agent genuinely can't proceed.</span></div>
+        <div class="mod"><code>report.js</code><span>The HTML report and run summary.</span></div>
+        <div class="mod"><code>senior-pe-analysis.js</code><span>The engineering debrief in plain language.</span></div>
+        <div class="mod"><code>output-organizer.js</code><span>Tidies the output folder; archives a pristine copy.</span></div>
+        <div class="mod"><code>success-archive.js</code><span>Keeps green runs for later comparison.</span></div>
+      </div>
+    </section>
+
+    <div class="flow"><span class="flow-label">not green? → change the approach</span></div>
+
+    <!-- LOOP -->
+    <div class="rail loop">
+      <div class="rail-mark"></div>
+      <div class="rail-b">
+        <h2>The loop back <em>returns to Build</em></h2>
+        <p>
+          When repairs are exhausted the agent changes <em>approach</em> rather than patching harder: it re-plans,
+          regenerates with a different strategy, and verifies the new script like any other attempt — bounded, and every attempt recorded.
+          The dashed modules are the only ones that ever call an LLM, and only with AI assist switched on.
+        </p>
+        <div class="mods">
+          <div class="mod"><code>replanner.js</code><span>Chooses a different strategy from the failure evidence.</span></div>
+          <div class="mod ai"><code>blueprint-agent.js</code><span>Escalates with the full evidence pack — only if you enable AI.</span></div>
+          <div class="mod ai"><code>blueprint-context.js</code><span>Assembles that evidence.</span></div>
+          <div class="mod ai"><code>llm-patcher.js</code><span>Turns a suggestion into a patch — schema-gated, then re-verified like any other.</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flow"><span class="flow-label">what was proven, kept for next time</span></div>
+
+    <!-- MEMORY -->
+    <div class="rail mem">
+      <div class="rail-mark"></div>
+      <div class="rail-b">
+        <h2>Memory <em>spans every run</em></h2>
+        <p>
+          Only fixes that were verified green are remembered. On the next visit to the same app they are applied
+          <em>before</em> the first request, so the agent doesn't re-suffer a problem it already solved — and any lesson whose
+          request still fails loses confidence.
+        </p>
+        <div class="mods">
+          <div class="mod hero"><code>learning-store.js</code><span>Verified lessons, host-scoped, applied proactively and decayed when they stop working.</span></div>
+          <div class="mod"><code>golden-diff.js</code><span>Learns from a human-corrected script.</span></div>
+          <div class="mod"><code>success-archive.js</code><span>Every green run, kept.</span></div>
+          <div class="mod"><code>input-state.js</code><span>What's already been processed.</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="flow"></div>
+
+    <div class="endcap">
+      <span class="dot"></span>
+      <b>00_USE_THIS_FINAL_VALIDATED.jmx</b>
+      <span>— a script that runs, with the evidence behind every decision in</span>
+      <code>_senior_pe_debrief.md</code>
+    </div>
+
+  </div>
+
+  <p class="foot">
+    <span>Every stage is deterministic and free by default.</span>
+    <span>·</span>
+    <span>The correlation engine underneath is read-only — <code>engine.js</code> is the only door to it.</span>
+  </p>
+</div>
+</body>
+</html>

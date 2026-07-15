@@ -88,6 +88,21 @@ const learningStore = require('./src/learning-store');
 const inputState = require('./src/input-state');
 const { archiveSuccessfulRun } = require('./src/success-archive');
 const { writeFinalJmxPointer } = require('./src/final-artifact');
+
+/**
+ * The deliverable keeps a stable filename, so an editor that opened it during a
+ * PREVIOUS run still holds that old version — and JMeter never reloads a file
+ * changed on disk. Saving from that stale buffer puts the old script back and
+ * looks exactly like "the agent didn't update the script". We cannot prevent
+ * it (locking the file blocks the user's own saves), so we name it.
+ */
+function warnIfStaleEditor(finalMarker, rec) {
+    const stale = finalMarker && finalMarker.staleEditorWarning;
+    if (!stale || !stale.external) return;
+    rec(stale.byJMeter
+        ? 'NOTE: the previous final was rewritten by JMeter after the agent wrote it (a save from a buffer opened before that run). If JMeter still has this file open, close it WITHOUT saving and reopen — otherwise your next save will overwrite this new script with the old one.'
+        : 'NOTE: the previous final was modified outside the agent since it was written. It has now been replaced; reopen it in any editor that still has it open.');
+}
 const runProgress = require('./src/run-progress');
 const outputOrganizer = require('./src/output-organizer');
 const { selectUnits } = require('./src/ui-inputs');
@@ -325,6 +340,7 @@ async function processUnit(unit) {
                 rec(`DONE — verdict=${verdict} · ` +
                     `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
                 rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
+                warnIfStaleEditor(finalMarker, rec);
                 const reportPath = writeHtmlReport(outDir, name, {
                     mode: `generate + run (${mode})`, verdict,
                     stats: out.stats, samples: out.result.samples || [],

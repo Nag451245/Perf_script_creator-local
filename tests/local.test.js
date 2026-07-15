@@ -7020,3 +7020,34 @@ test('ingest: a JMX with no response side is an ERROR, not a warning (correlatio
     assert.match(issue.message, /nothing to correlate FROM/);
     fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ── stale-editor detection: JMeter saving an old buffer over the deliverable ─
+test('final artifact: detects when JMeter rewrote the shipped final from a stale buffer', () => {
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_stale_'));
+    const finalArtifact = require('../src/final-artifact');
+    const sampler = (extra) => `<HTTPSamplerProxy testname="T01_/x-001" enabled="true">${extra}<stringProp name="HTTPSampler.path">/x</stringProp></HTTPSamplerProxy>`;
+    const src = path.join(dir, 'flow.jmx');
+    fs.writeFileSync(src, `<jmeterTestPlan>${sampler('')}</jmeterTestPlan>`);
+
+    // Run 1 ships the final and records its fingerprint.
+    const first = finalArtifact.writeFinalJmxPointer({
+        outDir: dir, name: 'flow', finalJmxPath: src, verdict: 'GREEN', validated: true,
+    });
+    assert.strictEqual(first.staleEditorWarning, null, 'nothing to warn about on a first ship');
+    assert.ok(fs.existsSync(path.join(dir, 'flow_final_fingerprint.json')));
+
+    // JMeter saves its own serialization over it: postBodyRaw on EVERY sampler.
+    fs.writeFileSync(first.finalCopyPath,
+        `<jmeterTestPlan>${sampler('<boolProp name="HTTPSampler.postBodyRaw">false</boolProp>')}</jmeterTestPlan>`);
+
+    // Run 2 notices before overwriting.
+    const second = finalArtifact.writeFinalJmxPointer({
+        outDir: dir, name: 'flow', finalJmxPath: src, verdict: 'GREEN', validated: true,
+    });
+    assert.ok(second.staleEditorWarning, 'external rewrite must be detected');
+    assert.strictEqual(second.staleEditorWarning.external, true);
+    assert.strictEqual(second.staleEditorWarning.byJMeter, true, 'postBodyRaw on every sampler is JMeter serializing');
+    assert.match(fs.readFileSync(second.guidePath, 'utf8'), /close it WITHOUT saving/);
+    fs.rmSync(dir, { recursive: true, force: true });
+});

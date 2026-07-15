@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 /**
  * Last-line-of-defence sanitizer, applied to the EXACT bytes shipped as
@@ -128,6 +129,36 @@ function recordedLiteralFor(varName, outDir, name) {
     } catch { return null; }
 }
 
+function fingerprintOf(xml) {
+    return crypto.createHash('sha256').update(String(xml || ''), 'utf8').digest('hex');
+}
+
+/**
+ * Was the final we shipped last time rewritten by something other than us?
+ * The tell is a file whose hash no longer matches the fingerprint we recorded.
+ * JMeter's serializer also leaves a mark: it emits HTTPSampler.postBodyRaw for
+ * EVERY sampler, while generation only writes it where a raw body exists.
+ * @returns {{external:boolean, byJMeter:boolean, previousHash:string}|null}
+ */
+function detectExternalEdit({ finalCopyPath, outDir, safeName }) {
+    try {
+        const fpPath = path.join(outDir, `${safeName}_final_fingerprint.json`);
+        if (!fs.existsSync(finalCopyPath) || !fs.existsSync(fpPath)) return null;
+        const prev = JSON.parse(fs.readFileSync(fpPath, 'utf8'));
+        const onDisk = fs.readFileSync(finalCopyPath, 'utf8');
+        const hash = fingerprintOf(onDisk);
+        if (!prev.sha256 || hash === prev.sha256) return null;
+        const samplers = (onDisk.match(/<HTTPSamplerProxy\b/g) || []).length;
+        const rawBodyProps = (onDisk.match(/HTTPSampler\.postBodyRaw/g) || []).length;
+        return {
+            external: true,
+            byJMeter: samplers > 0 && rawBodyProps >= samplers,
+            previousHash: prev.sha256,
+            writtenAt: prev.writtenAt || '',
+        };
+    } catch { return null; }
+}
+
 function writeFinalJmxPointer({
     outDir,
     name,
@@ -162,7 +193,25 @@ function writeFinalJmxPointer({
     // lock blocked the USER's own JMeter saves, so protection now rests on the
     // patchAbortRef kill-switch that halts the abandoned engine loop instead).
     try { if (fs.existsSync(finalCopyPath)) fs.chmodSync(finalCopyPath, 0o666); } catch { /* first write */ }
+
+    // STALE-EDITOR DETECTION. The deliverable keeps a stable name, so JMeter is
+    // usually holding the PREVIOUS run's version of this exact path in memory —
+    // and JMeter never reloads a file changed on disk. Saving from that stale
+    // buffer silently writes the old plan (hardcoded tokens and all) back over
+    // a freshly corrected script; the user then sees "the script did not get
+    // updated" and blames the agent. We cannot stop an external editor and must
+    // not lock the file (that blocks the user's own saves), so: fingerprint
+    // what we ship, and notice when what is on disk is not it.
+    const shipped = fingerprintOf(sanitized.xml);
+    const stale = detectExternalEdit({ finalCopyPath, outDir, safeName });
     fs.writeFileSync(finalCopyPath, sanitized.xml);
+    fs.writeFileSync(path.join(outDir, `${safeName}_final_fingerprint.json`), JSON.stringify({
+        file: finalName,
+        sha256: shipped,
+        bytes: Buffer.byteLength(sanitized.xml),
+        writtenAt: new Date().toISOString(),
+        note: 'If the file no longer matches this hash, something outside the agent rewrote it (most often a JMeter save from a buffer opened before this run). Reopen the file in JMeter before trusting what you see.',
+    }, null, 2));
     if (sanitized.notes.length) {
         fs.writeFileSync(path.join(outDir, `${safeName}_final_sanitizer.json`), JSON.stringify(sanitized.notes, null, 2));
     }
@@ -171,6 +220,12 @@ function writeFinalJmxPointer({
     const lines = [
         `USE THIS JMX: ${finalName}`,
         '',
+        ...(stale && stale.external ? [
+            stale.byJMeter
+                ? '!! JMeter rewrote the previous version of this file after the agent produced it (a save from a buffer opened before that run). If it is still open in JMeter, close it WITHOUT saving and reopen it — otherwise saving will put the OLD script back.'
+                : '!! The previous version of this file was modified outside the agent. It has been replaced; reopen it wherever it is still open.',
+            '',
+        ] : []),
         `Verdict: ${verdict}`,
         `JMeter validation: ${validated ? 'RAN' : 'NOT RUN'}`,
         `Source JMX: ${path.basename(finalJmxPath)}`,
@@ -199,7 +254,7 @@ function writeFinalJmxPointer({
     ];
     fs.writeFileSync(guidePath, lines.join('\n') + '\n');
 
-    return { finalCopyPath, guidePath };
+    return { finalCopyPath, guidePath, staleEditorWarning: stale };
 }
 
 module.exports = { writeFinalJmxPointer, _internal: { sanitizeFinalXml } };

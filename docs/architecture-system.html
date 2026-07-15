@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PerfScript Studio — System Architecture</title>
+<meta name="description" content="PerfScript Studio system architecture — processes, data stores, external systems and the flows between them.">
+<style>*,*::before,*::after{box-sizing:border-box} html{-webkit-text-size-adjust:100%}</style>
+<style>
+  :root{
+    --ink:#0E2A30; --teal:#028090; --seafoam:#00A896; --mint:#02C39A;
+    --coral:#FF6B6B; --gold:#F2B705; --ice:#CBE6E2;
+    --ground:#EDF3F3; --surface:#FFFFFF; --surface-2:#F5F9F9; --boundary:#F8FBFB;
+    --line:#C9DCDB; --line-soft:#E3EDEC; --ext:#8AA3A8;
+    --text:#0E2A30; --text-2:#41626A; --text-3:#6E888D;
+    --display:Cambria,Georgia,"Times New Roman",serif;
+    --body:"Segoe UI",Calibri,system-ui,-apple-system,sans-serif;
+    --mono:Consolas,"Cascadia Mono","Courier New",monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ground:#08171B; --surface:#123037; --surface-2:#0E262C; --boundary:#0B2027;
+      --line:#2A5058; --line-soft:#1E4048; --ext:#6E8E93;
+      --text:#E4F0EE; --text-2:#A9C6C6; --text-3:#8FAEB0; --ice:#9FC8C4;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ground:#08171B; --surface:#123037; --surface-2:#0E262C; --boundary:#0B2027;
+    --line:#2A5058; --line-soft:#1E4048; --ext:#6E8E93;
+    --text:#E4F0EE; --text-2:#A9C6C6; --text-3:#8FAEB0; --ice:#9FC8C4;
+  }
+  :root[data-theme="light"]{
+    --ground:#EDF3F3; --surface:#FFFFFF; --surface-2:#F5F9F9; --boundary:#F8FBFB;
+    --line:#C9DCDB; --line-soft:#E3EDEC; --ext:#8AA3A8;
+    --text:#0E2A30; --text-2:#41626A; --text-3:#6E888D; --ice:#CBE6E2;
+  }
+  body{
+    margin:0; background:var(--ground); color:var(--text);
+    font-family:var(--body); font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1330px; margin:0 auto; padding:30px 20px 40px;}
+  header{display:flex; flex-direction:column; gap:7px; margin-bottom:16px;}
+  .eyebrow{margin:0; font-family:var(--mono); font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--teal);}
+  h1{margin:0; font-family:var(--display); font-size:clamp(24px,3vw,33px); font-weight:700; letter-spacing:-.015em; line-height:1.1;}
+  .sub{margin:0; color:var(--text-2); font-size:15px; max-width:84ch;}
+
+  .canvas{
+    background:var(--surface-2); border:1px solid var(--line); border-radius:14px;
+    padding:8px; overflow-x:auto;
+  }
+  svg{display:block; width:100%; height:auto; min-width:980px;}
+
+  .lane-label{font-family:var(--mono); font-size:11px; letter-spacing:.14em; fill:var(--text-3);}
+  .n-title{font-family:var(--display); font-size:14.5px; font-weight:700; fill:var(--text);}
+  .n-sub{font-family:var(--body); font-size:11.5px; fill:var(--text-2);}
+  .n-mod{font-family:var(--mono); font-size:10.5px; fill:var(--text-3);}
+  .edge-label{font-family:var(--mono); font-size:10px; fill:var(--text-3);}
+  .band-title{font-family:var(--display); font-size:13px; font-weight:700; fill:var(--coral);}
+  .chip-t{font-family:var(--body); font-size:11.5px; font-weight:600; fill:var(--text);}
+
+  .box{fill:var(--surface); stroke:var(--line); stroke-width:1;}
+  .box-ext{fill:var(--surface-2); stroke:var(--ext); stroke-width:1;}
+  .boundary{fill:var(--boundary); stroke:var(--teal); stroke-width:1.2; stroke-dasharray:5 4;}
+  .gates-band{fill:color-mix(in srgb, var(--coral) 8%, var(--surface)); stroke:var(--coral); stroke-width:1;}
+  .chip{fill:var(--surface); stroke:var(--line-soft);}
+  .accent-teal{fill:var(--teal);} .accent-mint{fill:var(--mint);} .accent-ext{fill:var(--ext);}
+  .edge{stroke:var(--seafoam); stroke-width:1.6; fill:none;}
+  .edge-data{stroke:var(--mint); stroke-width:1.6; fill:none;}
+  .edge-probe{stroke:var(--teal); stroke-width:1.6; fill:none; stroke-dasharray:5 3;}
+  .edge-ai{stroke:var(--gold); stroke-width:1.6; fill:none; stroke-dasharray:5 3;}
+
+  .legend{display:flex; flex-wrap:wrap; gap:16px; margin-top:14px; padding:12px 14px;
+    background:var(--surface); border:1px solid var(--line-soft); border-radius:11px;}
+  .k{display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--text-2);}
+  .sw{width:20px; height:11px; border-radius:3px; flex:none; border:1px solid transparent;}
+  .sw.ours{background:var(--surface); border-color:var(--teal);}
+  .sw.store{background:var(--mint);}
+  .sw.gate{background:var(--coral);}
+  .sw.ext{background:var(--surface-2); border-color:var(--ext);}
+  .sw.ai{background:transparent; border:1.5px dashed var(--gold);}
+
+  .foot{margin-top:12px; font-size:12.5px; color:var(--text-3); max-width:100ch;}
+  .foot code{font-family:var(--mono);}
+  @media print{
+    :root{--ground:#fff; --surface:#fff; --surface-2:#fff; --boundary:#fff;}
+    @page{margin:10mm; size:landscape;}
+    body{background:#fff;} .wrap{padding:0; max-width:none;} .canvas{border:0; padding:0;}
+    svg{min-width:0;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">PerfScript Studio · system architecture</p>
+    <h1>What runs where, and what talks to what</h1>
+    <p class="sub">
+      One Node process per run, on your machine. It drives a local JMeter against your own environment,
+      reads the correlation engine without ever writing to it, and calls an external service only if you turn AI on.
+    </p>
+  </header>
+
+  <div class="canvas">
+  <svg viewBox="0 0 1360 940" role="img" aria-labelledby="ttl desc" xmlns="http://www.w3.org/2000/svg">
+    <title id="ttl">PerfScript Studio system architecture</title>
+    <desc id="desc">Three lanes. Left: the performance engineer, the settings file, the input recordings folder, and the output and memory folders. Centre, inside a dashed process boundary: the Web UI and Terminal entry points feeding one agent process, which runs Ingest, Understand, Generate, a band of four gates, Validate, Judge and re-plan, Ship, and Learn. Right, external: the read-only correlation engine, the application under test, a local Apache JMeter process, and optional LLM APIs.</desc>
+
+    <defs>
+      <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="var(--seafoam)"/>
+      </marker>
+      <marker id="ah-data" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="var(--mint)"/>
+      </marker>
+      <marker id="ah-probe" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="var(--teal)"/>
+      </marker>
+      <marker id="ah-ai" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,1 L9,5 L0,9 z" fill="var(--gold)"/>
+      </marker>
+    </defs>
+
+    <text class="lane-label" x="24" y="34">OPERATOR &amp; FILES</text>
+    <text class="lane-label" x="292" y="34">PERFSCRIPT-LOCAL — ONE NODE PROCESS PER RUN</text>
+    <text class="lane-label" x="1080" y="34">EXTERNAL TO THE AGENT</text>
+
+    <rect class="boundary" x="272" y="44" width="728" height="856" rx="16"/>
+
+    <!-- ══ LEFT LANE ══ -->
+    <g>
+      <rect class="box" x="24" y="88" width="220" height="60" rx="10"/>
+      <rect class="accent-teal" x="24" y="98" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="40" y="114">Performance engineer</text>
+      <text class="n-sub" x="40" y="132">records it, reads the verdict</text>
+    </g>
+    <g>
+      <rect class="box" x="24" y="180" width="220" height="64" rx="10"/>
+      <rect class="accent-mint" x="24" y="192" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="40" y="200">Settings</text>
+      <text class="n-mod" x="40" y="217">perfscript.config.json</text>
+      <text class="n-sub" x="40" y="233">target · credentials · profile</text>
+    </g>
+    <g>
+      <rect class="box" x="24" y="268" width="220" height="64" rx="10"/>
+      <rect class="accent-mint" x="24" y="280" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="40" y="288">Recordings in</text>
+      <text class="n-mod" x="40" y="305">input/</text>
+      <text class="n-sub" x="40" y="321">HAR · JMX + recording.xml</text>
+    </g>
+    <g>
+      <rect class="box" x="24" y="742" width="220" height="64" rx="10"/>
+      <rect class="accent-mint" x="24" y="754" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="40" y="762">Deliverables out</text>
+      <text class="n-mod" x="40" y="779">output/&lt;flow&gt;/</text>
+      <text class="n-sub" x="40" y="795">final JMX · JTL · report</text>
+    </g>
+    <g>
+      <rect class="box" x="24" y="818" width="220" height="64" rx="10"/>
+      <rect class="accent-mint" x="24" y="830" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="40" y="838">Memory</text>
+      <text class="n-mod" x="40" y="855">memory/verified-lessons.json</text>
+      <text class="n-sub" x="40" y="871">only fixes proven green</text>
+    </g>
+
+    <!-- ══ CENTRE ══ -->
+    <g>
+      <rect class="box" x="292" y="88" width="334" height="60" rx="10"/>
+      <rect class="accent-teal" x="292" y="98" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="308" y="112">Web UI</text>
+      <text class="n-mod" x="308" y="128">ui-server.js · localhost:7070</text>
+      <text class="n-sub" x="308" y="143">pick recordings, watch it run</text>
+    </g>
+    <g>
+      <rect class="box" x="646" y="88" width="334" height="60" rx="10"/>
+      <rect class="accent-teal" x="646" y="98" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="662" y="112">Terminal</text>
+      <text class="n-mod" x="662" y="128">node index.js --run --pair</text>
+      <text class="n-sub" x="662" y="143">same agent, no browser</text>
+    </g>
+
+    <g>
+      <rect class="box" x="292" y="180" width="688" height="60" rx="10"/>
+      <rect class="accent-teal" x="292" y="192" width="3" height="36" rx="1.5"/>
+      <text class="n-title" x="308" y="206">Agent process</text>
+      <text class="n-sub" x="308" y="224">Runs every stage below, streams progress, and takes steering mid-run.</text>
+      <text class="n-mod" x="964" y="206" text-anchor="end">index.js · runner.js</text>
+    </g>
+
+    <g>
+      <rect class="box" x="292" y="268" width="688" height="58" rx="10"/>
+      <rect class="accent-teal" x="292" y="280" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="308" y="292">Ingest</text>
+      <text class="n-sub" x="308" y="311">Pairs each script with the recording that captured it; scrubs secrets before writing.</text>
+      <text class="n-mod" x="964" y="292" text-anchor="end">ingest.js</text>
+    </g>
+    <g>
+      <rect class="box" x="292" y="344" width="688" height="58" rx="10"/>
+      <rect class="accent-teal" x="292" y="356" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="308" y="368">Understand</text>
+      <text class="n-sub" x="308" y="387">Reconstructs the journey, names the steps, reads the infrastructure it will load.</text>
+      <text class="n-mod" x="964" y="368" text-anchor="end">senior-pe.js · topology.js</text>
+    </g>
+    <g>
+      <rect class="box" x="292" y="420" width="688" height="58" rx="10"/>
+      <rect class="accent-teal" x="292" y="432" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="308" y="444">Generate</text>
+      <text class="n-sub" x="308" y="463">Correlates every per-session value, parameterises data, folds what must not replay.</text>
+      <text class="n-mod" x="964" y="444" text-anchor="end">generate.js · transforms.js</text>
+    </g>
+
+    <g>
+      <rect class="gates-band" x="292" y="496" width="688" height="76" rx="10"/>
+      <text class="band-title" x="308" y="517">Gates — any one of these stops the script shipping</text>
+      <rect class="chip" x="308" y="527" width="160" height="32" rx="7"/>
+      <text class="chip-t" x="388" y="547" text-anchor="middle">Will it even send?</text>
+      <rect class="chip" x="476" y="527" width="160" height="32" rx="7"/>
+      <text class="chip-t" x="556" y="547" text-anchor="middle">Is anyone logged in?</text>
+      <rect class="chip" x="644" y="527" width="160" height="32" rx="7"/>
+      <text class="chip-t" x="724" y="547" text-anchor="middle">Did the work happen?</text>
+      <rect class="chip" x="812" y="527" width="152" height="32" rx="7"/>
+      <text class="chip-t" x="888" y="547" text-anchor="middle">Right bytes shipped?</text>
+    </g>
+
+    <g>
+      <rect class="box" x="292" y="590" width="688" height="58" rx="10"/>
+      <rect class="accent-teal" x="292" y="602" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="308" y="614">Validate</text>
+      <text class="n-sub" x="308" y="633">Runs it for real and gathers evidence — response bodies, not just status codes.</text>
+      <text class="n-mod" x="964" y="614" text-anchor="end">runner.js · run-evidence.js</text>
+    </g>
+    <g>
+      <rect class="box" x="292" y="666" width="688" height="58" rx="10"/>
+      <rect class="accent-teal" x="292" y="678" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="308" y="690">Judge &amp; re-plan</text>
+      <text class="n-sub" x="308" y="709">Real defect, noise, sick environment or stale data — then fix, or change approach.</text>
+      <text class="n-mod" x="964" y="690" text-anchor="end">post-run-adjudicator.js</text>
+    </g>
+    <g>
+      <rect class="box" x="292" y="742" width="688" height="58" rx="10"/>
+      <rect class="accent-teal" x="292" y="754" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="308" y="766">Ship</text>
+      <text class="n-sub" x="308" y="785">Sanitises and fingerprints the exact file you open; writes the report and the blockers.</text>
+      <text class="n-mod" x="964" y="766" text-anchor="end">final-artifact.js</text>
+    </g>
+    <g>
+      <rect class="box" x="292" y="818" width="688" height="58" rx="10"/>
+      <rect class="accent-teal" x="292" y="830" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="308" y="842">Learn</text>
+      <text class="n-sub" x="308" y="861">Keeps only what went green, and applies it before the first request next time.</text>
+      <text class="n-mod" x="964" y="842" text-anchor="end">learning-store.js</text>
+    </g>
+
+    <!-- ══ RIGHT LANE ══ -->
+    <g>
+      <rect class="box-ext" x="1080" y="420" width="256" height="64" rx="10"/>
+      <rect class="accent-ext" x="1080" y="432" width="3" height="40" rx="1.5"/>
+      <text class="n-title" x="1096" y="440">Correlation engine</text>
+      <text class="n-mod" x="1096" y="457">jmeter-script-creator-main</text>
+      <text class="n-sub" x="1096" y="473">read-only — never modified</text>
+    </g>
+    <g>
+      <rect class="box-ext" x="1080" y="496" width="256" height="76" rx="10"/>
+      <rect class="accent-ext" x="1080" y="508" width="3" height="52" rx="1.5"/>
+      <text class="n-title" x="1096" y="520">Application under test</text>
+      <text class="n-sub" x="1096" y="538">your staging environment</text>
+      <text class="n-sub" x="1096" y="554">the only thing the agent</text>
+      <text class="n-sub" x="1096" y="566">reaches over the network</text>
+    </g>
+    <g>
+      <rect class="box-ext" x="1080" y="590" width="256" height="58" rx="10"/>
+      <rect class="accent-ext" x="1080" y="602" width="3" height="34" rx="1.5"/>
+      <text class="n-title" x="1096" y="612">Apache JMeter</text>
+      <text class="n-mod" x="1096" y="628">local java process · 5.6.3</text>
+      <text class="n-sub" x="1096" y="643">runs it, writes the JTL</text>
+    </g>
+    <g>
+      <rect x="1080" y="742" width="256" height="64" rx="10" fill="var(--surface-2)" stroke="var(--gold)" stroke-width="1" stroke-dasharray="5 3"/>
+      <rect x="1080" y="754" width="3" height="40" rx="1.5" fill="var(--gold)"/>
+      <text class="n-title" x="1096" y="762" fill="var(--gold)">LLM APIs</text>
+      <text class="n-mod" x="1096" y="779">OpenAI · Gemini</text>
+      <text class="n-sub" x="1096" y="795">optional — off by default</text>
+    </g>
+
+    <!-- ══ EDGES ══ -->
+    <path class="edge" d="M244,118 L286,118" marker-end="url(#ah)"/>
+    <text class="edge-label" x="248" y="112">browser</text>
+
+    <path class="edge" d="M134,88 L134,64 L813,64 L813,86" marker-end="url(#ah)"/>
+    <text class="edge-label" x="560" y="58">or straight to the CLI</text>
+
+    <path class="edge" d="M459,148 L459,178" marker-end="url(#ah)"/>
+    <text class="edge-label" x="464" y="167">spawns</text>
+    <path class="edge" d="M813,148 L813,178" marker-end="url(#ah)"/>
+    <text class="edge-label" x="818" y="167">runs</text>
+
+    <path class="edge-data" d="M244,210 L286,210" marker-end="url(#ah-data)"/>
+    <path class="edge-data" d="M244,297 L286,297" marker-end="url(#ah-data)"/>
+
+    <path class="edge" d="M636,240 L636,266" marker-end="url(#ah)"/>
+    <path class="edge" d="M636,326 L636,342" marker-end="url(#ah)"/>
+    <path class="edge" d="M636,402 L636,418" marker-end="url(#ah)"/>
+    <path class="edge" d="M636,478 L636,494" marker-end="url(#ah)"/>
+    <path class="edge" d="M636,572 L636,588" marker-end="url(#ah)"/>
+    <path class="edge" d="M636,648 L636,664" marker-end="url(#ah)"/>
+    <path class="edge" d="M636,724 L636,740" marker-end="url(#ah)"/>
+    <path class="edge" d="M636,800 L636,816" marker-end="url(#ah)"/>
+
+    <path class="edge-ai" d="M292,700 L262,700 L262,455 L290,455" marker-end="url(#ah-ai)"/>
+    <text class="edge-label" x="256" y="578" fill="var(--gold)" text-anchor="middle" transform="rotate(-90 256 578)">not green → change approach, rebuild</text>
+
+    <path class="edge" d="M980,449 L1078,449" marker-end="url(#ah)"/>
+    <text class="edge-label" x="1029" y="442" text-anchor="middle">require</text>
+
+    <path class="edge-probe" d="M980,534 L1078,534" marker-end="url(#ah-probe)"/>
+    <text class="edge-label" x="1029" y="527" text-anchor="middle">GET probe</text>
+
+    <path class="edge" d="M980,605 L1078,605" marker-end="url(#ah)"/>
+    <text class="edge-label" x="1029" y="599" text-anchor="middle">spawns</text>
+    <path class="edge-data" d="M1078,633 L982,633" marker-end="url(#ah-data)"/>
+    <text class="edge-label" x="1029" y="647" text-anchor="middle">JTL</text>
+
+    <path class="edge" d="M1192,590 L1192,576" marker-end="url(#ah)"/>
+    <text class="edge-label" x="1204" y="586">HTTP(S) load</text>
+
+    <path class="edge-ai" d="M980,700 L1024,700 L1024,774 L1078,774" marker-end="url(#ah-ai)"/>
+    
+
+    <path class="edge-data" d="M290,771 L246,771" marker-end="url(#ah-data)"/>
+    <path class="edge-data" d="M290,843 L246,843" marker-end="url(#ah-data)"/>
+    <path class="edge-data" d="M246,862 L290,862" marker-end="url(#ah-data)"/>
+    <text class="edge-label" x="252" y="836">write</text>
+    <text class="edge-label" x="252" y="878">read</text>
+  </svg>
+  </div>
+
+  <div class="legend">
+    <div class="k"><span class="sw ours"></span> Our code — runs locally</div>
+    <div class="k"><span class="sw store"></span> Data on your disk</div>
+    <div class="k"><span class="sw gate"></span> Gate — can stop the ship</div>
+    <div class="k"><span class="sw ext"></span> External system</div>
+    <div class="k"><span class="sw ai"></span> Optional — off by default</div>
+  </div>
+
+  <p class="foot">
+    Everything inside the dashed boundary is one Node process, started fresh per run — kill it and nothing is left behind.
+    The only outbound traffic is to your own environment, unless you switch AI assist on.
+    Secrets live in <code>perfscript.config.json</code>, which is gitignored and scrubbed out of every stored recording.
+  </p>
+</div>
+</body>
+</html>

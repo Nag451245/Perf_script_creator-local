@@ -33,6 +33,7 @@ const correlationHypotheses = require('./correlation-hypotheses');
 const statusAnalysis = require('./status-analysis');
 const finalGreenGate = require('./final-green-gate');
 const semanticTriage = require('./semantic-triage');
+const liveProbe = require('./live-probe');
 const nonLoadBearingFold = require('./nonloadbearing-fold');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
@@ -1980,6 +1981,32 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
             blueprintCtx.loop.attempts.push({ phase: 'replay-preflight', error: e.message });
             blueprintEvidence = summarizeBlueprintEvidence(blueprintCtx);
         }
+    }
+
+    // ── LIVE FRESHNESS PROBE (side-effect free: GET, no cookies) ───────────
+    // Ask the real page whether the challenge values the recording captured
+    // have rotated since. A senior curls the endpoint before spending a run;
+    // this is that instinct, deterministic. Evidence only — it never blocks.
+    if (enrichedRunCfg.liveProbe !== false && (gen.challengeTokens || []).length && targetBaseUrl) {
+        try {
+            const byProducer = new Map();
+            for (const t of gen.challengeTokens) {
+                if (!byProducer.has(t.producerPath)) byProducer.set(t.producerPath, []);
+                byProducer.get(t.producerPath).push(t);
+            }
+            const probes = [];
+            for (const [producerPath, tokens] of byProducer) {
+                const url = new URL(producerPath, targetBaseUrl).href;
+                probes.push(await liveProbe.probeFreshness({ url, tokens }));
+            }
+            if (probes.length) {
+                fs.writeFileSync(path.join(outDir, `${name}_live_probe.json`), JSON.stringify(probes, null, 2));
+                for (const p of probes) {
+                    if (p.summary) onLog(`live probe: ${p.summary}`);
+                    if (p.notes) onLog(`  → ${p.notes}`);
+                }
+            }
+        } catch (e) { onLog(`live probe skipped: ${e.message}`); }
     }
 
     // Run the engine loop, but guard against its parseJtl STALLING on a large

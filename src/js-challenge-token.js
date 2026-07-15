@@ -126,6 +126,7 @@ function extractorXml(refname, regex, group, label) {
 function correlateJsChallengeToken(xml, flat = []) {
     const tokens = detectJsChallengeTokens(flat);
     const applied = [];
+    const wired = [];
     let out = String(xml || '');
     let seq = 0;
     for (const t of tokens) {
@@ -167,8 +168,12 @@ function correlateJsChallengeToken(xml, flat = []) {
         }
         if (!committed) { seq--; continue; }
         applied.push({ name: t.name, producerPath: t.producerPath, consumerPath: t.consumerPath, rewired, ref });
+        // Carry the proven regex + recorded value so a LIVE probe can later ask
+        // the real page whether this value actually rotates (evidence that the
+        // correlation is required) without re-deriving anything.
+        wired.push({ name: t.name, value: t.value, regex: t.regex, producerPath: t.producerPath, ref });
     }
-    return { xml: out, applied };
+    return { xml: out, applied, tokens: wired };
 }
 
 module.exports = { correlateJsChallengeToken, _internal: { detectJsChallengeTokens } };

@@ -1494,10 +1494,12 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // a stale literal and the server fails the login SILENTLY (200, no session
     // cookie). Evidence-based: the pair must appear adjacently in an earlier
     // response, and the derived regex must reproduce it before wiring.
+    let challengeTokens = [];
     try {
         const chal = jsChallengeToken.correlateJsChallengeToken(xml, flat);
         if (chal.applied.length) {
             xml = chal.xml;
+            challengeTokens = chal.tokens || [];
             note('js-challenge-token',
                 `${chal.applied.length} inline-script challenge pair(s) correlated (rotating param NAME + VALUE)`,
                 chal.applied.map(a => `${a.name} ← ${a.producerPath} → ${a.consumerPath} (${a.rewired} consumer arg(s))`).join('; '),
@@ -1664,6 +1666,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         domainProfile: seniorPeDebrief.domainProfile || null,
         goldenDisables, goldenApplied,
         lineage: lineagePlans.map(l => ({ name: l.name, aliases: l.aliases, value: l.value, source: l.plan.sourceLabel })),
+        challengeTokens,
         playbooksApplied: pbResult.applied,
         playbookDisables: pbResult.addedDisables,
         playbookProtects: pbResult.addedProtects || [],

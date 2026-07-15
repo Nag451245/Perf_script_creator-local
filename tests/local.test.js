@@ -6800,3 +6800,32 @@ test('semantic triage: classifies auth and validation reasons without data match
     const v = semanticTriageMod.triageFailure({ label: 'y', responseBody: '{"detail":"field startDate is invalid"}', sentSources: {} });
     assert.strictEqual(v.category, 'validation');
 });
+
+// ── live freshness probe (GET-only, evidence never blocks) ────────────────
+const liveProbeMod = require('../src/live-probe');
+
+test('live probe: classifies rotated vs stable vs absent against the live page', () => {
+    const token = { name: 'abCdEf12', value: 'RECORDED_TOKEN_VALUE_1', regex: "window\.([A-Za-z0-9_$-]{2,64})Challenge = '([^']+)'" };
+    const rotated = liveProbeMod._internal.classifyToken("<script>window.zzTop99Challenge = 'FRESH_TOKEN_VALUE_9';</script>", token);
+    assert.strictEqual(rotated.verdict, 'rotated');
+    assert.strictEqual(rotated.liveValue, 'FRESH_TOKEN_VALUE_9');
+    assert.strictEqual(rotated.liveName, 'zzTop99', 'captures the rotated NAME too');
+
+    const stable = liveProbeMod._internal.classifyToken("<script>window.abCdEf12Challenge = 'RECORDED_TOKEN_VALUE_1';</script>", token);
+    assert.strictEqual(stable.verdict, 'stable');
+
+    const absent = liveProbeMod._internal.classifyToken('<html>login page rewritten</html>', token);
+    assert.strictEqual(absent.verdict, 'absent');
+});
+
+test('live probe: an unreachable host yields unknown verdicts and never blocks', async () => {
+    const r = await liveProbeMod.probeFreshness({
+        url: 'http://127.0.0.1:9/never-listening',
+        tokens: [{ name: 'x', value: 'v', regex: 'a(b)(c)' }],
+        timeoutMs: 800,
+    });
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.reachable, false);
+    assert.strictEqual(r.tokens[0].verdict, 'unknown');
+    assert.ok(/proceeding without freshness evidence/.test(r.summary));
+});

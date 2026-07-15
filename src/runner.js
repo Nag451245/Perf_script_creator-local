@@ -690,6 +690,23 @@ function guardFailureReportWithAdjudication({
  * one). Mutates `result` in place; engine untouched.
  */
 /** Testnames of samplers disabled (enabled="false") in the shipped JMX. */
+/**
+ * The ENABLED samplers of a plan, as {name, path} — the surface a proactive
+ * lesson is matched against (a lesson about a sampler we already folded has
+ * nothing to act on).
+ */
+function enabledSamplerSurface(xml) {
+    const out = [];
+    for (const m of String(xml || '').matchAll(/<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>/g)) {
+        const attrs = m[1] || '';
+        if (/enabled="false"/.test(attrs)) continue;
+        const name = (attrs.match(/testname="([^"]*)"/) || [])[1] || '';
+        const p = ((m[2] || '').match(/<stringProp name="HTTPSampler\.path">([^<]*)</) || [])[1] || '';
+        if (name) out.push({ name: name.trim(), path: p });
+    }
+    return out;
+}
+
 function disabledSamplerLabels(jmxPath) {
     const set = new Set();
     try {
@@ -1983,6 +2000,39 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         }
     }
 
+    // ── PROACTIVE EXPERIENCE: apply what we already proved on THIS host ────
+    // A senior returning to an app they scripted last month doesn't re-suffer
+    // the same failures to re-derive the same fixes. Host-scoped, >=0.9
+    // confidence lessons are applied to the plan BEFORE the first run; each
+    // application is tracked so a lesson whose sampler still fails decays.
+    let proactiveApplied = [];
+    if (learning.enabled && enrichedRunCfg.proactiveLessons !== false && targetBaseUrl) {
+        try {
+            const planSamplers = enabledSamplerSurface(fs.readFileSync(config.jmxPath, 'utf8'));
+            const proMatches = learningStore.findProactiveLessons({
+                storePath: learning.storePath,
+                samplers: planSamplers,
+                appHost: targetBaseUrl,
+                stackFingerprint: (gen.seniorPeDebrief && gen.seniorPeDebrief.stackFingerprint && gen.seniorPeDebrief.stackFingerprint.signals) || [],
+                minConfidence: Number(enrichedRunCfg.proactiveMinConfidence) > 0 ? Number(enrichedRunCfg.proactiveMinConfidence) : 0.9,
+            });
+            if (proMatches.length) {
+                const gate = filterProtectedPatchDisables(validateLlmPatches(proMatches.map(m => m.fix)), strictGuard);
+                if (gate.accepted.length) {
+                    const before = fs.readFileSync(config.jmxPath, 'utf8');
+                    const patched = applyLlmPatches(before, gate.accepted);
+                    if (patched.applied.length) {
+                        fs.writeFileSync(config.jmxPath, patched.xml);
+                        proactiveApplied = proMatches.slice(0, patched.applied.length);
+                        onLog(`proactive experience: applied ${patched.applied.length} lesson(s) proven on this host BEFORE the first run (${proMatches.map(m => m.targetSampler).slice(0, 3).join(', ')})`);
+                        fs.writeFileSync(path.join(outDir, `${name}_proactive_lessons.json`),
+                            JSON.stringify({ matches: proMatches, applied: patched.applied, skipped: patched.skipped }, null, 2));
+                    }
+                }
+            }
+        } catch (e) { onLog(`proactive experience skipped: ${e.message}`); }
+    }
+
     // ── LIVE FRESHNESS PROBE (side-effect free: GET, no cookies) ───────────
     // Ask the real page whether the challenge values the recording captured
     // have rotated since. A senior curls the endpoint before spending a run;
@@ -2079,6 +2129,23 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     }
     attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
     refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+
+    // Proactive experience is held to its claim: a lesson applied pre-emptively
+    // whose target sampler STILL failed didn't earn its confidence. Decay only
+    // those — penalizing every proactive lesson because the run was red for an
+    // unrelated reason (a stale-data save) would punish good experience.
+    if (proactiveApplied.length && learning.enabled) {
+        try {
+            const stillFailing = new Set((finalResult.samples || [])
+                .filter(s => s && !s.isTransaction && s.success === false)
+                .map(s => String(s.label || s.name || '').trim()));
+            const guilty = proactiveApplied.filter(m => stillFailing.has(String(m.targetSampler || '').trim()));
+            if (guilty.length) {
+                const res = learningStore.penalizeLessons({ storePath: learning.storePath, lessonIds: guilty.map(m => m.lessonId) });
+                if (res.penalized.length) onLog(`proactive experience: decayed ${res.penalized.length} lesson(s) whose sampler still failed`);
+            }
+        } catch (e) { onLog(`proactive decay skipped: ${e.message}`); }
+    }
 
     // ── SEMANTIC TRIAGE: read what the server SAID about each failure and
     // cross-reference the ids in its complaint with what the script SENT

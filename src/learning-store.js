@@ -173,6 +173,65 @@ function findMatchingLessons({ storePath = defaultStorePath(), failures = [], mi
         (b.stackOverlap - a.stackOverlap) || (Number(b.confidence) - Number(a.confidence)));
 }
 
+/**
+ * PROACTIVE lessons — experience applied BEFORE the first run.
+ *
+ * findMatchingLessons is reactive by design: it needs failures, so the agent
+ * must re-suffer a known problem on every visit. A senior returning to an app
+ * they scripted last month doesn't re-derive the same fixes; they walk in
+ * knowing. This matches lessons against the samplers that EXIST in the plan,
+ * so a lesson can fire before a single request is sent.
+ *
+ * Two deliberate guardrails make pre-emptive application safe:
+ *  - HOST-SCOPED ONLY. A generic lesson firing pre-emptively on an unrelated
+ *    app has no evidence behind it and would be a taught rule in disguise.
+ *    Only lessons verified green on THIS host apply (appHostHash must match).
+ *  - HIGHER BAR. Default 0.9 confidence vs the reactive 0.85: acting without a
+ *    symptom demands stronger prior proof.
+ * Every application is recorded so a lesson whose sampler still fails gets
+ * penalized — proactive experience decays exactly like reactive experience.
+ */
+function findProactiveLessons({ storePath = defaultStorePath(), samplers = [], appHost = '', stackFingerprint = [], minConfidence = 0.9 } = {}) {
+    if (!appHost || !samplers.length) return [];
+    const currentHostHash = sha256(String(appHost)).slice(0, 16);
+    const lessons = loadLessons(storePath).filter(l =>
+        Number(l.confidence || 0) >= minConfidence &&
+        l.scope === 'host' &&
+        l.appHostHash === currentHostHash);
+    if (!lessons.length) return [];
+    // Present each existing sampler as the "failure" surface the lesson pattern
+    // is matched against — same machinery, no symptom required.
+    const surface = samplers
+        .filter(s => s && (s.name || s.label))
+        .map(s => ({ samplerName: s.name || s.label, url: s.path || '' }));
+    const currentStacks = new Set((stackFingerprint || []).map(s => String(s && s.stack || s)));
+    const matches = [];
+    for (const sampler of surface) {
+        const samplerPattern = normalizePattern(sampler.samplerName);
+        for (const lesson of lessons) {
+            const lessonPattern = lesson.contextPattern && lesson.contextPattern.samplerPattern;
+            if (!lessonPattern || lessonPattern !== samplerPattern) continue;
+            if (lesson.fix && lesson.fix.kind === 'replaceValueWithVar' && String(lesson.fix.value || '') === '[REDACTED_VALUE]') continue;
+            const fix = adaptFixForFailure(lesson.fix, sampler);
+            const gate = validateLlmPatches([fix]);
+            if (!gate.accepted.length) continue;
+            matches.push({
+                lessonId: lesson.id,
+                confidence: lesson.confidence,
+                flowName: lesson.flowName,
+                symptom: lesson.symptom,
+                contextPattern: lesson.contextPattern,
+                stackOverlap: (lesson.stackFingerprint || []).filter(s => currentStacks.has(s)).length,
+                fix: gate.accepted[0],
+                proactive: true,
+                targetSampler: sampler.samplerName,
+            });
+        }
+    }
+    return dedupeMatches(matches).sort((a, b) =>
+        (b.stackOverlap - a.stackOverlap) || (Number(b.confidence) - Number(a.confidence)));
+}
+
 function learnFromRun({ storePath = defaultStorePath(), flowName = '', sourceRun = '', appHost = '', result = {}, fixes = [], stackFingerprint = [] } = {}) {
     if (!result || result.success !== true) return { learned: [], skipped: [{ reason: 'run_not_green' }] };
     const safeFixes = sanitizeFixes(fixes);
@@ -410,6 +469,7 @@ module.exports = {
     redactSensitive,
     normalizePattern,
     findMatchingLessons,
+    findProactiveLessons,
     learnFromRun,
     penalizeLessons,
     exportLessons,

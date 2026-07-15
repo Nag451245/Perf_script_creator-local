@@ -6829,3 +6829,36 @@ test('live probe: an unreachable host yields unknown verdicts and never blocks',
     assert.strictEqual(r.tokens[0].verdict, 'unknown');
     assert.ok(/proceeding without freshness evidence/.test(r.summary));
 });
+
+// ── proactive lessons (experience applied before the first run) ───────────
+test('proactive lessons: host-scoped high-confidence lesson fires without any failure; generic/foreign-host do not', () => {
+    const os = require('os');
+    const store = path.join(os.tmpdir(), `pf_proactive_${Date.now()}.json`);
+    const crypto = require('crypto');
+    const hostHash = crypto.createHash('sha256').update('https://app.example.com').digest('hex').slice(0, 16);
+    const lesson = (id, scope, conf, hash) => ({
+        id, scope, confidence: conf, appHostHash: hash, flowName: 'f', symptom: 's',
+        signature: id, contextPattern: { samplerPattern: learningStore.normalizePattern('T01_/oauth/token-004') },
+        fix: { kind: 'setSamplerEnabled', sampler: 'T01_/oauth/token-004', enabled: false }, stackFingerprint: [],
+    });
+    fs.writeFileSync(store, JSON.stringify([
+        lesson('host-hi', 'host', 0.95, hostHash),           // should fire
+        lesson('host-low', 'host', 0.85, hostHash),          // below proactive bar
+        lesson('generic-hi', 'generic', 0.99, ''),           // generic never fires proactively
+        lesson('other-host', 'host', 0.99, 'deadbeefdeadbeef'), // different app
+    ]));
+    const matches = learningStore.findProactiveLessons({
+        storePath: store,
+        samplers: [{ name: 'T01_/oauth/token-004', path: '/oauth/token' }, { name: 'T01_/unrelated-009', path: '/unrelated' }],
+        appHost: 'https://app.example.com',
+    });
+    assert.deepStrictEqual(matches.map(m => m.lessonId), ['host-hi']);
+    assert.strictEqual(matches[0].targetSampler, 'T01_/oauth/token-004');
+    assert.strictEqual(matches[0].proactive, true);
+    fs.unlinkSync(store);
+});
+
+test('proactive lessons: no appHost means no proactive application at all', () => {
+    assert.deepStrictEqual(
+        learningStore.findProactiveLessons({ samplers: [{ name: 'x' }], appHost: '' }), []);
+});

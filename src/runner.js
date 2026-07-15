@@ -32,6 +32,7 @@ const fastRepairLoop = require('./fast-repair-loop');
 const correlationHypotheses = require('./correlation-hypotheses');
 const statusAnalysis = require('./status-analysis');
 const finalGreenGate = require('./final-green-gate');
+const semanticTriage = require('./semantic-triage');
 const nonLoadBearingFold = require('./nonloadbearing-fold');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
@@ -878,6 +879,34 @@ function ignoreLogoutOnlyFailures(result = {}) {
 function isLogoutSample(sample = {}) {
     const hay = `${sample.label || sample.name || sample.samplerLabel || ''} ${sample.url || ''} ${sample.finalUrl || ''} ${sample.path || ''}`;
     return /\/(?:jwt\/v2\/logout|v2\/logout|logout)(?:\/|\?|$)|\blogout\b/i.test(hay);
+}
+
+/** Semantic triage of failing samples: server reasons ↔ sent-value sources. */
+function runSemanticTriage({ result = {}, evidence = null, gen = {}, outDir = '', name = '' } = {}) {
+    // sent-value sources: CSV row 1 + lineage recorded values
+    let csvHeader = [], csvRow = [];
+    try {
+        const csvPath = path.join(outDir, `${name}_data.csv`);
+        if (fs.existsSync(csvPath)) {
+            const lines = fs.readFileSync(csvPath, 'utf8').split(/\r?\n/).filter(Boolean);
+            csvHeader = (lines[0] || '').split('|');
+            csvRow = (lines[1] || '').split('|');
+        }
+    } catch { /* best effort */ }
+    const sentSources = semanticTriage.buildSentSources({ csvHeader, csvRow, lineage: gen.lineage || [] });
+    const rows = (evidence && evidence.rows) || [];
+    const bodyByLabel = new Map();
+    for (const r of rows) if (r && r.observedBody) bodyByLabel.set(String(r.label || '').trim(), r.observedBody);
+    const out = [];
+    for (const s of result.samples || []) {
+        if (!s || s.isTransaction || s.success !== false) continue;
+        const label = String(s.label || s.name || '').trim();
+        const body = s.responseBody || s.body || bodyByLabel.get(label) || '';
+        if (!body) continue;
+        const t = semanticTriage.triageFailure({ label, responseBody: body, sentSources });
+        if (t.reasons.length || t.dataMatches.length) out.push(t);
+    }
+    return out;
 }
 
 function buildAttemptRunEvidence({ entries = [], stableJtl = '', outDir = '', onLog = () => {} } = {}) {
@@ -2023,6 +2052,25 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     }
     attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
     refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+
+    // ── SEMANTIC TRIAGE: read what the server SAID about each failure and
+    // cross-reference the ids in its complaint with what the script SENT
+    // (CSV columns, lineage variables). "Appointment X not found" + "X came
+    // from CSV column AptID" = stale test data, named precisely — not a
+    // correlation bug to keep patching.
+    if (!finalResult.success) {
+        try {
+            const triage = runSemanticTriage({ result: finalResult, evidence: currentEvidence, gen, outDir, name });
+            if (triage.length) {
+                finalResult.semanticTriage = triage;
+                fs.writeFileSync(path.join(outDir, `${name}_semantic_triage.json`), JSON.stringify(triage, null, 2));
+                for (const t of triage.slice(0, 3)) {
+                    onLog(`semantic triage: ${t.label} — ${t.summary}`);
+                    if (t.ask) onLog(`  → ${t.ask}`);
+                }
+            }
+        } catch (e) { onLog(`semantic triage skipped: ${e.message}`); }
+    }
 
     // ── EMPIRICAL NON-LOAD-BEARING FOLD (app-agnostic) ─────────────────────
     // Before spending AI tokens or a replan, reproduce the fix a senior

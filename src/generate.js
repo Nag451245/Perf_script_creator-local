@@ -1663,6 +1663,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         plannedExtractors, reasoning, dualHarHints, loadProfile: loadProfileApplied, seniorPeDebrief,
         domainProfile: seniorPeDebrief.domainProfile || null,
         goldenDisables, goldenApplied,
+        lineage: lineagePlans.map(l => ({ name: l.name, aliases: l.aliases, value: l.value, source: l.plan.sourceLabel })),
         playbooksApplied: pbResult.applied,
         playbookDisables: pbResult.addedDisables,
         playbookProtects: pbResult.addedProtects || [],

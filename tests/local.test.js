@@ -6774,3 +6774,29 @@ test('repeat navigation: exact-URL GET repeat with no new session material is fl
     assert.deepStrictEqual(r.indexes, [2]);
     assert.strictEqual(r.byIndex[2].firstIndex, 0);
 });
+
+// ── semantic triage: server said ↔ script sent ────────────────────────────
+const semanticTriageMod = require('../src/semantic-triage');
+
+test('semantic triage: names the CSV column behind a stale-data rejection', () => {
+    const sentSources = semanticTriageMod.buildSentSources({
+        csvHeader: ['userName', 'AptID'], csvRow: ['AshtonK', '844599527'],
+        lineage: [{ name: 'CaseID', value: '59341829' }],
+    });
+    const t = semanticTriageMod.triageFailure({
+        label: 'T07_/saveSOAP.php-071',
+        responseBody: '{"error":"Appointment 844599527 not found or no longer exists"}',
+        sentSources,
+    });
+    assert.strictEqual(t.category, 'stale_data');
+    assert.strictEqual(t.dataMatches.length, 1);
+    assert.ok(t.dataMatches[0].source.includes('CSV column "AptID"'));
+    assert.ok(t.ask.includes('stale test data'));
+});
+
+test('semantic triage: classifies auth and validation reasons without data matches', () => {
+    const a = semanticTriageMod.triageFailure({ label: 'x', responseBody: '{"message":"session expired, please login"}', sentSources: {} });
+    assert.strictEqual(a.category, 'auth');
+    const v = semanticTriageMod.triageFailure({ label: 'y', responseBody: '{"detail":"field startDate is invalid"}', sentSources: {} });
+    assert.strictEqual(v.category, 'validation');
+});

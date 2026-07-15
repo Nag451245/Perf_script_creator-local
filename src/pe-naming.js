@@ -15,6 +15,7 @@ const SEGMENTS = {
 };
 
 function buildPeNamingModel({ entries = [], flowName = '', pages = [], scenarioCode = DEFAULT_SCENARIO_CODE, transactionNames = [] } = {}) {
+    scenarioCode = normalizeScenarioCode(scenarioCode);
     const flowPrefix = normalizeFlowName(flowName);
     const pageById = new Map((pages || []).map(page => [page.id, page]));
     const groupPlan = buildGroupPlan(entries, pageById);
@@ -230,8 +231,30 @@ function samplerLabel(entry, index) {
     return `Step ${String(index + 1).padStart(2, '0')} - ${methodOf(entry)} ${pathOf(entry && entry.request && entry.request.url)}`;
 }
 
+/**
+ * The scenario code that prefixes every label (SC01_T02_..). An operator runs
+ * the same flow as different scenarios in one test plan (SC01 checkout, SC02
+ * search), so it is a PER-RUN choice, not a stored setting: anything unusable
+ * falls back to SC01 rather than poisoning every label in the script.
+ * Accepts "SC02", "sc2", "2" -> "SC02".
+ */
+function normalizeScenarioCode(value) {
+    const raw = String(value == null ? '' : value).trim();
+    if (!raw) return DEFAULT_SCENARIO_CODE;
+    const m = raw.match(/^(?:sc)?[_\-\s]?(\d{1,2})$/i);
+    if (m) return `SC${String(m[1]).padStart(2, '0')}`;
+    // An operator may use their own convention (e.g. "PERF3"); accept a short
+    // alphanumeric token as-is, uppercased, rather than silently ignoring it.
+    if (/^[A-Za-z][A-Za-z0-9]{1,9}$/.test(raw)) return raw.toUpperCase();
+    return DEFAULT_SCENARIO_CODE;
+}
+
 function normalizeFlowName(flowName) {
     const text = String(flowName || 'Flow')
+        // "__paired" is OUR marker for a dual-recording variance run, not part
+        // of the flow's name — it must never reach a transaction label the
+        // engineer reads (SC01_T02_Smart_Text_Rec1_14July__Paired_Login).
+        .replace(/_{1,2}paired$/i, '')
         .replace(/([a-z])([A-Z])/g, '$1 $2')
         .replace(/[_-]+/g, ' ')
         .replace(/[^a-zA-Z0-9]+/g, ' ')
@@ -290,6 +313,7 @@ module.exports = {
     stepNumberFromLabel,
     _internal: {
         normalizeFlowName,
+        normalizeScenarioCode,
         normalizeTransactionNames,
         normalizeRequestName,
         segmentForEntry,

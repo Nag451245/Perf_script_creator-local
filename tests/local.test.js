@@ -7051,3 +7051,45 @@ test('final artifact: detects when JMeter rewrote the shipped final from a stale
     assert.match(fs.readFileSync(second.guidePath, 'utf8'), /close it WITHOUT saving/);
     fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ── flow prefix must not carry our internal "__paired" marker ─────────────
+test('pe-naming: __paired is an internal marker and never reaches a transaction label', () => {
+    const peNamingMod = require('../src/pe-naming');
+    const e = (url) => ({ request: { method: 'GET', url }, response: { status: 200 } });
+    const entries = [e('https://app.test/login'), e('https://app.test/home')];
+    const model = peNamingMod.buildPeNamingModel({ entries, flowName: 'Smart_Text_Rec1_14July__paired', pages: [] });
+    for (const g of model.groups) assert.ok(!/paired/i.test(g.name), `"${g.name}" must not mention paired`);
+    assert.ok(model.groups[0].name.startsWith('SC01_T01_Smart_Text_Rec1_14July'), model.groups[0].name);
+    // A flow genuinely named "...Paired" mid-name keeps it; only the suffix goes.
+    const keep = peNamingMod._internal.normalizeFlowName('Paired_Device_Flow');
+    assert.strictEqual(keep, 'Paired_Device_Flow');
+});
+
+test('pe-naming: scenario code is per-run, normalized, and falls back to SC01', () => {
+    const peNamingMod = require('../src/pe-naming');
+    const n = peNamingMod._internal.normalizeScenarioCode;
+    assert.strictEqual(n('SC02'), 'SC02');
+    assert.strictEqual(n('sc2'), 'SC02');
+    assert.strictEqual(n('3'), 'SC03');
+    assert.strictEqual(n('PERF3'), 'PERF3', 'operators may use their own short convention');
+    assert.strictEqual(n(''), 'SC01', 'blank => default');
+    assert.strictEqual(n(undefined), 'SC01');
+    assert.strictEqual(n('not a valid code!!'), 'SC01', 'garbage must not poison every label');
+
+    const e = (url) => ({ request: { method: 'GET', url }, response: { status: 200 } });
+    const model = peNamingMod.buildPeNamingModel({ entries: [e('https://app.test/login')], flowName: 'flow', scenarioCode: 'SC03' });
+    assert.ok(model.groups[0].name.startsWith('SC03_T01_'), model.groups[0].name);
+    assert.ok(model.requests[0].peLabel.startsWith('SC03_T01_'), model.requests[0].peLabel);
+});
+
+test('ui run flags: scenario code rides per-run and is never a saved setting', () => {
+    const runMode = require('../src/ui-run-mode');
+    assert.deepStrictEqual(
+        runMode.flagsForRunRequest({ mode: 'run', scenarioCode: 'SC02' }).filter((f, i, a) => f === '--scenario' || a[i - 1] === '--scenario'),
+        ['--scenario', 'SC02']);
+    // Blank => no flag at all => the agent defaults to SC01.
+    assert.ok(!runMode.flagsForRunRequest({ mode: 'run', scenarioCode: '' }).includes('--scenario'));
+    assert.ok(!runMode.flagsForRunRequest({ mode: 'run' }).includes('--scenario'));
+    // Anything that could smuggle another flag is dropped.
+    assert.ok(!runMode.flagsForRunRequest({ mode: 'run', scenarioCode: '--ai x' }).includes('--scenario'));
+});

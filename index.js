@@ -124,6 +124,19 @@ const MAX_ITER = iterFlag >= 0
     ? Math.min(6, Math.max(1, Number(args[iterFlag + 1]) || 3))
     : Math.min(6, Math.max(1, Number(CONFIG.maxIterations) || 3));
 
+// Scenario code (SC01_T02_...) is deliberately a PER-RUN flag and never read
+// from or written to the config: an operator scripts the same flow as SC02 for
+// one deliverable and must not have that silently applied to every later run.
+// Absent => SC01.
+const scenarioFlag = args.indexOf('--scenario');
+const SCENARIO_CODE = scenarioFlag >= 0 ? String(args[scenarioFlag + 1] || '') : '';
+
+/** run config for this process: stored settings + per-run-only overrides. */
+function runCfgForThisRun() {
+    const base = CONFIG.run || {};
+    return SCENARIO_CODE ? { ...base, scenarioCode: SCENARIO_CODE } : base;
+}
+
 const processed = new Set();
 let lastIdleScanMessageKey = '';
 const processedStatePath = INPUT_STATE_CFG.storePath
@@ -239,7 +252,7 @@ async function processUnit(unit) {
     // so the operator can catch a misread instantly instead of after a run.
     try {
         const { summarizeFlow } = require('./src/flow-understanding');
-        const understanding = summarizeFlow({ entries, pages, runCfg: CONFIG.run || {} });
+        const understanding = summarizeFlow({ entries, pages, runCfg: runCfgForThisRun() });
         for (const line of understanding.lines) rec(line);
         fs.writeFileSync(path.join(outDir, `${name}_understanding.json`), JSON.stringify(understanding.summary, null, 2));
     } catch (e) { rec(`flow understanding skipped: ${e.message}`); }
@@ -270,7 +283,7 @@ async function processUnit(unit) {
     // runCfg reaches generate() on BOTH paths: runValidate overrides it with
     // the enriched copy (auto host-rewrite), and the generate-only fallback
     // below needs it for config-driven disableCalls / oauth gate / loadProfile.
-    const genOpts = { dualHarHints: notes, secondaryEntries, runCfg: CONFIG.run || {} };
+    const genOpts = { dualHarHints: notes, secondaryEntries, runCfg: runCfgForThisRun() };
 
     // Human-fixed working script for this flow (input/<flow>__golden.jmx):
     // its proven extractors / enable judgments are merged into generation.
@@ -288,7 +301,7 @@ async function processUnit(unit) {
     // is the Phase-2 localization the architecture calls for. The full --run
     // still owns "is this script good enough to ship."
     if (FAST_LOOP || DO_RUN) {
-        const runCfg = CONFIG.run || {};
+        const runCfg = runCfgForThisRun();
         const targetBase = (runCfg.targetBaseUrlOverride || '').trim() || null;
         if (!targetBase) {
             if (FAST_LOOP) rec('fast-replay pre-flight skipped: set run.targetBaseUrlOverride to enable it.');
@@ -311,7 +324,7 @@ async function processUnit(unit) {
             progressTimer = startRunProgressHeartbeat(outDir, rec);
             const out = await runValidate({
                 entries, pages, outDir, name,
-                runCfg: CONFIG.run || {},
+                runCfg: runCfgForThisRun(),
                 maxIterations: MAX_ITER,
                 onLog: rec,
                 genOpts,

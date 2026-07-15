@@ -224,7 +224,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
               <option value="on">On — standard model</option>
               <option value="pro">On — Gemini Pro</option>
             </select></div>
+          <div class="field"><label>Scenario code</label>
+            <input id="scenario" type="text" maxlength="10" placeholder="SC01"
+              title="Prefixes every transaction label, e.g. SC02_T01_Login. Applies to THIS run only — never saved. Blank = SC01."></div>
         </div>
+        <div class="hint" style="margin-top:-4px">Scenario code applies to this run only and resets to SC01 next time.</div>
         <div id="ai-note" class="hint" style="margin-top:-4px;color:var(--accent)">Deterministic only — generation, correlation &amp; self-repair run free. No LLM calls.</div>
         <div class="run-btns">
           <button id="run-selected" class="btn-primary" type="button">Run selected</button>
@@ -252,7 +256,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
         <div class="field"><label>Business objective</label><input id="cfg-objective" placeholder="capacity, soak, release certification"></div>
         <div class="field"><label>Tech stack</label><input id="cfg-stack" placeholder="React, Spring Boot, OAuth"></div>
         <div class="field"><label>Domain notes</label><textarea id="cfg-domain" placeholder="business rules, test data, cleanup needs"></textarea></div>
-        <div class="field"><label>Transaction names</label><textarea id="cfg-transactions" placeholder="One transaction name per line, applied to T01, T02, T03..."></textarea></div>
+        <div class="field"><label>Transaction names</label><textarea id="cfg-transactions" placeholder="Optional. One NAME per line — replaces the whole name of T01, T02, T03 in order (e.g. Login). For the SC0x prefix use “Scenario code” in the run panel."></textarea></div>
         <div class="grid2">
           <div class="field"><label>p95 SLO ms</label><input id="cfg-p95" type="number" min="0"></div>
           <div class="field"><label>Error %</label><input id="cfg-error" type="number" min="0"></div>
@@ -420,7 +424,7 @@ function toggleHist(i){
 }
 function requestBody(force){
  var ins=selectedInputs();
- return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,runSelected:!force,iterations:q('#iterations').value,retryFailed:q('#retry').value,aiAssist:q('#ai-assist').value,pair:ins.length===2});
+ return JSON.stringify({mode:q('#mode').value,selectedInputs:ins,force:!!force,runSelected:!force,iterations:q('#iterations').value,scenarioCode:q('#scenario').value,retryFailed:q('#retry').value,aiAssist:q('#ai-assist').value,pair:ins.length===2});
 }
 async function saveCfg(quiet){
  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({targetBaseUrl:q('#cfg-target').value,username:q('#cfg-user').value,password:q('#cfg-pass').value,loadProfile:{users:q('#cfg-users').value,rampUpSec:q('#cfg-ramp').value,holdSec:q('#cfg-hold').value},seniorMode:q('#mode').value==='senior-agent'?'mature':'strong',testObjective:q('#cfg-objective').value,techStack:q('#cfg-stack').value,domainNotes:q('#cfg-domain').value,transactionNames:q('#cfg-transactions').value,slo:{p95Ms:q('#cfg-p95').value,errorRatePct:q('#cfg-error').value}})});

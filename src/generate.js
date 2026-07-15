@@ -725,6 +725,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         entries: flat,
         pages,
         flowName: name,
+        scenarioCode: runCfg.scenarioCode,
         transactionNames: runCfg.transactionNames,
     });
     const groups = peModel.groups;

@@ -138,6 +138,9 @@ function normalizeRunRequest(url, body = {}) {
         selectedInputs: normalizeStringList(body.selectedInputs || body.inputs),
         force: !!body.force,
         iterations: body.iterations,
+        // Per-run only: deliberately NOT part of saved settings, so the next run
+        // is SC01 again unless the operator types a code for that run too.
+        scenarioCode: body.scenarioCode,
         retryFailed: body.retryFailed,
         aiAssist: body.aiAssist || 'off',
         geminiPro: !!body.geminiPro,

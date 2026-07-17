@@ -7206,3 +7206,38 @@ test('final green gate: missing business markers fail the gate with the step nam
     assert.ok(gate.failures.some(f => f.category === 'business_marker_missing'));
     assert.match(gate.reason, /T02_\/dashboard.php-020/);
 });
+
+// ── repeat producers: a repeat whose body feeds a later request is KEPT ───
+test('repeat producer: value in the repeat body consumed downstream => kept + extractors cloned', () => {
+    const genInternal = require('../src/generate')._internal;
+    const e = (method, url, body, post) => ({ request: { method, url, ...(post ? { postData: { params: [{ name: 'token', value: post }] } } : {}) }, response: { status: 200, content: { text: body || '' } } });
+    const TOK = 'aaaabbbbccccddddeeeeffff11112222';
+    const flat = [
+        e('GET', 'https://auth.test/redirect/', `<form><input name="token" value="${TOK}"></form>`),
+        e('POST', 'https://auth.test/authorization/', '', TOK),
+        e('GET', 'https://auth.test/redirect/', `<form><input name="token" value="${TOK}"></form>`), // repeat — but produces
+        e('POST', 'https://auth.test/authorization/', '', TOK),
+    ];
+    const produced = genInternal.repeatProducesDownstreamValue(flat, 2);
+    assert.ok(produced.includes(TOK), 'repeat body value consumed by the later POST');
+    assert.deepStrictEqual(genInternal.repeatProducesDownstreamValue(flat, 3), [], 'a consumer is not a producer');
+
+    // cloning: repeat sampler gets the first instance's extractor
+    const sampler = (name, path) => `<HTTPSamplerProxy testname="${name}" enabled="true"><stringProp name="HTTPSampler.path">${path}</stringProp></HTTPSamplerProxy>`;
+    const extractor = '<RegexExtractor testclass="RegexExtractor" testname="Extract token"><stringProp name="RegexExtractor.refname">token</stringProp></RegexExtractor>\n<hashTree/>';
+    const xml = [
+        sampler('T01_/redirect/-001', '/redirect/'), `<hashTree>${extractor}</hashTree>`,
+        sampler('T01_/authorization/-002', '/authorization/'), '<hashTree></hashTree>',
+        sampler('T01_/redirect/-003', '/redirect/'), '<hashTree></hashTree>',
+        sampler('T01_/authorization/-004', '/authorization/'), '<hashTree></hashTree>',
+    ].join('\n');
+    const idx = [
+        { order: 0, name: 'T01_/redirect/-001', path: '/redirect/' },
+        { order: 1, name: 'T01_/authorization/-002', path: '/authorization/' },
+        { order: 2, name: 'T01_/redirect/-003', path: '/redirect/' },
+        { order: 3, name: 'T01_/authorization/-004', path: '/authorization/' },
+    ];
+    const res = genInternal.cloneExtractorsToRepeats(xml, [{ idx: 2, values: ['x'] }], idx);
+    assert.strictEqual(res.cloned, 1);
+    assert.strictEqual((res.xml.match(/refname">token</g) || []).length, 2, 'repeat now re-extracts ${token}');
+});

@@ -404,6 +404,60 @@ function extractorProducerPaths(xml) {
 // paths like /iam/callback or /s/interceptor) belongs in run.disableCalls in
 // perfscript.config.json — a default here would silently disable business
 // samplers on every other app.
+/**
+ * Values a repeat-navigation's response body offers that some LATER request
+ * actually sends (params, url, body). Evidence that the repeat is a producer.
+ */
+function repeatProducesDownstreamValue(flat, idx) {
+    const body = String((flat[idx] && flat[idx].response && flat[idx].response.content && flat[idx].response.content.text) || '');
+    if (!body) return [];
+    const candidates = new Set();
+    for (const m of body.matchAll(/[A-Za-z0-9_\-]{16,}/g)) {
+        candidates.add(m[0]);
+        if (candidates.size >= 200) break;
+    }
+    if (!candidates.size) return [];
+    const produced = [];
+    for (let j = idx + 1; j < flat.length && produced.length < 5; j++) {
+        const req = flat[j].request || {};
+        const hay = `${req.url || ''} ${(req.postData && req.postData.text) || ''} ` +
+            `${((req.postData && req.postData.params) || []).map(p => `${p.name}=${p.value}`).join('&')}`;
+        for (const v of candidates) {
+            if (hay.includes(v)) { produced.push(v); candidates.delete(v); }
+        }
+    }
+    return produced;
+}
+
+/**
+ * Clone the extractors attached to the FIRST enabled sampler with the same
+ * method+path onto each kept repeat producer, so the shared variable refreshes
+ * right before its later consumer instead of carrying the first page's value.
+ */
+function cloneExtractorsToRepeats(xml, keptRepeats, samplerIndex) {
+    let out = xml;
+    let cloned = 0;
+    for (const k of keptRepeats) {
+        const repeat = samplerIndex[k.idx];
+        if (!repeat) continue;
+        // find first sampler in document order with the same path whose hashTree carries extractors
+        const blockRe = /<HTTPSamplerProxy\b([^>]*)>([\s\S]*?)<\/HTTPSamplerProxy>\s*<hashTree>([\s\S]*?)<\/hashTree>/g;
+        let m, extractorXml = '';
+        while ((m = blockRe.exec(out)) !== null) {
+            const name = (m[1].match(/testname="([^"]*)"/) || [])[1] || '';
+            if (name === repeat.name) break; // reached the repeat itself — stop
+            const p = (m[2].match(/<stringProp name="HTTPSampler\.path">([^<]*)</) || [])[1] || '';
+            if (p !== repeat.path) continue;
+            const chunks = m[3].match(/<(RegexExtractor|HtmlExtractor|JSONPostProcessor|BoundaryExtractor)\b[\s\S]*?<\/\1>\s*<hashTree\/>/g);
+            if (chunks && chunks.length) { extractorXml = chunks.join('\n'); break; }
+        }
+        if (!extractorXml) continue;
+        out = injectAfterSampler(out, repeat.order, '\n' + extractorXml + '\n');
+        cloned++;
+    }
+    return { xml: out, cloned };
+}
+
 const DEFAULT_DISABLE_PATTERNS = [
     'ohttp_gateway',
     'ohttp-relay-safebrowsing-chrome',
@@ -1474,6 +1528,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // of band it re-consumes a one-time grant and 500s. Fold the repeat — the
     // FIRST instance stays and produces everything. Folded labels merge into
     // duplicateHopLabels so the business guard exempts them like other hops.
+    const keptRepeatProducers = [];
     {
         const repeats = redirectHops.detectRepeatNavigations(flat);
         const repeatFolded = [];
@@ -1485,6 +1540,21 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
                 const s = samplerIndex2[idx];
                 if (!s) continue;
                 if (matchesConfiguredPattern(`${s.name} ${s.path || ''}`, runCfg.protectedCalls)) continue;
+                // A repeat whose BODY produces a value some later request sends
+                // is a PRODUCER, not a duplicate. Cookies were already checked;
+                // this closes the body half. The trap that proved it: both
+                // recorded /redirect/ pages served the IDENTICAL one-time token
+                // (so "produces nothing new" held on paper), but live pages
+                // serve a FRESH token each visit — folding the repeat left the
+                // second /authorization/ POST replaying a consumed token and
+                // earned it a login page. Keep the repeat; it gets the first
+                // instance's extractors cloned after render so the variable
+                // refreshes at the right moment.
+                const produced = repeatProducesDownstreamValue(flat, idx);
+                if (produced.length) {
+                    keptRepeatProducers.push({ idx, values: produced.slice(0, 3) });
+                    continue;
+                }
                 repeatTargets.push({ s, idx });
             }
             // Descending position — flips lengthen the xml by one char each.
@@ -1499,6 +1569,10 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
                     dupHops.indexes.push(idx);
                 }
             }
+            if (keptRepeatProducers.length) note('repeat-navigation-kept',
+                `${keptRepeatProducers.length} repeat navigation(s) KEPT — their body produces a value a later request consumes`,
+                keptRepeatProducers.map(k => `entry ${k.idx}: ${k.values.map(v => v.slice(0, 18) + '…').join(', ')}`).join(' | '),
+                `a live page serves a FRESH value each visit even when the recording showed identical ones; the first instance's extractors are cloned here so the variable refreshes before its consumer`);
             if (repeatFolded.length) note('repeat-navigation',
                 `${repeatFolded.length} repeat navigation(s) folded — same URL as an earlier kept request, no new session material`,
                 repeatFolded.slice(0, 6).join(', '),
@@ -1566,6 +1640,22 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
                 `extracts both halves from the live page each run — a stale recorded challenge makes the login fail silently with 200 and no session cookie`);
         }
     } catch (e) { note('js-challenge-token', 'skipped (non-fatal)', e.message); }
+
+    // Kept repeat producers get the first instance's extractors cloned, so the
+    // shared variable (e.g. ${token}) REFRESHES right before its later
+    // consumer instead of carrying the first page's already-consumed value.
+    if (keptRepeatProducers.length) {
+        try {
+            const cloneRes = cloneExtractorsToRepeats(xml, keptRepeatProducers, indexSamplersForGenerate(xml));
+            if (cloneRes.cloned) {
+                xml = cloneRes.xml;
+                note('repeat-producer-extractors',
+                    `${cloneRes.cloned} kept repeat producer(s) re-extract their downstream-consumed value(s)`,
+                    keptRepeatProducers.map(k => `entry ${k.idx}`).join(', '),
+                    `same refname as the first instance — JMeter overwrites the variable when the repeat runs, so the consumer always sends the freshest value`);
+            }
+        } catch (e) { note('repeat-producer-extractors', 'skipped (non-fatal)', e.message); }
+    }
 
     // Convergence pass — fold in the body/session correlations the engine's
     // pass misses. Uses the SECOND recording (variance) to find dynamics that
@@ -1865,4 +1955,4 @@ function lookupValueForVar(flat, varName, params) {
     return '';
 }
 
-module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectAndRevertParameterCorruption, detectRecordedNoiseBeacons, detectPolling } };
+module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectAndRevertParameterCorruption, detectRecordedNoiseBeacons, detectPolling, repeatProducesDownstreamValue, cloneExtractorsToRepeats } };

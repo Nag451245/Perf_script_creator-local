@@ -836,6 +836,42 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             candidates.push(...group); // no provable lineage — stays CSV data
         }
     }
+    // LINEAGE BEYOND THE CSV: a mutating business request can carry entity ids
+    // the parameter advisor never surfaced (buried in a 2000-field form, e.g.
+    // the appointment id a save targets). Same evidence rule as above — the
+    // value must have a PRODUCER response earlier in the flow — but the search
+    // scans the requests themselves. This is how "the data drifted since the
+    // recording" stops being a wall: the flow re-derives TODAY's valid id from
+    // the same page it originally came from (chart page → AptID → save).
+    if (lineageEnabled) {
+        const already = new Set(lineagePlans.map(l => l.value));
+        for (const c of candidates) already.add(String(c.value == null ? '' : c.value)); // CSV keeps what it owns
+        const seenPair = new Set();
+        for (let ci = 0; ci < flat.length && lineagePlans.length < lineageMax; ci++) {
+            const e = flat[ci];
+            if (!/^(POST|PUT|PATCH)$/i.test((e.request && e.request.method) || '')) continue;
+            const pd = e.request && e.request.postData;
+            const params = Array.isArray(pd && pd.params) && pd.params.length
+                ? pd.params.map(p => ({ name: String(p.name || ''), value: String(p.value || '') }))
+                : String((pd && pd.text) || '').split('&').map(kv => {
+                    const i = kv.indexOf('=');
+                    try { return { name: decodeURIComponent(kv.slice(0, i)), value: decodeURIComponent(kv.slice(i + 1)) }; }
+                    catch { return { name: kv.slice(0, i), value: kv.slice(i + 1) }; }
+                });
+            for (const p of params) {
+                if (lineagePlans.length >= lineageMax) break;
+                const value = p.value;
+                if (!p.name || value.length < 6 || !ENTITY_ID_RE.test(value)) continue;
+                if (already.has(value) || seenPair.has(p.name + '=' + value)) continue;
+                seenPair.add(p.name + '=' + value);
+                const plan = planExtractor(p.name, [{ name: p.name, value }], flat, ci);
+                if (!plan) continue;
+                already.add(value);
+                lineagePlans.push({ name: p.name, aliases: [p.name], value, plan, firstConsumer: ci });
+            }
+        }
+    }
+
     if (lineagePlans.length) note('data-lineage',
         `${lineagePlans.length} entity id(s) will be picked from LIVE responses instead of replayed as recorded literals`,
         lineagePlans.map(l => `${l.name}=${l.value} ← ${l.plan.sourceLabel}`).slice(0, 6).join('; '),

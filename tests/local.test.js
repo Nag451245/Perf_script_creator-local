@@ -7241,3 +7241,17 @@ test('repeat producer: value in the repeat body consumed downstream => kept + ex
     assert.strictEqual(res.cloned, 1);
     assert.strictEqual((res.xml.match(/refname">token</g) || []).length, 2, 'repeat now re-extracts ${token}');
 });
+
+test('findLastJtl: newest by MTIME wins, not the highest iteration number (stale-dir poisoning)', () => {
+    const os = require('os');
+    const { findLastJtl } = require('../src/verifier');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_jtl_'));
+    fs.mkdirSync(path.join(dir, 'iteration_3'));
+    fs.mkdirSync(path.join(dir, 'iteration_1'));
+    fs.writeFileSync(path.join(dir, 'iteration_3', 'results.jtl'), 'stale');
+    fs.writeFileSync(path.join(dir, 'iteration_1', 'results.jtl'), 'fresh');
+    const past = Date.now() / 1000 - 3600;
+    fs.utimesSync(path.join(dir, 'iteration_3', 'results.jtl'), past, past);
+    assert.match(findLastJtl(dir), /iteration_1/, 'the fresh 1-iteration run must win over the previous run\'s iteration_3');
+    fs.rmSync(dir, { recursive: true, force: true });
+});

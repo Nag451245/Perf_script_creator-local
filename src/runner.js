@@ -1946,6 +1946,16 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
 
     onLog(`target=${targetBaseUrl} · credentials=${credentials ? 'yes' : 'no'} · jmeter=${jmeterBinPath} · maxIter=${maxIterations}`);
 
+    // Purge the PREVIOUS run's iteration dirs. A shorter run leaves higher-
+    // numbered stale dirs behind, and anything that reads "the latest JTL"
+    // (body backfill, stall recovery, semantic triage) can be poisoned into
+    // judging this run on the last run's responses.
+    try {
+        for (const d of fs.readdirSync(outDir)) {
+            if (/^iteration_\d+$/.test(d)) fs.rmSync(path.join(outDir, d), { recursive: true, force: true });
+        }
+    } catch { /* best effort */ }
+
     const iterationTrajectory = [];
     const config = {
         jmeterBinPath,

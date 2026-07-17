@@ -53,14 +53,17 @@ function safeJsonShape(text) {
 
 function findLastJtl(outDir) {
     if (!fs.existsSync(outDir)) return null;
-    const dirs = fs.readdirSync(outDir, { withFileTypes: true })
-        .filter(d => d.isDirectory() && /^iteration_\d+$/.test(d.name))
-        .sort((a, b) => Number(b.name.split('_')[1]) - Number(a.name.split('_')[1]));
-    for (const d of dirs) {
+    // Newest by MTIME, not by iteration number: a 1-iteration run leaves the
+    // previous run's iteration_3 on disk, and picking it by number fed the
+    // gates STALE response bodies — the verdict then judged the previous run.
+    const candidates = [];
+    for (const d of fs.readdirSync(outDir, { withFileTypes: true })) {
+        if (!d.isDirectory() || !/^iteration_\d+$/.test(d.name)) continue;
         const p = path.join(outDir, d.name, 'results.jtl');
-        if (fs.existsSync(p)) return p;
+        try { candidates.push({ p, mtime: fs.statSync(p).mtimeMs }); } catch { /* no jtl */ }
     }
-    return null;
+    candidates.sort((a, b) => b.mtime - a.mtime);
+    return candidates.length ? candidates[0].p : null;
 }
 
 /**

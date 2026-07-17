@@ -7151,3 +7151,12 @@ test('continuation: stuck (flat failures, no plan) or guard-blocked-only => null
         iterationsRun: 1, maxIterations: 3,
     }), null);
 });
+
+// ── ask-and-continue: veto window semantics ───────────────────────────────
+test('ask-and-continue: "stop" halts, "continue" skips the wait, silence means continue', async () => {
+    const chan = (replies) => { let i = 0; return { active: true, poll: () => (i < replies.length ? [{ kind: 'guidance', text: replies[i++] }] : []), say: () => {} }; };
+    assert.strictEqual(await runnerInternal.askOperatorToContinue({ steering: chan(['stop']), waitMs: 4000 }), 'stop');
+    assert.strictEqual(await runnerInternal.askOperatorToContinue({ steering: chan(['yes go ahead']), waitMs: 4000 }), 'continue');
+    assert.strictEqual(await runnerInternal.askOperatorToContinue({ steering: chan([]), waitMs: 1500 }), 'timeout', 'timeout = keep going, as the operator asked');
+    assert.strictEqual(await runnerInternal.askOperatorToContinue({ steering: null, waitMs: 1300 }), 'timeout', 'plain CLI still gets the veto window');
+});

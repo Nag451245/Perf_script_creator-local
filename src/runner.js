@@ -963,6 +963,34 @@ function buildAttemptRunEvidence({ entries = [], stableJtl = '', outDir = '', on
 }
 
 /**
+ * Ask the operator whether to keep going, with a veto window. Timeout means
+ * CONTINUE — the operator asked for an agent that presses on unless told to
+ * stop, not one that stalls waiting for permission. "stop" (or no/halt/enough)
+ * ends it; "continue"/"yes"/"go" skips the wait. Works through the same chat
+ * channel used for mid-run steering; without a chat channel (plain CLI) the
+ * window still elapses so Ctrl+C has a clear moment to land.
+ */
+async function askOperatorToContinue({ steering = null, onLog = () => {}, waitMs = 30000, pending = 0, extension = 1, maxExtensions = 2 } = {}) {
+    const secs = Math.round(waitMs / 1000);
+    const ask = `I identified ${pending} fix(es) I haven't applied yet — continuing automatically in ${secs}s (extension ${extension}/${maxExtensions}). Say "stop" to finish now, "continue" to skip the wait.`;
+    if (steering && steering.active) steering.say(ask);
+    onLog(`waiting ${secs}s for the operator — "stop" halts, "continue" proceeds now${steering && steering.active ? '' : ' (no chat channel: Ctrl+C stops the run)'}`);
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 1200));
+        if (!steering || !steering.active) continue;
+        for (const cmd of steering.poll()) {
+            const t = String((cmd && cmd.text) || '').toLowerCase();
+            if (/\b(stop|halt|no|enough|finish|abort)\b/.test(t)) return 'stop';
+            if (/\b(continue|yes|go|proceed|more)\b/.test(t)) return 'continue';
+            // Anything else is steering guidance; acknowledge so it isn't lost.
+            steering.say(`Noted — I'll carry that into the next iterations: "${String(cmd.text || '').slice(0, 120)}"`);
+        }
+    }
+    return 'timeout';
+}
+
+/**
  * Was this run STUCK, or merely OUT OF BUDGET? A senior engineer ends a
  * session with one of two very different messages: "this needs a human" or
  * "give me another hour and it's done". The evidence distinguishing them is
@@ -2462,6 +2490,90 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         }
     }
 
+    // ── ASK-AND-CONTINUE: out of iterations, but the plan isn't done ───────
+    // When the run ends not-green at the cap WITH actionable fixes still
+    // queued (the engine breaks before applying its last round), don't halt —
+    // tell the operator, give them a veto window, then keep going. Endless
+    // loops are structurally impossible: each extension must REDUCE failures
+    // or the loop stops, extensions are capped, every JMeter round sits under
+    // the stall watchdog, and "stop" in the chat ends it immediately.
+    const autoExtendCfg = enrichedRunCfg.autoExtend || {};
+    if (autoExtendCfg.enabled !== false && !finalResult.success && !classifyEnvironmentFailure(finalResult).environment) {
+        const EXTEND_WAIT_MS = Math.max(5, Number(autoExtendCfg.waitSeconds) || 30) * 1000;
+        const MAX_EXTENSIONS = Math.min(4, Math.max(1, Number(autoExtendCfg.maxExtensions) || 2));
+        let extensions = 0;
+        while (extensions < MAX_EXTENSIONS && !finalResult.success) {
+            const cont = assessContinuation({
+                trajectory: iterationTrajectory,
+                guard: strictGuard,
+                iterationsRun: iterationTrajectory.length,
+                maxIterations: Math.max(config.maxIterations || 0, iterationTrajectory.length),
+            });
+            if (!cont || cont.status !== 'fixable_out_of_budget') break; // no concrete queued plan => nothing to continue WITH
+            finalResult.continuation = cont;
+            onLog(`CONTINUATION: ${cont.message}`);
+            const decision = await askOperatorToContinue({
+                steering, onLog, waitMs: EXTEND_WAIT_MS,
+                pending: cont.pendingFixes.length, extension: extensions + 1, maxExtensions: MAX_EXTENSIONS,
+            });
+            if (decision === 'stop') {
+                finalResult.continuation = { ...cont, operatorStopped: true };
+                onLog('operator said stop — finishing with the current verdict');
+                break;
+            }
+            extensions++;
+            const beforeFailed = iterationTrajectory[iterationTrajectory.length - 1].failed;
+            const extraIters = Math.max(1, Math.min(3, cont.suggestedIterations - iterationTrajectory.length));
+            onLog(`extension ${extensions}/${MAX_EXTENSIONS}: running ${extraIters} more iteration(s) — say "stop" in the chat anytime`);
+            try { fs.rmSync(stableJtl, { force: true }); } catch { /* locked */ }
+            const extAbortRef = { aborted: false };
+            const extWatch = watchForStallOrCap(outDir, { graceMs: STALL_GRACE_MS, capMs: WATCHDOG_MS });
+            const racedExt = await Promise.race([
+                runFeedbackLoop({ ...config, jmxPath: finalJmxPath, maxIterations: extraIters }, gen.flat, {
+                    applyPatch: guardedApplyPatch({
+                        guard: strictGuard, blockedDisables, onLog, valueFlow, stableJtl, outDir, name,
+                        adjudicationRecords: requestAdjudications, abortRef: extAbortRef,
+                    }),
+                }).then(r => ({ kind: 'loop', r })),
+                extWatch.promise,
+            ]);
+            extWatch.cancel();
+            let resultExt;
+            if (racedExt.kind === 'loop') {
+                resultExt = racedExt.r;
+            } else {
+                extAbortRef.aborted = true;
+                const jtl = fs.existsSync(stableJtl) ? stableJtl : findLastJtl(outDir);
+                const samples = jtl ? summarizeJtlFast(jtl) : [];
+                const reqs = samples.filter(s => !s.isTransaction);
+                resultExt = {
+                    success: reqs.length > 0 && reqs.every(s => s.success),
+                    iterationsRun: extraIters, samples, finalJmxPath, recoveredFromJtl: true,
+                };
+                onLog(`extension parse stalled — verdict recovered from ${jtl ? path.basename(jtl) : 'JTL'}`);
+            }
+            recoverSamplesFromJtl(resultExt, stableJtl, outDir, onLog, resultExt.finalJmxPath || finalJmxPath);
+            finalJmxPath = resultExt.finalJmxPath || finalJmxPath;
+            finalJmxPathRef.value = finalJmxPath;
+            currentEvidence = buildAttemptRunEvidence({ entries: gen.flat, stableJtl, outDir, onLog });
+            verified = applyBusinessVerification(resultExt, finalJmxPath, strictGuard, blockedDisables);
+            finalResult = verified.result;
+            applyStatusRootCauseToResult(finalResult, gen.flat, currentEvidence, { strictStatusMatch: enrichedRunCfg.strictStatusMatch });
+            attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
+            const afterFailed = iterationTrajectory.length ? iterationTrajectory[iterationTrajectory.length - 1].failed : beforeFailed;
+            if (finalResult.success) {
+                onLog(`extension ${extensions} finished the job — GREEN`);
+                delete finalResult.continuation;
+                break;
+            }
+            if (afterFailed >= beforeFailed) {
+                onLog(`extension ${extensions} made no progress (${beforeFailed} → ${afterFailed} failures) — stopping so this cannot loop forever`);
+                break;
+            }
+            onLog(`extension ${extensions}: failures ${beforeFailed} → ${afterFailed} — reassessing`);
+        }
+    }
+
     if (requestAdjudications.length) {
         finalResult.requestAdjudication = { iterations: requestAdjudications };
         if (blueprintCtx && blueprintCtx.validation) blueprintCtx.validation.requestAdjudication = finalResult.requestAdjudication;
@@ -2563,12 +2675,12 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // fixes it already adjudicated. A run that ends there with actionable
     // fixes queued and a falling failure count isn't blocked — it just needs
     // more iterations, and the honest verdict says so with the exact rerun.
-    if (!finalResult.success) {
+    if (!finalResult.success && !(finalResult.continuation && finalResult.continuation.operatorStopped)) {
         const continuation = assessContinuation({
             trajectory: iterationTrajectory,
             guard: strictGuard,
-            iterationsRun: Number(finalResult.iterationsRun) || iterationTrajectory.length,
-            maxIterations,
+            iterationsRun: iterationTrajectory.length || Number(finalResult.iterationsRun) || 0,
+            maxIterations: Math.max(config.maxIterations || 0, 1),
         });
         if (continuation) {
             finalResult.continuation = continuation;
@@ -2656,6 +2768,7 @@ module.exports = {
     _internal: {
         classifyEnvironmentFailure,
         assessContinuation,
+        askOperatorToContinue,
         backfillObservedBodies,
         enabledSamplerSurface,
         runSemanticTriage,

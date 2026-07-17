@@ -962,6 +962,46 @@ function buildAttemptRunEvidence({ entries = [], stableJtl = '', outDir = '', on
     }
 }
 
+/**
+ * Was this run STUCK, or merely OUT OF BUDGET? A senior engineer ends a
+ * session with one of two very different messages: "this needs a human" or
+ * "give me another hour and it's done". The evidence distinguishing them is
+ * already in hand — the engine adjudicates fixes each iteration but BREAKS at
+ * the cap before applying the final round, so:
+ *   pending fixes  = last iteration's actionable, non-guard-blocked actions
+ *   converging     = the failure count fell across iterations
+ * Both present => the honest verdict is "needs N more iterations", with the
+ * exact rerun. Neither => the existing blockers speak (genuinely stuck).
+ */
+function assessContinuation({ trajectory = [], guard = null, iterationsRun = 0, maxIterations = 3 } = {}) {
+    if (!trajectory.length || iterationsRun < maxIterations) return null; // stopped early => not a budget problem
+    const last = trajectory[trajectory.length - 1];
+    if (!last || !last.failed) return null;
+    const ACTIONABLE = new Set(['disable', 'recorrelate']);
+    const protectedNames = (guard && guard.protectedNames) || new Set();
+    const pendingFixes = (last.failures || [])
+        .filter(f => f && ACTIONABLE.has(String(f.action || '')))
+        .filter(f => !protectedNames.has(String(f.sampler || '').trim()))
+        .map(f => ({ sampler: f.sampler, action: f.action, rootCause: f.rootCause || '' }));
+    const first = trajectory[0];
+    const converging = trajectory.length >= 2 && last.failed < first.failed;
+    if (!pendingFixes.length && !converging) return null; // stuck: no plan, no progress
+    // Rough budget: the loop applies a round of fixes then needs a verify pass.
+    const extra = Math.min(4, Math.max(2, Math.ceil(pendingFixes.length / 2) + 1));
+    const suggestedIterations = Math.min(6, iterationsRun + extra);
+    const shape = trajectory.map(t => t.failed).join('→');
+    const message = pendingFixes.length
+        ? `not stuck — out of iterations. ${pendingFixes.length} fix(es) were identified and queued but the budget (${maxIterations}) ran out before they could be applied (failures ${shape}). Rerun with --iterations ${suggestedIterations} (UI: "Fix iterations" = ${suggestedIterations}) and the agent should finish the job.`
+        : `still converging when the budget (${maxIterations}) ran out — failures fell ${shape}. Rerun with --iterations ${suggestedIterations} (UI: "Fix iterations" = ${suggestedIterations}) to let it continue.`;
+    return {
+        status: pendingFixes.length ? 'fixable_out_of_budget' : 'converging',
+        pendingFixes,
+        failuresByIteration: trajectory.map(t => t.failed),
+        suggestedIterations,
+        message,
+    };
+}
+
 /** Fill body-less rows from the iteration JTL (see run-evidence for why). */
 function backfillObservedBodies({ evidence, outDir = '', jtlPath = '' }) {
     const iterJtl = findLastJtl(outDir);
@@ -1878,6 +1918,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
 
     onLog(`target=${targetBaseUrl} · credentials=${credentials ? 'yes' : 'no'} · jmeter=${jmeterBinPath} · maxIter=${maxIterations}`);
 
+    const iterationTrajectory = [];
     const config = {
         jmeterBinPath,
         jmxPath: gen.jmxPath,
@@ -1889,6 +1930,16 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         timeoutMs: 4 * 60 * 1000,
         jmeterProperties: bodyCaptureProperties(enrichedRunCfg),
         onIteration: (s) => {
+            // Keep the full per-iteration adjudication: the engine BREAKS at the
+            // iteration cap BEFORE applying its last round of fixes, so the final
+            // entry here is the list of identified-but-never-applied actions —
+            // exactly what separates "stuck" from "just ran out of budget".
+            iterationTrajectory.push({
+                iteration: Number(s && s.iteration) || iterationTrajectory.length + 1,
+                passed: Number(s && s.passed) || 0,
+                failed: Number(s && s.failed) || 0,
+                failures: Array.isArray(s && s.failures) ? s.failures : [],
+            });
             onLog(`[iter] ${JSON.stringify(s).slice(0, 180)}`);
             steeringTick('between JMeter iterations');
         },
@@ -2507,6 +2558,27 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         }
     }
 
+    // ── CONTINUATION VERDICT: "out of budget" is not "stuck" ──────────────
+    // The engine stops at the iteration cap BEFORE applying the last round of
+    // fixes it already adjudicated. A run that ends there with actionable
+    // fixes queued and a falling failure count isn't blocked — it just needs
+    // more iterations, and the honest verdict says so with the exact rerun.
+    if (!finalResult.success) {
+        const continuation = assessContinuation({
+            trajectory: iterationTrajectory,
+            guard: strictGuard,
+            iterationsRun: Number(finalResult.iterationsRun) || iterationTrajectory.length,
+            maxIterations,
+        });
+        if (continuation) {
+            finalResult.continuation = continuation;
+            onLog(`CONTINUATION: ${continuation.message}`);
+            if (continuation.pendingFixes.length) {
+                onLog(`  queued but never applied: ${continuation.pendingFixes.map(f => `${f.sampler} (${f.action})`).slice(0, 4).join('; ')}`);
+            }
+        }
+    }
+
     // Blocked-state report: when the verdict is not GREEN, translate the
     // terminal evidence into PRECISE human asks instead of "needs attention".
     let humanBlockers = [];
@@ -2521,6 +2593,18 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 uploadFiles: gen.uploadFiles || null,
                 gate0: gen.gate0 || null,
             });
+            // A run that merely ran out of budget leads with the rerun ask, not
+            // with environment/credential asks that don't apply to it.
+            if (finalResult.continuation) {
+                humanBlockers.unshift({
+                    blocker: 'Iteration budget exhausted before the identified fixes could be applied',
+                    ask: finalResult.continuation.message,
+                    evidence: `failures per iteration: ${finalResult.continuation.failuresByIteration.join(' → ')}` +
+                        (finalResult.continuation.pendingFixes.length
+                            ? `; queued: ${finalResult.continuation.pendingFixes.map(f => `${f.sampler} (${f.action})`).slice(0, 4).join('; ')}`
+                            : ''),
+                });
+            }
             if (humanBlockers.length) {
                 fs.writeFileSync(path.join(outDir, `${name}_blockers.json`), JSON.stringify(humanBlockers, null, 2));
                 fs.writeFileSync(path.join(outDir, `${name}_blockers.md`), blockersModule.renderBlockersMarkdown(name, humanBlockers));
@@ -2571,6 +2655,7 @@ module.exports = {
     runLlmPatchRounds,
     _internal: {
         classifyEnvironmentFailure,
+        assessContinuation,
         backfillObservedBodies,
         enabledSamplerSurface,
         runSemanticTriage,

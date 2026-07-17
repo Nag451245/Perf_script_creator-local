@@ -7093,3 +7093,61 @@ test('ui run flags: scenario code rides per-run and is never a saved setting', (
     // Anything that could smuggle another flag is dropped.
     assert.ok(!runMode.flagsForRunRequest({ mode: 'run', scenarioCode: '--ai x' }).includes('--scenario'));
 });
+
+// ── continuation verdict: out-of-budget vs genuinely stuck ────────────────
+test('continuation: queued fixes at the cap => fixable_out_of_budget with exact rerun ask', () => {
+    const r = runnerInternal.assessContinuation({
+        trajectory: [
+            { iteration: 1, passed: 60, failed: 16, failures: [] },
+            { iteration: 2, passed: 70, failed: 6, failures: [] },
+            { iteration: 3, passed: 73, failed: 3, failures: [
+                { sampler: 'T02_/redirect/-022', action: 'disable', rootCause: 'server_error_500' },
+                { sampler: 'T05_/rpc.php-067', action: 'recorrelate', rootCause: 'stale_token' },
+                { sampler: 'T07_/save.php-071', action: 'investigate', rootCause: 'assertion_failed' },
+            ] },
+        ],
+        guard: { protectedNames: new Set() },
+        iterationsRun: 3, maxIterations: 3,
+    });
+    assert.strictEqual(r.status, 'fixable_out_of_budget');
+    assert.strictEqual(r.pendingFixes.length, 2, 'investigate is not an applicable fix');
+    assert.deepStrictEqual(r.failuresByIteration, [16, 6, 3]);
+    assert.ok(r.suggestedIterations > 3 && r.suggestedIterations <= 6);
+    assert.match(r.message, /not stuck — out of iterations/);
+    assert.match(r.message, new RegExp(`--iterations ${r.suggestedIterations}`));
+});
+
+test('continuation: converging but no queued fixes => softer "still converging" verdict', () => {
+    const r = runnerInternal.assessContinuation({
+        trajectory: [
+            { iteration: 1, failed: 12, passed: 50, failures: [] },
+            { iteration: 2, failed: 5, passed: 57, failures: [{ sampler: 'x', action: 'investigate' }] },
+        ],
+        guard: null, iterationsRun: 2, maxIterations: 2,
+    });
+    assert.strictEqual(r.status, 'converging');
+    assert.match(r.message, /still converging/);
+});
+
+test('continuation: stuck (flat failures, no plan) or guard-blocked-only => null, blockers speak instead', () => {
+    const flat = [
+        { iteration: 1, failed: 4, passed: 60, failures: [{ sampler: 'a', action: 'investigate' }] },
+        { iteration: 2, failed: 4, passed: 60, failures: [{ sampler: 'a', action: 'investigate' }] },
+        { iteration: 3, failed: 4, passed: 60, failures: [{ sampler: 'a', action: 'investigate' }] },
+    ];
+    assert.strictEqual(runnerInternal.assessContinuation({ trajectory: flat, iterationsRun: 3, maxIterations: 3 }), null);
+    // the only queued fix is guard-protected — applying it is forbidden, so more budget won't help
+    const blocked = [
+        { iteration: 1, failed: 2, passed: 60, failures: [] },
+        { iteration: 2, failed: 2, passed: 60, failures: [{ sampler: 'T07_/save.php-071', action: 'disable' }] },
+    ];
+    assert.strictEqual(runnerInternal.assessContinuation({
+        trajectory: blocked, guard: { protectedNames: new Set(['T07_/save.php-071']) },
+        iterationsRun: 2, maxIterations: 2,
+    }), null);
+    // stopped before the cap => the loop chose to stop; budget was not the limit
+    assert.strictEqual(runnerInternal.assessContinuation({
+        trajectory: [{ iteration: 1, failed: 3, passed: 10, failures: [{ sampler: 'a', action: 'disable' }] }],
+        iterationsRun: 1, maxIterations: 3,
+    }), null);
+});

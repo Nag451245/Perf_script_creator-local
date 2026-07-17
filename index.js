@@ -354,6 +354,7 @@ async function processUnit(unit) {
                     `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
                 rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
                 warnIfStaleEditor(finalMarker, rec);
+                if (out.result.continuation) rec(`NOT STUCK — ${out.result.continuation.message}`);
                 const reportPath = writeHtmlReport(outDir, name, {
                     mode: `generate + run (${mode})`, verdict,
                     stats: out.stats, samples: out.result.samples || [],

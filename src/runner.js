@@ -2635,6 +2635,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         assertionsPlanned: gen.stats ? gen.stats.assertions : null,
         requireAssertions: enrichedRunCfg.requireAssertions === true,
         softFailurePatterns: enrichedRunCfg.softFailurePatterns || [],
+        invariants: gen.businessInvariants || null,
     });
     finalResult.finalGreenGate = finalGate;
     fs.writeFileSync(path.join(outDir, `${name}_final_green_gate.json`), JSON.stringify(finalGate, null, 2));

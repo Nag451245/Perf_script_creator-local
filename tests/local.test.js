@@ -7160,3 +7160,49 @@ test('ask-and-continue: "stop" halts, "continue" skips the wait, silence means c
     assert.strictEqual(await runnerInternal.askOperatorToContinue({ steering: chan([]), waitMs: 1500 }), 'timeout', 'timeout = keep going, as the operator asked');
     assert.strictEqual(await runnerInternal.askOperatorToContinue({ steering: null, waitMs: 1300 }), 'timeout', 'plain CLI still gets the veto window');
 });
+
+// ── body-truth invariants (dual-recording agreement) ─────────────────────
+const invariantsMod = require('../src/invariants');
+
+test('invariants: only markers BOTH recordings agree on survive, boilerplate is dropped', () => {
+    const e = (path, body) => ({ request: { method: 'GET', url: 'https://app.test' + path }, response: { status: 200, content: { text: body } } });
+    const primary = [
+        e('/dashboard', '{"widgets":[1],"clinics":[2],"apiVersion":1,"sessionId":"abc"}'),
+        e('/patients',  '{"patients":[1],"total":9,"apiVersion":1,"sessionId":"xyz"}'),
+        e('/chart',     '<html><head><title>Patient Record</title></head></html>'),
+    ];
+    const secondary = [
+        e('/dashboard', '{"widgets":[9],"clinics":[8],"apiVersion":1,"nonce":"q"}'),
+        e('/patients',  '{"patients":[5],"total":2,"apiVersion":1,"nonce":"r"}'),
+        e('/chart',     '<html><head><title>Patient Record</title></head></html>'),
+    ];
+    const inv = invariantsMod.mineInvariants({ primary, secondary });
+    assert.ok(inv.byEntryIndex[0].markers.includes('json-key:widgets'));
+    assert.ok(!inv.byEntryIndex[0].markers.includes('json-key:sessionId'), 'volatile key differs across recs — dropped');
+    assert.ok(!inv.byEntryIndex[0].markers.includes('json-key:apiVersion'), 'boilerplate carried by most steps — dropped');
+    assert.ok(!inv.byEntryIndex[2], 'a single title marker is below the 2-marker gate threshold');
+});
+
+test('invariants: a 200 whose content vanished fails its step; real content and failing rows are left alone', () => {
+    const invariants = { byEntryIndex: { 5: { markers: ['json-key:patients', 'json-key:total'], path: '/patients' } } };
+    const rows = (body, success = true) => [{ entryIndex: 5, label: 'T04_/patients-035', success, isTransaction: false, observedBody: body }];
+    // live body is the login page: every marker gone => fail
+    const wall = invariantsMod.checkInvariants({ rows: rows('<title>Login</title><input type="password">'), invariants });
+    assert.strictEqual(wall.length, 1);
+    assert.strictEqual(wall[0].missing.length, 2);
+    // live body has the keys with different data => pass (that is the point)
+    assert.strictEqual(invariantsMod.checkInvariants({ rows: rows('{"patients":[42],"total":1}'), invariants }).length, 0);
+    // no captured body => no judgment; already-failing row => no double judgment
+    assert.strictEqual(invariantsMod.checkInvariants({ rows: rows(''), invariants }).length, 0);
+    assert.strictEqual(invariantsMod.checkInvariants({ rows: rows('<title>Login</title>', false), invariants }).length, 0);
+});
+
+test('final green gate: missing business markers fail the gate with the step named', () => {
+    const evidence = { rows: [{ entryIndex: 3, label: 'T02_/dashboard.php-020', success: true, isTransaction: false,
+        observedBody: '<title>Login</title><input type="password">', recordedBody: 'x', recordedBodyLength: 1, observedBodyLength: 40, observedStatus: 200, recordedStatus: 200 }] };
+    const invariants = { byEntryIndex: { 3: { markers: ['json-key:widgets', 'json-key:clinics'], path: '/dashboard.php' } } };
+    const gate = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence, invariants });
+    assert.strictEqual(gate.ok, false);
+    assert.ok(gate.failures.some(f => f.category === 'business_marker_missing'));
+    assert.match(gate.reason, /T02_\/dashboard.php-020/);
+});

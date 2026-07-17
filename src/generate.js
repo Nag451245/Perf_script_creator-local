@@ -42,6 +42,7 @@ const foldSafetyModule = require('./fold-safety');
 const renderedRequestCheck = require('./rendered-request-check');
 const dateIntent = require('./date-intent');
 const jsChallengeToken = require('./js-challenge-token');
+const invariantsModule = require('./invariants');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
 const peNaming = require('./pe-naming');
@@ -1572,6 +1573,27 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // session-in-body class (sessionId:"Token <cookie>"). Layers cleanly: the
     // consumed-gate only touches values still LITERAL here (engine ${vars} are
     // skipped), each extractor is verified against the recorded producer before
+    // BODY-TRUTH INVARIANTS (dual recordings only): everything identical
+    // across both recordings' responses for a step is provably stable business
+    // truth — JSON key sets, discriminative page titles. The green gate later
+    // requires each passing sampler's LIVE body to still carry its step's
+    // markers, so a 200 whose real content is gone (auth wall, error page)
+    // fails the step no matter what the status code claims.
+    let businessInvariants = null;
+    if (runCfg.invariants !== false && (runCfg.invariants || {}).enabled !== false &&
+        opts.secondaryEntries && opts.secondaryEntries.length) {
+        try {
+            businessInvariants = invariantsModule.mineInvariants({ primary: flat, secondary: opts.secondaryEntries });
+            if (businessInvariants.steps) {
+                fs.writeFileSync(path.join(outDir, `${name}_business_invariants.json`), JSON.stringify(businessInvariants, null, 2));
+                note('business-invariants',
+                    `${businessInvariants.steps} step(s) carry body-truth markers both recordings agree on`,
+                    Object.values(businessInvariants.byEntryIndex).slice(0, 4).map(v => `${v.path}: ${v.markers.slice(0, 3).join(', ')}`).join(' | '),
+                    `the green gate will require each passing sampler's live body to still carry its step's markers — a 200 with the content gone fails the step`);
+            }
+        } catch (e) { note('business-invariants', 'skipped (non-fatal)', e.message); }
+    }
+
     // wiring, and var names never clobber the engine's. Dual recordings only.
     let bodyCorrelated = 0;
     if (opts.secondaryEntries && opts.secondaryEntries.length) {
@@ -1726,6 +1748,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         goldenDisables, goldenApplied,
         lineage: lineagePlans.map(l => ({ name: l.name, aliases: l.aliases, value: l.value, source: l.plan.sourceLabel })),
         challengeTokens,
+        businessInvariants,
         playbooksApplied: pbResult.applied,
         playbookDisables: pbResult.addedDisables,
         playbookProtects: pbResult.addedProtects || [],

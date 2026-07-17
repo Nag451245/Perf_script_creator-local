@@ -2,6 +2,7 @@
 
 const statusAnalysis = require('./status-analysis');
 const semanticTriage = require('./semantic-triage');
+const invariantsModule = require('./invariants');
 
 // 200-status responses that carry an application-level failure. These are the
 // "everything 200 but nothing worked" bodies: GraphQL error envelopes, SOAP
@@ -28,9 +29,27 @@ function evaluateFinalGreenGate({
     assertionsPlanned = null,
     requireAssertions = false,
     softFailurePatterns = [],
+    invariants = null,
 } = {}) {
     const failures = [];
     const warnings = [];
+
+    // Body-truth invariants: markers both recordings agree on must still be in
+    // each passing sampler's LIVE body. A 200 whose step-content vanished
+    // (auth wall past login, an error page, the wrong response entirely) fails
+    // its step regardless of status. Judged only where a body was captured.
+    if (invariants && evidence && Array.isArray(evidence.rows)) {
+        const misses = invariantsModule.checkInvariants({ rows: evidence.rows, invariants });
+        if (misses.length) {
+            failures.push({
+                category: 'business_marker_missing',
+                reason: `${misses.length} passing sampler(s) lost the body markers both recordings agree on — ` +
+                    misses.slice(0, 3).map(m => `"${m.sampler}" missing ${m.missing.length}/${m.expected} (e.g. ${m.missing[0]})`).join('; ') +
+                    '. The step returned a success code without its real content.',
+                details: misses,
+            });
+        }
+    }
 
     // Assertion coverage: a JMX with zero assertions passes JMeter on HTTP
     // status alone — the classic "everything 200 but nothing verified" trap.

@@ -1340,6 +1340,37 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             `${heuristicDisagreements.length} operator-disabled sampler(s) look like auth/session producers to the heuristics`,
             `disabled anyway (operator wins): ${heuristicDisagreements.slice(0, 8).join(', ')}`,
             `if the run now fails at a downstream consumer, re-enable these or move them to protectedCalls`);
+        // EVIDENCE, not heuristics: an operator disable that kills a PROVEN
+        // producer (recorded Set-Cookie session material, or body values some
+        // later request sends) is how one flow's leftover tuning silently
+        // breaks every other flow — /jwt/v2/create-cookie disabled for
+        // createtask made Loading serve login pages for weeks. The operator
+        // still wins, but this cannot stay quiet.
+        try {
+            const idxByName = new Map(indexSamplersForGenerate(xml).map(s => [s.name, s.order]));
+            const killedProducers = [];
+            for (const nm of dis.hits || []) {
+                const i = idxByName.get(nm);
+                if (i == null || !flat[i]) continue;
+                const e = flat[i];
+                const cookies = ((e.response && e.response.headers) || [])
+                    .filter(h => /^set-cookie$/i.test(String(h.name || '')))
+                    .map(h => String(h.value || '').split('=')[0])
+                    .filter(n => /(sess|auth|token|iam|idem|csrf|jwt)/i.test(n));
+                const produced = repeatProducesDownstreamValue(flat, i);
+                if (cookies.length || produced.length) {
+                    killedProducers.push({
+                        name: nm,
+                        evidence: [cookies.length ? `sets ${cookies.slice(0, 3).join(',')}` : '',
+                            produced.length ? `produces ${produced.slice(0, 2).map(v => v.slice(0, 14) + '…').join(',')}` : ''].filter(Boolean).join('; '),
+                    });
+                }
+            }
+            if (killedProducers.length) note('disable-calls-session-risk',
+                `OPERATOR DISABLE KILLS A PROVEN PRODUCER — ${killedProducers.length} sampler(s) whose recorded output the flow depends on are force-disabled`,
+                killedProducers.map(k => `${k.name} (${k.evidence})`).join(' | '),
+                `run.disableCalls is GLOBAL: a disable tuned for one flow poisons every flow. If this run walls at login pages, remove these entries or scope them per flow.`);
+        } catch { /* advisory only — never blocks generation */ }
         if (dis.skippedProtected && dis.skippedProtected.length) note('disable-calls-conflict',
             `${dis.skippedProtected.length} sampler(s) matched disableCalls but were kept enabled by protectedCalls or hard safety guards`,
             `kept enabled: ${dis.skippedProtected.slice(0, 8).join(', ')}`,

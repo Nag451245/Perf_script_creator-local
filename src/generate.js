@@ -1439,12 +1439,20 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         const recordedFailures = [];
         const failFamilies = new Set();   // third-party host+pathname (all query variants)
         const failExact = new Set();      // host + pathname + query (any host)
-        for (const e of flat) {
+        for (let fi = 0; fi < flat.length; fi++) {
+            const e = flat[fi];
             const st = Number(e && e.response && e.response.status || 0);
             if (st < 400) continue;
-            const mintsSession = ((e.response && e.response.headers) || []).some(h =>
-                /^set-cookie$/i.test(String(h.name || '')) && /(?:sess|auth|token|iam|idem|csrf)/i.test(String((h.value || '').split('=')[0])));
-            if (mintsSession) continue; // a 401/403 handshake step that still sets session material stays
+            // A recorded failure that STILL sets any cookie, or produces a value
+            // a later request sends, is a producer the flow depends on — not
+            // noise. WebPT's /jwt/v2/create-cookie recorded a 400 while setting
+            // TS*/dtCookie affinity+session material; folding it walled the
+            // login. Cookie names vary wildly (TS*, dt*, JSESSIONID, .ASPXAUTH),
+            // so ANY Set-Cookie counts here, and body-produced values are
+            // checked too. Evidence, not a name allowlist.
+            const setsCookie = ((e.response && e.response.headers) || [])
+                .some(h => /^set-cookie$/i.test(String(h.name || '')));
+            if (setsCookie || repeatProducesDownstreamValue(flat, fi).length) continue;
             try {
                 const u = new URL(e.request.url);
                 recordedFailures.push({ path: u.pathname + (u.search || ''), status: st });

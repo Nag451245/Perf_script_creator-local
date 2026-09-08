@@ -7299,3 +7299,49 @@ test('knowledge base: an entry using an unknown check never fires (no guessing)'
     const bogus = [{ id: 'x', title: 'x', when: [{ check: 'noSuchCheckExists' }], remedy: 'r', verify: 'v' }];
     assert.deepStrictEqual(knowledgeBase.reviewAgainstKnowledge({ xml: 'anything' }, { knowledge: bogus }), []);
 });
+
+// ── diagnosis loop: model → hypotheses → evidence → ranked cause ─────────
+const diagnosisModule = require('../src/diagnosis');
+
+test('diagnosis: builds an app model with session minters and multi-host awareness', () => {
+    const e = (url, cookies = []) => ({ request: { method: 'GET', url },
+        response: { status: 200, headers: cookies.map(c => ({ name: 'Set-Cookie', value: `${c}=v; path=/` })), content: { text: '' } } });
+    const model = diagnosisModule.buildAppModel({ entries: [
+        e('https://app.test/'), e('https://auth.test/login', ['PHPSESSID', 'authToken']), e('https://app.test/home'),
+    ] });
+    assert.strictEqual(model.primaryHost, 'app.test');
+    assert.strictEqual(model.multiHost, true);
+    assert.deepStrictEqual(model.sessionCookieNames.sort(), ['PHPSESSID', 'authToken']);
+    assert.strictEqual(model.sessionMinters[0].path, '/login');
+});
+
+test('diagnosis: a disabled session minter is named — but a bare "/" never counts as evidence', () => {
+    const mk = (path, cookie) => ({ request: { method: 'GET', url: `https://app.test${path}` },
+        response: { status: 200, headers: [{ name: 'Set-Cookie', value: `${cookie}=v` }], content: { text: '' } } });
+    const entries = [mk('/jwt/v2/create-cookie', 'authToken'), mk('/', 'sessionId')];
+    const withDisable = diagnosisModule.diagnose({ entries,
+        disabledLabels: new Set(['T01_/jwt/v2/create-cookie-040']), failingLabels: ['T01_/dashboard-050'] });
+    assert.strictEqual(withDisable.top.id, 'session_minter_disabled');
+    assert.match(withDisable.top.for[0], /create-cookie/);
+    // the root-path minter is disabled too, but "/" matches every label — it must not be cited
+    assert.ok(!withDisable.top.for.some(f => f.startsWith('/ sets')), 'a bare "/" must never support the hypothesis');
+    // nothing disabled => hypothesis is actively refuted, not just unsupported
+    const clean = diagnosisModule.diagnose({ entries, disabledLabels: new Set(), failingLabels: [] });
+    const h = clean.hypotheses.find(x => x.id === 'session_minter_disabled');
+    assert.strictEqual(h.supported, false);
+    assert.strictEqual(h.score, 0, 'refuted hypotheses are scored out, not merely ranked low');
+});
+
+test('diagnosis: an unsupported hypothesis never outranks a supported one', () => {
+    const ranked = diagnosisModule.rankHypotheses([
+        { id: 'favourite-theory', prior: 0.99, for: [], against: [] },
+        { id: 'evidenced', prior: 0.2, for: ['the server said so'], against: [] },
+    ]);
+    assert.strictEqual(ranked[0].id, 'evidenced', 'evidence beats prior — that is the whole point');
+});
+
+test('diagnosis: says so plainly when nothing is supported, instead of guessing', () => {
+    const r = diagnosisModule.diagnose({ entries: [], evidence: [], failingLabels: [] });
+    assert.strictEqual(r.top, null);
+    assert.match(r.summary, /not one this reasoner recognises yet/);
+});

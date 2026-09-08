@@ -35,6 +35,7 @@ const finalGreenGate = require('./final-green-gate');
 const semanticTriage = require('./semantic-triage');
 const liveProbe = require('./live-probe');
 const knowledgeBase = require('./knowledge-base');
+const diagnosisModule = require('./diagnosis');
 const nonLoadBearingFold = require('./nonloadbearing-fold');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
@@ -2133,6 +2134,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // Infrastructure facts that decide whether the eventual numbers mean
     // anything (session affinity above all) belong in the operator's face, not
     // only in a debrief file they may never open.
+    let knowledgeFindings = [];
     // ── KNOWLEDGE REVIEW: read the script the way a senior would, BEFORE
     // spending a JMeter run. Findings are advisory — knowledge proposes,
     // the gates still dispose — but a known issue named up front is worth
@@ -2147,6 +2149,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 .map(s => String((s && s.stack) || s)),
         };
         const findings = knowledgeBase.reviewAgainstKnowledge(kbContext);
+        knowledgeFindings = findings;
         if (findings.length) {
             fs.writeFileSync(path.join(outDir, `${name}_knowledge_review.json`), JSON.stringify(findings, null, 2));
             onLog(`knowledge review: ${findings.length} known issue(s) recognised in this script`);
@@ -2307,6 +2310,36 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 if (res.penalized.length) onLog(`proactive experience: decayed ${res.penalized.length} lesson(s) whose sampler still failed`);
             }
         } catch (e) { onLog(`proactive decay skipped: ${e.message}`); }
+    }
+
+    // ── DIFFERENTIAL DIAGNOSIS: the gates say a run is wrong; this says WHY.
+    // Builds a model of the app, lists what could produce the symptom, and
+    // scores each candidate against evidence already collected — so the
+    // operator gets a reasoned cause, not just a failure list. Explains only;
+    // the gates still decide and the existing guards still apply every fix.
+    if (!finalResult.success) {
+        try {
+            const failing = (finalResult.samples || [])
+                .filter(s => s && !s.isTransaction && s.success === false)
+                .map(s => String(s.label || s.name || '').trim());
+            const wallLabels = ((finalResult.semanticTriage || [])
+                .filter(t => t && t.category === 'auth_wall')).map(t => t.label);
+            const dx = diagnosisModule.diagnose({
+                entries: gen.flat,
+                evidence: (currentEvidence && currentEvidence.rows) || [],
+                stack: ((gen.seniorPeDebrief && gen.seniorPeDebrief.stackFingerprint && gen.seniorPeDebrief.stackFingerprint.signals) || [])
+                    .map(s => String((s && s.stack) || s)),
+                disabledLabels: disabledSamplerLabels(finalJmxPath),
+                failingLabels: [...new Set([...failing, ...wallLabels])],
+                knowledgeFindings: knowledgeFindings,
+            });
+            finalResult.diagnosis = { top: dx.top, hypotheses: dx.hypotheses, model: dx.model };
+            fs.writeFileSync(path.join(outDir, `${name}_diagnosis.json`), JSON.stringify(dx, null, 2));
+            onLog(`diagnosis: ${dx.summary}`);
+            if (dx.top && dx.top.remedy) onLog(`  remedy: ${dx.top.remedy}`);
+            const alsoRan = dx.hypotheses.filter(h => h.supported && h !== dx.top).slice(0, 2);
+            for (const h of alsoRan) onLog(`  also possible: ${h.claim.split('.')[0]} (${h.for[0] || ''})`);
+        } catch (e) { onLog(`diagnosis skipped: ${e.message}`); }
     }
 
     // ── SEMANTIC TRIAGE: read what the server SAID about each failure and

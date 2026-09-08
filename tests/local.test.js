@@ -7398,20 +7398,118 @@ test('experiments: results become evidence for or against, and nothing else', ()
     assert.strictEqual(applied[1].testedLive, undefined);
 });
 
-test('auth wall: a recorded REDIRECT that now answers 200 with a login page is caught', () => {
-    // A 3xx has no body, so the baseline-body rule alone misses this — and that
-    // is exactly how a wall gets reported far downstream of where it began.
+test('auth wall: a redirect that becomes a login page counts only AFTER sign-in', () => {
+    const loginPage = '<title>Login</title><input type="password">';
+    // After the credential step: a step that used to redirect onward now asks
+    // who you are — that is the wall, and a 3xx has no body to prove it.
     const hit = semanticTriage.detectAuthWall({
         label: 'T01_/eviction/evict-013', recordedStatus: 302, observedStatus: 200,
-        recordedBody: '', observedBody: '<title>Login</title><input type="password">',
+        recordedBody: '', observedBody: loginPage, signedIn: true,
     });
-    assert.ok(hit, 'redirect-to-login-page must be recognised without a recorded body');
+    assert.ok(hit, 'redirect-to-login-page after sign-in must be recognised');
     assert.match(hit.evidence, /recorded a 302 redirect/);
+    // REGRESSION GUARD: before sign-in (GET /, the login page itself) and after
+    // logout, a login page is the CORRECT response. Firing here walls almost
+    // every app that authenticates by redirect.
+    assert.strictEqual(semanticTriage.detectAuthWall({
+        label: 'T01_GET_/-001', recordedStatus: 302, observedStatus: 200,
+        recordedBody: '', observedBody: loginPage, signedIn: false }), null,
+    'a login page before sign-in is not a wall');
     // a redirect that still redirects is not a wall
     assert.strictEqual(semanticTriage.detectAuthWall({
-        label: 'x', recordedStatus: 302, observedStatus: 302, recordedBody: '', observedBody: '' }), null);
+        label: 'x', recordedStatus: 302, observedStatus: 302, recordedBody: '', observedBody: '', signedIn: true }), null);
     // a 200->200 with no recorded baseline still makes no claim
     assert.strictEqual(semanticTriage.detectAuthWall({
         label: 'y', recordedStatus: 200, observedStatus: 200, recordedBody: '',
-        observedBody: '<input type="password">' }), null);
+        observedBody: '<input type="password">', signedIn: true }), null);
+});
+
+test('auth wall: the sign-in window is derived from the recording, and gates the whole scan', () => {
+    const loginPage = '<title>Login</title><input type="password">';
+    const row = (entryIndex, label, req, extra = {}) => ({
+        entryIndex, label, isTransaction: false, success: true,
+        recordedStatus: 302, observedStatus: 200, recordedBody: '', observedBody: loginPage,
+        entry: { request: req }, ...extra,
+    });
+    const rows = [
+        row(0, 'T01_GET_/-001', { method: 'GET', url: 'https://app.test/' }),
+        row(1, 'T01_/u/login/identifier-007', { method: 'GET', url: 'https://auth.test/u/login/identifier' }),
+        row(2, 'T02_/login-010', { method: 'POST', url: 'https://auth.test/login',
+            postData: { params: [{ name: 'username', value: 'u' }, { name: 'password', value: 'p' }] } }),
+        row(3, 'T03_/dashboard-020', { method: 'GET', url: 'https://app.test/dashboard' }),
+        row(4, 'T09_/logout/-073', { method: 'GET', url: 'https://app.test/logout/' }),
+        row(5, 'T09_/u/login/identifier-091', { method: 'GET', url: 'https://auth.test/u/login/identifier' }),
+    ];
+    const w = semanticTriage._internal.authWindow(rows);
+    assert.strictEqual(w.loginAt, 2, 'the request carrying a password field is the sign-in moment');
+    assert.strictEqual(w.logoutAt, 4);
+    const found = semanticTriage.findAuthWall(rows);
+    assert.deepStrictEqual(found.walls.map(x => x.entryIndex), [3],
+        'only the post-login, pre-logout step is a wall — not GET /, the login page, logout, or the page after it');
+});
+
+// ── knowledge that FIXES: recognised issues get repaired, provably ───────
+const knowledgeRemedies = require('../src/knowledge-remedies');
+const extractorsMod = require('../src/extractors');
+
+test('knowledge remedy: a stale ASP.NET __VIEWSTATE is actually correlated, not just reported', () => {
+    const VS = '/wEPDwUKMTU3NDQzNzk3MQ9kFgICAw9kFgICAQ8PFgIeBFRleHQFBUhlbGxvZGQ';
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/form.aspx' },
+          response: { status: 200, headers: [], content: { mimeType: 'text/html',
+              text: `<html><form><input type="hidden" name="__VIEWSTATE" value="${VS}" /></form></html>` } } },
+        { request: { method: 'POST', url: 'https://app.test/form.aspx',
+              postData: { params: [{ name: '__VIEWSTATE', value: VS }, { name: 'btn', value: 'Save' }] } },
+          response: { status: 200, headers: [], content: { text: 'saved' } } },
+    ];
+    const sampler = (name, path, extra = '') =>
+        `<HTTPSamplerProxy testname="${name}" enabled="true"><stringProp name="HTTPSampler.path">${path}</stringProp>${extra}</HTTPSamplerProxy>`;
+    const xml = [
+        sampler('T01_GET_/form.aspx-001', '/form.aspx'), '<hashTree></hashTree>',
+        sampler('T01_POST_/form.aspx-002', '/form.aspx',
+            `<stringProp name="Argument.name">__VIEWSTATE</stringProp><stringProp name="Argument.value">${VS}</stringProp>`),
+        '<hashTree></hashTree>',
+    ].join('\n');
+
+    const kb = knowledgeBase.loadKnowledge();
+    const findings = knowledgeBase.reviewAgainstKnowledge({ xml, entries }, { knowledge: kb });
+    assert.ok(findings.some(f => f.id === 'aspnet-viewstate'), 'the issue must first be recognised');
+
+    const res = knowledgeRemedies.applyKnowledgeRemedies(xml, {
+        entries, findings, knowledge: kb,
+        planExtractor: extractorsMod.planExtractor, injectAfterSampler: extractorsMod.injectAfterSampler,
+    });
+    const fixed = res.applied.find(a => a.knowledgeId === 'aspnet-viewstate' || a.param === '__VIEWSTATE');
+    assert.ok(fixed, 'ViewState must be repaired, not merely reported');
+    assert.ok(!res.xml.includes(`Argument.value">${VS}`), 'the stale literal is gone from the POST');
+    assert.match(res.xml, /RegexExtractor|HtmlExtractor|JSONPostProcessor/, 'an extractor was wired on the producer');
+    // The invariant that actually matters: the variable the POST now sends is
+    // the one the extractor produces. A mismatch would ship a script that
+    // sends "${SOMETHING}" literally and fails in a far more confusing way.
+    const sent = (res.xml.match(/Argument\.value">\$\{([^}]+)\}/) || [])[1];
+    const produced = (res.xml.match(/(?:refname|referenceNames)">([^<]+)</) || [])[1];
+    assert.ok(sent, 'the POST now sends a variable');
+    assert.strictEqual(sent, produced, 'the variable sent must be the one the extractor defines');
+    assert.strictEqual(fixed.source, 'Step 01 - GET /form.aspx', 'and it comes from the page that rendered the form');
+});
+
+test('knowledge remedy: refuses to "fix" a value with no producer, and never substitutes before the producer', () => {
+    const ORPHAN = 'clientSideComputedValue1234567890';
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/page' },
+          response: { status: 200, headers: [], content: { text: '<html>nothing useful here</html>' } } },
+        { request: { method: 'POST', url: 'https://app.test/submit',
+              postData: { params: [{ name: '__VIEWSTATE', value: ORPHAN }] } },
+          response: { status: 200, headers: [], content: { text: 'ok' } } },
+    ];
+    const xml = `<HTTPSamplerProxy testname="a" enabled="true"><stringProp name="HTTPSampler.path">/submit</stringProp>` +
+        `<stringProp name="Argument.name">__VIEWSTATE</stringProp><stringProp name="Argument.value">${ORPHAN}</stringProp></HTTPSamplerProxy><hashTree></hashTree>`;
+    const kb = knowledgeBase.loadKnowledge();
+    const res = knowledgeRemedies.applyKnowledgeRemedies(xml, {
+        entries, findings: [{ id: 'aspnet-viewstate', title: 'x' }], knowledge: kb,
+        planExtractor: extractorsMod.planExtractor, injectAfterSampler: extractorsMod.injectAfterSampler,
+    });
+    assert.strictEqual(res.applied.length, 0, 'no producer => no guessing');
+    assert.strictEqual(res.xml, xml, 'the script is left byte-identical');
+    assert.ok(res.notes.some(n => /no provable producer/.test(n)), 'and it says so, for a human');
 });

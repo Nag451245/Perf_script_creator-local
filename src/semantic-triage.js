@@ -125,7 +125,8 @@ function loginMarkers(body) {
  * body for the SAME request did not. The recording proves what this endpoint
  * looks like when authenticated; anything else is the wall.
  */
-function detectAuthWall({ label = '', observedBody = '', recordedBody = '', recordedStatus = 0, observedStatus = 0 } = {}) {
+function detectAuthWall({ label = '', observedBody = '', recordedBody = '', recordedStatus = 0,
+    observedStatus = 0, signedIn = false } = {}) {
     const live = loginMarkers(observedBody);
     if (!live.length) return null;
     const recorded = loginMarkers(recordedBody);
@@ -133,12 +134,15 @@ function detectAuthWall({ label = '', observedBody = '', recordedBody = '', reco
     // page (this IS the login screen) — not a wall, just the flow.
     const newMarkers = live.filter(m => !recorded.includes(m));
     if (!newMarkers.length) return null;
-    // A recorded REDIRECT that now answers 200 with a login page is the
-    // strongest wall signal there is — the app stopped forwarding an
-    // authenticated user and started asking who they are. A 3xx has no body,
-    // so the baseline-body rule below would silently miss it, which is how a
-    // wall got reported nine samplers downstream of where it started.
-    const redirectBecameLogin = Number(recordedStatus) >= 300 && Number(recordedStatus) < 400 &&
+    // A recorded REDIRECT that now answers 200 with a login page can be the
+    // strongest wall signal there is — but ONLY once the flow has actually
+    // signed in. Before the credential step, and again after logout, a login
+    // page is the CORRECT response, and a 3xx carries no body to prove
+    // otherwise. Without that guard this rule flags `GET /`, the login page
+    // itself and the post-logout page on every app that authenticates by
+    // redirect — which is nearly all of them.
+    const redirectBecameLogin = signedIn &&
+        Number(recordedStatus) >= 300 && Number(recordedStatus) < 400 &&
         Number(observedStatus) >= 200 && Number(observedStatus) < 300;
     if (!redirectBecameLogin && !String(recordedBody || '').trim()) return null; // no baseline => no claim
     return {
@@ -153,15 +157,52 @@ function detectAuthWall({ label = '', observedBody = '', recordedBody = '', reco
     };
 }
 
+const CREDENTIAL_FIELD_RE = /(^|[_\-.])(password|passwd|pwd|passcode|credential)/i;
+const LOGOUT_PATH_RE = /\/(logout|signout|sign-out|log-out)(\/|\?|$)/i;
+
+/**
+ * When was this flow actually signed in? Everything before the credential
+ * submission is the login journey itself, where a login page is the correct
+ * answer; everything after a logout is the same again. Derived from the
+ * RECORDING, so it needs no app knowledge: the login moment is the request
+ * that carries a password field, and logout is a logout path after it.
+ */
+function authWindow(rows = []) {
+    let loginAt = -1, logoutAt = -1;
+    for (const r of rows || []) {
+        if (!r || r.isTransaction) continue;
+        const idx = Number(r.entryIndex);
+        if (!Number.isFinite(idx)) continue;
+        const req = (r.entry && r.entry.request) || {};
+        const url = String(req.url || r.recordedUrl || '');
+        if (loginAt < 0 && /^(POST|PUT)$/i.test(String(req.method || ''))) {
+            const params = ((req.postData && req.postData.params) || []).map(p => String(p.name || ''));
+            const text = String((req.postData && req.postData.text) || '');
+            const carriesCredential = params.some(n => CREDENTIAL_FIELD_RE.test(n)) ||
+                text.split('&').some(kv => CREDENTIAL_FIELD_RE.test(decodeURIComponent(kv.split('=')[0] || '')));
+            if (carriesCredential) loginAt = idx;
+        }
+        if (loginAt >= 0 && idx > loginAt && logoutAt < 0 && LOGOUT_PATH_RE.test(url)) logoutAt = idx;
+    }
+    return { loginAt, logoutAt };
+}
+
 /**
  * Scan aligned evidence rows for the auth wall. Returns the affected rows plus
  * the earliest one — the place to actually fix.
  */
 function findAuthWall(rows = []) {
     const walls = [];
+    const window = authWindow(rows);
     for (const r of rows || []) {
         if (!r || r.isTransaction) continue;
-        const hit = detectAuthWall({ label: r.label, observedBody: r.observedBody, recordedBody: r.recordedBody, recordedStatus: r.recordedStatus, observedStatus: r.observedStatus });
+        const idx = Number(r.entryIndex);
+        const signedIn = window.loginAt >= 0 && idx > window.loginAt &&
+            (window.logoutAt < 0 || idx < window.logoutAt);
+        const hit = detectAuthWall({
+            label: r.label, observedBody: r.observedBody, recordedBody: r.recordedBody,
+            recordedStatus: r.recordedStatus, observedStatus: r.observedStatus, signedIn,
+        });
         if (hit) walls.push({ ...hit, entryIndex: r.entryIndex, observedStatus: r.observedStatus, passed: r.success !== false });
     }
     return {
@@ -197,5 +238,5 @@ function triageFailure({ label = '', responseBody = '', sentSources = {} } = {})
 
 module.exports = {
     triageFailure, serverReasons, buildSentSources, detectAuthWall, findAuthWall,
-    _internal: { classify, crossReference, loginMarkers },
+    _internal: { classify, crossReference, loginMarkers, authWindow },
 };

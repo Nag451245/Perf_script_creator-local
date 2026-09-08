@@ -43,6 +43,8 @@ const renderedRequestCheck = require('./rendered-request-check');
 const dateIntent = require('./date-intent');
 const jsChallengeToken = require('./js-challenge-token');
 const invariantsModule = require('./invariants');
+const knowledgeBase = require('./knowledge-base');
+const knowledgeRemedies = require('./knowledge-remedies');
 const uploadFiles = require('./upload-files');
 const valueFlowDecisions = require('./value-flow-decisions');
 const peNaming = require('./pe-naming');
@@ -1683,6 +1685,35 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // Kept repeat producers get the first instance's extractors cloned, so the
     // shared variable (e.g. ${token}) REFRESHES right before its later
     // consumer instead of carrying the first page's already-consumed value.
+    // KNOWLEDGE-DRIVEN REPAIR: recognising a stale ViewState/SAML/CSRF token
+    // and only reporting it is a checklist, not an engineer. Every entry in the
+    // knowledge file that carries a `fix` is applied here — but only where the
+    // recording proves a producer AND planExtractor proves the extractor
+    // reproduces the recorded value. A new framework added to that JSON file
+    // gets correlated with no code change at all.
+    if ((runCfg.knowledgeRemedies || {}).enabled !== false) {
+        try {
+            const kb = knowledgeBase.loadKnowledge();
+            const findings = knowledgeBase.reviewAgainstKnowledge({ xml, entries: flat, stack: [] }, { knowledge: kb });
+            const fixable = findings.filter(f => (kb.find(e => e.id === f.id) || {}).fix);
+            if (fixable.length) {
+                const taken = new Set(knownDefinedVars(xml));
+                const rem = knowledgeRemedies.applyKnowledgeRemedies(xml, {
+                    entries: flat, findings: fixable, knowledge: kb,
+                    planExtractor, injectAfterSampler, taken,
+                });
+                if (rem.applied.length) {
+                    xml = rem.xml;
+                    note('knowledge-remedy',
+                        `${rem.applied.length} known issue(s) REPAIRED, not just reported`,
+                        rem.applied.map(a => `${a.title}: ${a.param} ← ${a.source} (${a.substituted} occurrence(s))`).join(' | '),
+                        `each extractor was proven against the recorded response before it was wired; values with no provable producer were left alone`);
+                }
+                for (const n of rem.notes) note('knowledge-remedy-skipped', n, '', 'reported for a human instead of guessed at');
+            }
+        } catch (e) { note('knowledge-remedy', 'skipped (non-fatal)', e.message); }
+    }
+
     if (keptRepeatProducers.length) {
         try {
             const cloneRes = cloneExtractorsToRepeats(xml, keptRepeatProducers, indexSamplersForGenerate(xml));

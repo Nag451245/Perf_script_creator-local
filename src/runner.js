@@ -1195,6 +1195,13 @@ function bodyCaptureProperties(runCfg = {}) {
         'jmeter.save.saveservice.output_format': 'xml',
         'jmeter.save.saveservice.samplerData': 'false',
         'jmeter.save.saveservice.responseHeaders': 'true',
+        'jmeter.save.saveservice.requestHeaders': 'true',
+        // Cookies are the evidence auth failures are MADE of — which session
+        // material a request actually carried. Without them the agent can see
+        // that a step got the login page but never why, and a whole class of
+        // diagnosis stops at "the session is not established" with no next
+        // step. They are small, and JMeter writes them as their own element.
+        'jmeter.save.saveservice.cookies': 'true',
         'jmeter.save.saveservice.url': 'true',
         'jmeter.save.saveservice.response_data': mode === 'full' ? 'true' : 'false',
         'jmeter.save.saveservice.response_data.on_error': mode === 'off' ? 'false' : 'true',

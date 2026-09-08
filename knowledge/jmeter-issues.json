@@ -1,0 +1,129 @@
+{
+  "about": "Seeded performance-engineering knowledge. Each entry is a diagnosis: what you see, when it applies, the cheap test that confirms it, the remedy, and how you know it worked. Edit or add entries freely — this file is data, not code. Add your own hard-won issues here; the agent will check every future script against them.",
+  "entries": [
+    {
+      "id": "literal-with-producer",
+      "title": "A dynamic value is hardcoded even though the recording shows where it comes from",
+      "severity": "high",
+      "confidence": 0.9,
+      "symptom": "The script sends a long token/id as a recorded literal, and that exact value appears in an earlier response — so it was dynamic and is now stale.",
+      "when": [{ "check": "literalHasProducerInRecording", "minLength": 20 }],
+      "discriminate": "Search the recording for the literal. If any earlier response contains it, it is server-issued, not a constant.",
+      "remedy": "Extract it from the producing response and reference it as a variable everywhere downstream.",
+      "verify": "Replay: the request now sends a value that differs from the recording and the step still succeeds."
+    },
+    {
+      "id": "aspnet-viewstate",
+      "title": "ASP.NET __VIEWSTATE / __EVENTVALIDATION not correlated",
+      "severity": "high",
+      "confidence": 0.95,
+      "symptom": "Postbacks fail, redirect to the start page, or return a validation error, because ViewState is per-page and single-use.",
+      "when": [{ "check": "scriptSendsLiteralParam", "namePattern": "^__(VIEWSTATE|EVENTVALIDATION|VIEWSTATEGENERATOR)$", "minLength": 20 }],
+      "discriminate": "Load the page twice in a browser and compare the hidden field values — ASP.NET regenerates them per render.",
+      "remedy": "Extract __VIEWSTATE, __VIEWSTATEGENERATOR and __EVENTVALIDATION from the GET that renders the form, and send them on the following POST. Keep them URL-encoded.",
+      "verify": "The postback returns the expected next page instead of bouncing back to the form."
+    },
+    {
+      "id": "jsf-viewstate",
+      "title": "JSF javax.faces.ViewState not correlated",
+      "severity": "high",
+      "confidence": 0.95,
+      "symptom": "JSF/PrimeFaces requests fail with a ViewExpiredException or silently return the same page.",
+      "when": [{ "check": "scriptSendsLiteralParam", "namePattern": "javax\\.faces\\.ViewState", "minLength": 8 }],
+      "discriminate": "The value changes on every page render, and the server keeps a per-session view map.",
+      "remedy": "Extract javax.faces.ViewState from each rendering response and send the freshest value on the next request. Server-side state saving also requires a stable session cookie.",
+      "verify": "No ViewExpiredException, and the partial-response XML reflects the action you submitted."
+    },
+    {
+      "id": "saml-autopost",
+      "title": "SAML SSO assertion not correlated (auto-POST form)",
+      "severity": "high",
+      "confidence": 0.9,
+      "symptom": "Login appears to succeed but the app never gets a session: the browser silently auto-POSTs a hidden SAMLResponse/RelayState form that a script must reproduce.",
+      "when": [{ "check": "scriptSendsLiteralParam", "namePattern": "^(SAMLResponse|SAMLRequest|RelayState)$", "minLength": 20 }],
+      "discriminate": "Look for an HTML form the browser submits via JavaScript on load, with the assertion in a hidden input — it is base64 and single-use.",
+      "remedy": "Extract SAMLResponse and RelayState from the IdP response body and POST them to the ACS URL as a real step. Do not follow redirects blindly through the handoff.",
+      "verify": "The ACS POST returns a session cookie for the service-provider domain."
+    },
+    {
+      "id": "csrf-literal",
+      "title": "CSRF / anti-forgery token sent as a recorded literal",
+      "severity": "high",
+      "confidence": 0.9,
+      "symptom": "Mutating requests fail with 403/419, or return the form again with a generic error.",
+      "when": [{ "check": "scriptSendsLiteralParam", "namePattern": "csrf|xsrf|authenticity_token|antiforgery|_token$", "minLength": 10 }],
+      "discriminate": "Reload the form page — the hidden token changes. Some frameworks rotate it per request, others per session.",
+      "remedy": "Extract the token from the page that renders the form (hidden input or meta tag) and send it on the submit. If the framework also sends it as a header, set the header too.",
+      "verify": "The mutating request succeeds and the change is visible in a follow-up read."
+    },
+    {
+      "id": "data-rows-below-users",
+      "title": "Not enough test data rows for the configured user count",
+      "severity": "high",
+      "confidence": 0.95,
+      "symptom": "The script passes at 1 user, then produces lock contention, duplicate-record errors or unrealistic cache hits under load, because threads share the same few data rows.",
+      "when": [{ "check": "dataRowsBelowUsers", "minRatio": 1 }],
+      "discriminate": "Count rows in the CSV against the thread count. With shareMode=all and recycle, thread N+1 simply reuses row 1.",
+      "remedy": "Generate or supply at least one unique row per concurrent user (more for multi-iteration runs), or make the flow pick its entity from a live listing response instead of a fixed pool.",
+      "verify": "At the target user count, no two threads operate on the same business entity."
+    },
+    {
+      "id": "missing-cookie-manager",
+      "title": "App issues session cookies but the plan has no Cookie Manager",
+      "severity": "high",
+      "confidence": 0.95,
+      "symptom": "Everything after login behaves as if logged out — often HTTP 200 serving the login page.",
+      "when": [
+        { "check": "recordingSetsCookie", "namePattern": "sess|auth|token|jwt|iam|idem" },
+        { "check": "scriptMissingElement", "element": "CookieManager" }
+      ],
+      "discriminate": "Check whether the recording's Set-Cookie values are ever echoed back on later requests.",
+      "remedy": "Add an HTTP Cookie Manager. Keep it per-thread so each virtual user holds its own session.",
+      "verify": "Post-login steps return real application content, not the login page."
+    },
+    {
+      "id": "session-affinity-cookie",
+      "title": "Load balancer session affinity — each user needs its own cookie store",
+      "severity": "medium",
+      "confidence": 0.85,
+      "symptom": "Load lands unevenly on one node, or throughput plateaus far below expectation, because every thread carries the same persistence cookie.",
+      "when": [{ "check": "recordingSetsCookie", "namePattern": "^(TS[0-9a-f]{6,}|BIGipServer|AWSALB|ARRAffinity|NSC_)" }],
+      "discriminate": "The cookie is set by the edge, not the app, and its value encodes a backend node.",
+      "remedy": "Ensure the Cookie Manager is per-thread (not shared). Decide deliberately whether to clear it per iteration — clearing re-balances, keeping it models a returning user.",
+      "verify": "Under load, backend nodes receive comparable request counts."
+    },
+    {
+      "id": "recording-without-bodies",
+      "title": "Recording captured almost no response bodies — correlation is impossible",
+      "severity": "high",
+      "confidence": 0.95,
+      "symptom": "Very few correlations are found and dynamic values ship as literals, no matter how good the tooling is.",
+      "when": [{ "check": "recordingBodyCoverageBelow", "pct": 25 }],
+      "discriminate": "A JMX holds only requests; the response side lives in the recording XML/JTL. If bodies are missing, there is nothing to extract from.",
+      "remedy": "Re-capture with response bodies enabled, or pair the JMX with the recording file that has them.",
+      "verify": "Body coverage is high and the correlation count rises accordingly."
+    },
+    {
+      "id": "no-assertions",
+      "title": "Script validates on HTTP status alone",
+      "severity": "medium",
+      "confidence": 0.9,
+      "symptom": "The run reports success while the application returned an error page, a login page, or an empty result — all with HTTP 200.",
+      "when": [{ "check": "scriptHasNoAssertions" }],
+      "discriminate": "Open a passing response body and ask whether it actually contains the business outcome.",
+      "remedy": "Assert a business marker on each key step — a field the working response always carries — not just the response code.",
+      "verify": "Deliberately breaking the step (e.g. bad credentials) now fails the script."
+    },
+    {
+      "id": "extractor-without-default",
+      "title": "Extractor has no default value — failures become silent",
+      "severity": "medium",
+      "confidence": 0.85,
+      "symptom": "When the regex misses, the variable is empty and the next request sends a blank value, producing a confusing downstream error instead of an obvious one.",
+      "when": [{ "check": "extractorWithoutDefault" }],
+      "discriminate": "Look at the failing request: an empty or literal ${var} in the sent value means the extractor never matched.",
+      "remedy": "Give every extractor an obvious default such as NOT_FOUND so a miss is visible at the point it happens.",
+      "verify": "A forced miss shows the sentinel value in the request, at the right step."
+    }
+  ]
+}

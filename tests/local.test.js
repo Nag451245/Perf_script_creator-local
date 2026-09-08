@@ -7255,3 +7255,47 @@ test('findLastJtl: newest by MTIME wins, not the highest iteration number (stale
     assert.match(findLastJtl(dir), /iteration_1/, 'the fresh 1-iteration run must win over the previous run\'s iteration_3');
     fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ── knowledge base: expertise as data, not code ──────────────────────────
+const knowledgeBase = require('../src/knowledge-base');
+
+test('knowledge base: seeded entries load and are well formed', () => {
+    const kb = knowledgeBase.loadKnowledge();
+    assert.ok(kb.length >= 10, 'seed knowledge should be present');
+    for (const e of kb) {
+        assert.ok(e.id && e.title && Array.isArray(e.when) && e.when.length, `entry ${e.id} needs id/title/when`);
+        assert.ok(e.remedy && e.verify, `entry ${e.id} must say what to do and how to know it worked`);
+        for (const clause of e.when) {
+            assert.ok(knowledgeBase.CHECKS[clause.check], `entry ${e.id} uses unknown check "${clause.check}"`);
+        }
+    }
+});
+
+test('knowledge base: fires on a hardcoded ViewState, stays silent once correlated', () => {
+    const arg = (n, v) => `<stringProp name="Argument.name">${n}</stringProp><stringProp name="Argument.value">${v}</stringProp>`;
+    const stale = `<jmeterTestPlan>${arg('__VIEWSTATE', '/wEPDwUKMTU3NDQzNzk3MQ9kFgICAw9kFgI')}</jmeterTestPlan>`;
+    const fixed = `<jmeterTestPlan>${arg('__VIEWSTATE', '${viewstate}')}</jmeterTestPlan>`;
+    const kb = knowledgeBase.loadKnowledge();
+    const hit = knowledgeBase.reviewAgainstKnowledge({ xml: stale, entries: [] }, { knowledge: kb });
+    assert.ok(hit.some(f => f.id === 'aspnet-viewstate'), 'stale ViewState must be recognised');
+    const clean = knowledgeBase.reviewAgainstKnowledge({ xml: fixed, entries: [] }, { knowledge: kb });
+    assert.ok(!clean.some(f => f.id === 'aspnet-viewstate'), 'a correlated ViewState is not an issue');
+});
+
+test('knowledge base: data-vs-users rule catches the 1-user blind spot', () => {
+    const kb = knowledgeBase.loadKnowledge();
+    const few = knowledgeBase.reviewAgainstKnowledge({ xml: '', entries: [], dataRows: 10, users: 50 }, { knowledge: kb });
+    const f = few.find(x => x.id === 'data-rows-below-users');
+    assert.ok(f, '10 rows for 50 users must be flagged');
+    assert.match(f.evidence, /10 data row\(s\) for 50 users/);
+    // enough data, or a single-user validation run => silent
+    assert.ok(!knowledgeBase.reviewAgainstKnowledge({ xml: '', entries: [], dataRows: 60, users: 50 }, { knowledge: kb })
+        .some(x => x.id === 'data-rows-below-users'));
+    assert.ok(!knowledgeBase.reviewAgainstKnowledge({ xml: '', entries: [], dataRows: 10, users: 1 }, { knowledge: kb })
+        .some(x => x.id === 'data-rows-below-users'));
+});
+
+test('knowledge base: an entry using an unknown check never fires (no guessing)', () => {
+    const bogus = [{ id: 'x', title: 'x', when: [{ check: 'noSuchCheckExists' }], remedy: 'r', verify: 'v' }];
+    assert.deepStrictEqual(knowledgeBase.reviewAgainstKnowledge({ xml: 'anything' }, { knowledge: bogus }), []);
+});

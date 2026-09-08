@@ -34,6 +34,7 @@ const statusAnalysis = require('./status-analysis');
 const finalGreenGate = require('./final-green-gate');
 const semanticTriage = require('./semantic-triage');
 const liveProbe = require('./live-probe');
+const knowledgeBase = require('./knowledge-base');
 const nonLoadBearingFold = require('./nonloadbearing-fold');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
@@ -1028,6 +1029,15 @@ function assessContinuation({ trajectory = [], guard = null, iterationsRun = 0, 
         suggestedIterations,
         message,
     };
+}
+
+/** Data rows available to the thread group (header excluded). */
+function countDataRows(outDir, name) {
+    try {
+        const csv = path.join(outDir, `${name}_data.csv`);
+        if (!fs.existsSync(csv)) return 0;
+        return Math.max(0, fs.readFileSync(csv, 'utf8').split(/\r?\n/).filter(l => l.trim()).length - 1);
+    } catch { return 0; }
 }
 
 /** Fill body-less rows from the iteration JTL (see run-evidence for why). */
@@ -2123,6 +2133,30 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     // Infrastructure facts that decide whether the eventual numbers mean
     // anything (session affinity above all) belong in the operator's face, not
     // only in a debrief file they may never open.
+    // ── KNOWLEDGE REVIEW: read the script the way a senior would, BEFORE
+    // spending a JMeter run. Findings are advisory — knowledge proposes,
+    // the gates still dispose — but a known issue named up front is worth
+    // more than the same issue diagnosed after three iterations.
+    try {
+        const kbContext = {
+            xml: fs.readFileSync(config.jmxPath, 'utf8'),
+            entries: gen.flat,
+            dataRows: countDataRows(outDir, name),
+            users: Number((gen.loadProfile && gen.loadProfile.users) || (enrichedRunCfg.loadProfile || {}).users) || 0,
+            stack: ((gen.seniorPeDebrief && gen.seniorPeDebrief.stackFingerprint && gen.seniorPeDebrief.stackFingerprint.signals) || [])
+                .map(s => String((s && s.stack) || s)),
+        };
+        const findings = knowledgeBase.reviewAgainstKnowledge(kbContext);
+        if (findings.length) {
+            fs.writeFileSync(path.join(outDir, `${name}_knowledge_review.json`), JSON.stringify(findings, null, 2));
+            onLog(`knowledge review: ${findings.length} known issue(s) recognised in this script`);
+            for (const f of findings.slice(0, 4)) {
+                onLog(`  · [${f.severity}] ${f.title}${f.evidence ? ` — ${f.evidence}` : ''}`);
+                if (f.remedy) onLog(`      remedy: ${f.remedy.split('.')[0]}.`);
+            }
+        }
+    } catch (e) { onLog(`knowledge review skipped: ${e.message}`); }
+
     for (const f of ((gen.seniorPeDebrief && gen.seniorPeDebrief.infrastructure) || []).filter(x => x.severity === 'high')) {
         onLog(`topology: ${f.tech} — ${f.evidence}`);
         onLog(`  → ${f.implication.split('.')[0]}.`);

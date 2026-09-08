@@ -135,6 +135,22 @@ function stepLabel(index) {
  * @param name   base name
  * @param data   { mode, verdict, stats, samples, baselineDiff?, memoryMatches?, learnedLessons?, correlations?, dualHar?, loadProfile?, reasoning?, businessVerification? }
  */
+/**
+ * Where does this artifact actually live? The organizer files diagnostics into
+ * subfolders and strips the flow-name prefix there, so a link built from the
+ * root name alone would silently vanish from the report.
+ */
+function resolveArtifactHref(outDir, file, name) {
+    if (fs.existsSync(path.join(outDir, file))) return file;
+    const short = name && file.startsWith(name + "_") ? file.slice(name.length + 1) : file;
+    for (const folder of ["reports", "evidence", "results", "data", "scripts"]) {
+        for (const candidate of [short, file]) {
+            if (fs.existsSync(path.join(outDir, folder, candidate))) return folder + "/" + candidate;
+        }
+    }
+    return "";
+}
+
 function writeHtmlReport(outDir, name, data = {}) {
     const {
         mode = 'generate', verdict = 'generated', stats = {}, samples = [],
@@ -202,8 +218,11 @@ function writeHtmlReport(outDir, name, data = {}) {
     const artifactItems = pointerItems + manifestItems + explicitArtifacts + ARTIFACTS
         .map(([suffix, desc]) => {
             const file = suffix === 'log.txt' ? 'log.txt' : `${name}${suffix}`;
-            const full = path.join(outDir, file);
-            return fs.existsSync(full) ? `<li><a href="${esc(file)}">${esc(file)}</a> — ${esc(desc)}</li>` : '';
+            // Diagnostics are filed into subfolders (and lose the flow-name
+            // prefix there), so link wherever the file actually ended up
+            // rather than dropping the link the moment it is tidied away.
+            const href = resolveArtifactHref(outDir, file, name);
+            return href ? `<li><a href="${esc(href)}">${esc(href)}</a> — ${esc(desc)}</li>` : '';
         })
         .filter(Boolean).join('');
 

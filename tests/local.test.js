@@ -358,7 +358,7 @@ test('PE naming: run evidence aligns PE suffixed JTL labels to original recordin
     assert.strictEqual(evidence.rows[2].recordedUrl, 'https://app.test/patientChart.php?id=123');
 });
 
-test('output organizer: creates compatibility subfolders and manifest without removing root files', () => {
+test('output organizer: files land in the right folder, and the manifest points at them', () => {
     const out = tmp();
     fs.writeFileSync(path.join(out, 'demo.jmx'), '<jmeterTestPlan/>');
     fs.writeFileSync(path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx'), '<jmeterTestPlan/>');
@@ -376,17 +376,21 @@ test('output organizer: creates compatibility subfolders and manifest without re
         currentJtlPath: path.join(out, 'final.jtl'),
     });
 
-    assert.ok(fs.existsSync(path.join(out, 'demo.jmx')), 'root generated JMX should stay in place');
-    assert.ok(fs.existsSync(path.join(out, 'scripts', '00_USE_THIS_FINAL_VALIDATED_demo.jmx')));
-    assert.ok(fs.existsSync(path.join(out, 'reports', 'demo_report.html')));
+    // The base script is filed under scripts/ (with a real name, not "jmx");
+    // the deliverable, the report and the CSV stay where a human/JMeter needs
+    // them and are archived rather than duplicated at the root.
+    assert.ok(!fs.existsSync(path.join(out, 'demo.jmx')), 'the base script is filed away, not left at the root');
+    assert.ok(fs.existsSync(path.join(out, 'scripts', 'base.jmx')));
+    assert.ok(fs.existsSync(path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx')), 'deliverable stays at the root');
+    assert.ok(fs.existsSync(path.join(out, 'scripts', '00_USE_THIS_FINAL_VALIDATED_demo.jmx')), 'and is archived');
+    assert.ok(fs.existsSync(path.join(out, 'reports', 'report.html')));
     assert.ok(fs.existsSync(path.join(out, 'results', 'final.jtl')));
-    assert.ok(fs.existsSync(path.join(out, 'evidence', 'demo_label_map.json')));
-    assert.ok(fs.existsSync(path.join(out, 'data', 'demo_data.csv')));
+    assert.ok(fs.existsSync(path.join(out, 'evidence', 'label_map.json')));
+    assert.ok(fs.existsSync(path.join(out, 'demo_data.csv')), 'the CSV stays beside the script that reads it');
     assert.ok(fs.existsSync(path.join(out, 'output_manifest.json')));
     assert.strictEqual(manifest.verdict, 'GREEN');
     assert.strictEqual(manifest.whatToOpen.finalJmx, 'scripts/00_USE_THIS_FINAL_VALIDATED_demo.jmx');
-    assert.strictEqual(manifest.whatToOpen.dataCsv, 'data/demo_data.csv');
-    assert.match(fs.readFileSync(path.join(out, '00_OUTPUT_INDEX.md'), 'utf8'), /Data CSV: data\/demo_data\.csv/);
+    assert.match(fs.readFileSync(path.join(out, '00_OUTPUT_INDEX.md'), 'utf8'), /Data CSV:/);
 });
 
 test('LLM escalation: clean no-op without a Gemini key', async () => {
@@ -7512,4 +7516,46 @@ test('knowledge remedy: refuses to "fix" a value with no producer, and never sub
     assert.strictEqual(res.applied.length, 0, 'no producer => no guessing');
     assert.strictEqual(res.xml, xml, 'the script is left byte-identical');
     assert.ok(res.notes.some(n => /no provable producer/.test(n)), 'and it says so, for a human');
+});
+
+// ── output folder: one of each file, and a root a human can read ─────────
+test('output organizer: files are MOVED not duplicated, and the root stays short', () => {
+    const os = require('os');
+    const organizer = require('../src/output-organizer');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_org_'));
+    const name = 'MyFlow__paired';
+    const w = (f, c = 'x') => { fs.writeFileSync(path.join(dir, f), c); return path.join(dir, f); };
+    const finalJmx = w(`00_USE_THIS_FINAL_VALIDATED_${name}.jmx`, '<jmeterTestPlan/>');
+    w(`${name}.jmx`, '<jmeterTestPlan/>');                 // base script
+    w(`${name}_patched_1.jmx`, '<jmeterTestPlan/>');
+    w('final_validated.jmx', '<jmeterTestPlan/>');         // legacy duplicate deliverable
+    w(`${name}_report.html`, '<html></html>');
+    w(`${name}_data.csv`, 'a|b\n1|2');
+    w(`${name}_senior_pe_debrief.json`, '{}');
+    w(`${name}_baseline_diff.json`, '{}');
+    w('final.jtl', '<testResults/>');
+    w('log.txt', 'log');
+
+    organizer.organizeOutput({ outDir: dir, name, verdict: 'GREEN', finalJmxPath: finalJmx,
+        reportPath: path.join(dir, `${name}_report.html`), currentJtlPath: path.join(dir, 'final.jtl') });
+
+    const rootFiles = fs.readdirSync(dir).filter(f => fs.statSync(path.join(dir, f)).isFile());
+    // The deliverable and the things a human opens stay put...
+    assert.ok(rootFiles.includes(`00_USE_THIS_FINAL_VALIDATED_${name}.jmx`), 'the deliverable stays at the root');
+    assert.ok(rootFiles.includes(`${name}_data.csv`), 'the CSV must sit beside the script that reads it');
+    assert.ok(rootFiles.includes(`${name}_report.html`) && rootFiles.includes('log.txt'));
+    // ...diagnostics are filed away, not copied, and lose the redundant prefix
+    assert.ok(!rootFiles.includes(`${name}_senior_pe_debrief.json`), 'diagnostics move off the root');
+    assert.ok(fs.existsSync(path.join(dir, 'evidence', 'senior_pe_debrief.json')), 'and lose the flow-name prefix');
+    assert.ok(!fs.existsSync(path.join(dir, 'evidence', `${name}_senior_pe_debrief.json`)), 'exactly one copy exists');
+    // the legacy second deliverable is gone; the base script keeps a real name
+    assert.ok(!fs.existsSync(path.join(dir, 'final_validated.jmx')), 'only one deliverable survives');
+    assert.ok(fs.existsSync(path.join(dir, 'scripts', 'base.jmx')), '"<flow>.jmx" must not become a file named "jmx"');
+    assert.ok(rootFiles.length <= 9, `root should stay short, got ${rootFiles.length}: ${rootFiles.join(', ')}`);
+
+    // Running twice must not grow the folder — organize is idempotent.
+    const before = fs.readdirSync(path.join(dir, 'evidence')).length;
+    organizer.organizeOutput({ outDir: dir, name, verdict: 'GREEN', finalJmxPath: finalJmx });
+    assert.strictEqual(fs.readdirSync(path.join(dir, 'evidence')).length, before, 'a second organize adds nothing');
+    fs.rmSync(dir, { recursive: true, force: true });
 });

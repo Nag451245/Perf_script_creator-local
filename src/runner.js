@@ -36,6 +36,7 @@ const semanticTriage = require('./semantic-triage');
 const liveProbe = require('./live-probe');
 const knowledgeBase = require('./knowledge-base');
 const diagnosisModule = require('./diagnosis');
+const experimentsModule = require('./experiments');
 const nonLoadBearingFold = require('./nonloadbearing-fold');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
@@ -2333,7 +2334,33 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 failingLabels: [...new Set([...failing, ...wallLabels])],
                 knowledgeFindings: knowledgeFindings,
             });
-            finalResult.diagnosis = { top: dx.top, hypotheses: dx.hypotheses, model: dx.model };
+            // The loop closes here: a hypothesis the collected evidence cannot
+            // settle goes and OBSERVES. GET-only, no cookies, recording hosts
+            // only, state-changing paths refused — see experiments.js.
+            let experimentResults = [];
+            if ((enrichedRunCfg.experiments || {}).enabled !== false && targetBaseUrl) {
+                try {
+                    const plan = experimentsModule.planExperiments({
+                        hypotheses: dx.hypotheses, model: dx.model, entries: gen.flat, baseUrl: targetBaseUrl,
+                    });
+                    if (plan.length) {
+                        onLog(`experiments: running ${plan.length} live check(s) to settle the diagnosis`);
+                        for (const p of plan) onLog(`  · ${p.question}`);
+                        experimentResults = await experimentsModule.runExperiments(plan);
+                        for (const r of experimentResults) {
+                            onLog(`  → ${r.ran ? r.observation : `could not run (${r.why})`}`);
+                        }
+                        dx.hypotheses = diagnosisModule.rankHypotheses(
+                            experimentsModule.applyExperimentResults(dx.hypotheses, experimentResults));
+                        const supported = dx.hypotheses.filter(h => h.supported);
+                        dx.top = supported[0] || null;
+                        dx.summary = dx.top
+                            ? `${dx.top.claim} Evidence: ${dx.top.for.join('; ')}.`
+                            : dx.summary;
+                    }
+                } catch (e) { onLog(`experiments skipped: ${e.message}`); }
+            }
+            finalResult.diagnosis = { top: dx.top, hypotheses: dx.hypotheses, model: dx.model, experiments: experimentResults };
             fs.writeFileSync(path.join(outDir, `${name}_diagnosis.json`), JSON.stringify(dx, null, 2));
             onLog(`diagnosis: ${dx.summary}`);
             if (dx.top && dx.top.remedy) onLog(`  remedy: ${dx.top.remedy}`);

@@ -7345,3 +7345,55 @@ test('diagnosis: says so plainly when nothing is supported, instead of guessing'
     assert.strictEqual(r.top, null);
     assert.match(r.summary, /not one this reasoner recognises yet/);
 });
+
+// ── live experiments: a hypothesis proves itself, safely ─────────────────
+const experiments = require('../src/experiments');
+
+test('experiments: refuses anything that could change state or wander off-host', () => {
+    const known = ['app.test'];
+    const safe = (u) => experiments._internal.isSafeToProbe(u, known);
+    assert.strictEqual(safe('https://app.test/redirect/').ok, true);
+    // state-changing paths are refused even as GETs — plenty of apps act on them
+    for (const p of ['/logout', '/user/signout', '/account/delete', '/token/revoke', '/password/reset', '/order/cancel']) {
+        assert.strictEqual(safe(`https://app.test${p}`).ok, false, `${p} must never be probed`);
+    }
+    // cannot be talked into contacting a host the recording never touched
+    assert.strictEqual(safe('https://evil.test/').ok, false);
+    assert.match(safe('https://evil.test/').why, /not in the recording/);
+    // no other protocols
+    assert.strictEqual(safe('file:///etc/passwd').ok, false);
+    assert.strictEqual(safe('ftp://app.test/x').ok, false);
+});
+
+test('experiments: plans only what a GET can actually settle, and never tries credentials', () => {
+    const e = (url, body = '', post) => ({ request: { method: post ? 'POST' : 'GET', url, ...(post ? { postData: { text: post } } : {}) },
+        response: { status: 200, headers: [], content: { text: body } } });
+    const TOKEN = 'abcdefghijklmnopqrstuvwxyz123456';
+    const entries = [e('https://app.test/form', `<input value="${TOKEN}">`), e('https://app.test/submit', '', `token=${TOKEN}`)];
+    const model = { sessionMinters: [{ host: 'app.test', path: '/login/start', cookies: ['PHPSESSID'] }] };
+    const plan = experiments.planExperiments({
+        hypotheses: [
+            { id: 'credentials_rejected' },          // must NOT be probed — could lock the account
+            { id: 'session_never_minted' },
+            { id: 'single_use_value_replayed' },
+        ], model, entries, baseUrl: 'https://app.test',
+    });
+    const kinds = plan.map(p => p.kind);
+    assert.ok(kinds.includes('mint-check'));
+    assert.ok(kinds.includes('volatility-check'));
+    assert.ok(!plan.some(p => p.hypothesisId === 'credentials_rejected'), 'never auto-test credentials');
+    assert.ok(plan.length <= experiments._internal.MAX_EXPERIMENTS);
+});
+
+test('experiments: results become evidence for or against, and nothing else', () => {
+    const hyps = [{ id: 'single_use_value_replayed', for: [], against: [] }, { id: 'other', for: [], against: [] }];
+    const applied = experiments.applyExperimentResults(hyps, [
+        { hypothesisId: 'single_use_value_replayed', ran: true, supports: true, question: 'Does it rotate?', observation: 'it has rotated' },
+        { hypothesisId: 'other', ran: false, why: 'timeout' },
+    ]);
+    assert.strictEqual(applied[0].for.length, 1);
+    assert.match(applied[0].for[0], /live check/);
+    assert.strictEqual(applied[0].testedLive, true);
+    assert.strictEqual(applied[1].for.length, 0, 'an experiment that could not run adds nothing');
+    assert.strictEqual(applied[1].testedLive, undefined);
+});

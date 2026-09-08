@@ -61,7 +61,13 @@ function httpGet(rawUrl, { timeoutMs = DEFAULT_TIMEOUT_MS, redirectsLeft = MAX_R
                 bytes += Buffer.byteLength(chunk);
                 if (bytes <= MAX_BODY_BYTES) body += chunk;
             });
-            res.on('end', () => resolve({ ok: true, status, body, url: target.href }));
+            // Surface Set-Cookie: a diagnosis often turns on whether an
+            // endpoint still issues session material when called fresh.
+            const setCookie = []
+                .concat(res.headers && res.headers['set-cookie'] ? res.headers['set-cookie'] : [])
+                .map(v => String(v).split('=')[0].trim())
+                .filter(Boolean);
+            res.on('end', () => resolve({ ok: true, status, body, url: target.href, setCookie }));
         });
         req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: `timeout after ${timeoutMs}ms`, url: rawUrl }); });
         req.on('error', (e) => resolve({ ok: false, error: e.message, url: rawUrl }));

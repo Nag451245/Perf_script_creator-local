@@ -7397,3 +7397,21 @@ test('experiments: results become evidence for or against, and nothing else', ()
     assert.strictEqual(applied[1].for.length, 0, 'an experiment that could not run adds nothing');
     assert.strictEqual(applied[1].testedLive, undefined);
 });
+
+test('auth wall: a recorded REDIRECT that now answers 200 with a login page is caught', () => {
+    // A 3xx has no body, so the baseline-body rule alone misses this — and that
+    // is exactly how a wall gets reported far downstream of where it began.
+    const hit = semanticTriage.detectAuthWall({
+        label: 'T01_/eviction/evict-013', recordedStatus: 302, observedStatus: 200,
+        recordedBody: '', observedBody: '<title>Login</title><input type="password">',
+    });
+    assert.ok(hit, 'redirect-to-login-page must be recognised without a recorded body');
+    assert.match(hit.evidence, /recorded a 302 redirect/);
+    // a redirect that still redirects is not a wall
+    assert.strictEqual(semanticTriage.detectAuthWall({
+        label: 'x', recordedStatus: 302, observedStatus: 302, recordedBody: '', observedBody: '' }), null);
+    // a 200->200 with no recorded baseline still makes no claim
+    assert.strictEqual(semanticTriage.detectAuthWall({
+        label: 'y', recordedStatus: 200, observedStatus: 200, recordedBody: '',
+        observedBody: '<input type="password">' }), null);
+});

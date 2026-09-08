@@ -125,7 +125,7 @@ function loginMarkers(body) {
  * body for the SAME request did not. The recording proves what this endpoint
  * looks like when authenticated; anything else is the wall.
  */
-function detectAuthWall({ label = '', observedBody = '', recordedBody = '' } = {}) {
+function detectAuthWall({ label = '', observedBody = '', recordedBody = '', recordedStatus = 0, observedStatus = 0 } = {}) {
     const live = loginMarkers(observedBody);
     if (!live.length) return null;
     const recorded = loginMarkers(recordedBody);
@@ -133,11 +133,20 @@ function detectAuthWall({ label = '', observedBody = '', recordedBody = '' } = {
     // page (this IS the login screen) — not a wall, just the flow.
     const newMarkers = live.filter(m => !recorded.includes(m));
     if (!newMarkers.length) return null;
-    if (!String(recordedBody || '').trim()) return null; // no baseline => no claim
+    // A recorded REDIRECT that now answers 200 with a login page is the
+    // strongest wall signal there is — the app stopped forwarding an
+    // authenticated user and started asking who they are. A 3xx has no body,
+    // so the baseline-body rule below would silently miss it, which is how a
+    // wall got reported nine samplers downstream of where it started.
+    const redirectBecameLogin = Number(recordedStatus) >= 300 && Number(recordedStatus) < 400 &&
+        Number(observedStatus) >= 200 && Number(observedStatus) < 300;
+    if (!redirectBecameLogin && !String(recordedBody || '').trim()) return null; // no baseline => no claim
     return {
         label,
         category: 'auth_wall',
-        evidence: `live response shows ${newMarkers.join(' and ')}; the recorded response for this request did not`,
+        evidence: redirectBecameLogin
+            ? `recorded a ${recordedStatus} redirect, now answers ${observedStatus} with ${newMarkers.join(' and ')}`
+            : `live response shows ${newMarkers.join(' and ')}; the recorded response for this request did not`,
         recordedTitle: (String(recordedBody).match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
         observedTitle: (String(observedBody).match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
         ask: `The server returned the LOGIN page for "${label}" with an HTTP 200, so JMeter counted it as a pass. The session is not established — every "passing" sampler after login is measuring the login page, not the application. Fix the authentication handshake before trusting any number from this run.`,
@@ -152,7 +161,7 @@ function findAuthWall(rows = []) {
     const walls = [];
     for (const r of rows || []) {
         if (!r || r.isTransaction) continue;
-        const hit = detectAuthWall({ label: r.label, observedBody: r.observedBody, recordedBody: r.recordedBody });
+        const hit = detectAuthWall({ label: r.label, observedBody: r.observedBody, recordedBody: r.recordedBody, recordedStatus: r.recordedStatus, observedStatus: r.observedStatus });
         if (hit) walls.push({ ...hit, entryIndex: r.entryIndex, observedStatus: r.observedStatus, passed: r.success !== false });
     }
     return {

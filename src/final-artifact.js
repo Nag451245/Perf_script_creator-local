@@ -3,6 +3,19 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { nextAction } = require('./run-summary');
+
+/** Soft-wrap a sentence so a plain-text file stays readable in Notepad. */
+function wrap(text, width = 78) {
+    const words = String(text || '').split(/\s+/);
+    const out = []; let line = '';
+    for (const w of words) {
+        if (line && (line + ' ' + w).length > width) { out.push(line); line = w; }
+        else line = line ? line + ' ' + w : w;
+    }
+    if (line) out.push(line);
+    return out.join('\n');
+}
 
 /**
  * Last-line-of-defence sanitizer, applied to the EXACT bytes shipped as
@@ -170,6 +183,10 @@ function writeFinalJmxPointer({
     currentJtlPath = '',
     labelMapPath = '',
     manifestPath = '',
+    greenGate = null,
+    blockers = [],
+    continuation = null,
+    changeSummary = '',
 } = {}) {
     if (!outDir || !name || !finalJmxPath) {
         throw new Error('outDir, name, and finalJmxPath are required');
@@ -180,10 +197,11 @@ function writeFinalJmxPointer({
 
     fs.mkdirSync(outDir, { recursive: true });
     const safeName = String(name).replace(/[^a-zA-Z0-9_-]/g, '_');
-    const status = validated
-        ? (verdict === 'GREEN' ? 'FINAL_VALIDATED' : 'FINAL_NEEDS_ATTENTION')
-        : 'FINAL_GENERATED_NOT_VALIDATED';
-    const finalName = `00_USE_THIS_${status}_${safeName}.jmx`;
+    // ONE STABLE NAME. The old name baked the verdict and the flow into the
+    // filename — 75 characters that CHANGED between runs, so a folder ended up
+    // with several near-identical scripts and an editor could sit on a stale
+    // one. The status belongs in the report, not in the thing you double-click.
+    const finalName = '00_RUN_THIS_SCRIPT.jmx';
     const finalCopyPath = path.join(outDir, finalName);
     // Sanitize the exact shipped bytes (corruption revert + re-assert folds) —
     // repair rounds can hand back a re-substituted / re-enabled JMX even when
@@ -216,45 +234,47 @@ function writeFinalJmxPointer({
         fs.writeFileSync(path.join(outDir, `${safeName}_final_sanitizer.json`), JSON.stringify(sanitized.notes, null, 2));
     }
 
+    // The first thing anyone reads should answer "what do I do now?", not make
+    // them interpret a status word. Action first, then why, then the details.
     const guidePath = path.join(outDir, '00_OPEN_THIS_FIRST.txt');
+    const action = nextAction({ verdict, gate: greenGate, blockers, continuation, validated });
     const lines = [
-        `USE THIS JMX: ${finalName}`,
+        action.headline.toUpperCase(),
         '',
+        ...(action.detail ? [wrap(action.detail), ''] : []),
+        ...(changeSummary ? [wrap(changeSummary), ''] : []),
         ...(stale && stale.external ? [
             stale.byJMeter
-                ? '!! JMeter rewrote the previous version of this file after the agent produced it (a save from a buffer opened before that run). If it is still open in JMeter, close it WITHOUT saving and reopen it — otherwise saving will put the OLD script back.'
-                : '!! The previous version of this file was modified outside the agent. It has been replaced; reopen it wherever it is still open.',
+                ? wrap('!! JMeter rewrote the previous version of this file after the agent produced it (a save from a buffer opened before that run). If it is still open in JMeter, close it WITHOUT saving and reopen it — otherwise saving will put the OLD script back.')
+                : wrap('!! The previous version of this file was modified outside the agent. It has been replaced; reopen it wherever it is still open.'),
             '',
         ] : []),
-        `Verdict: ${verdict}`,
-        `JMeter validation: ${validated ? 'RAN' : 'NOT RUN'}`,
-        `Source JMX: ${path.basename(finalJmxPath)}`,
-        `Report: ${path.basename(reportPath || `${safeName}_report.html`)}`,
-        `Current JTL: ${currentJtlPath ? path.basename(currentJtlPath) : 'final.jtl'}`,
-        `PE label map: ${labelMapPath ? path.basename(labelMapPath) : `${safeName}_label_map.json`}`,
-        `Output manifest: ${manifestPath ? path.basename(manifestPath) : 'output_manifest.json'}`,
-        'Run log: log.txt',
+        'WHAT TO OPEN',
+        `  The script .......... ${finalName}`,
+        `  Everything else ..... ${path.basename(reportPath || `${safeName}_report.html`)}  (open in a browser)`,
+        // Only name the CSV when there is one — pointing at a file that was
+        // never generated reads as a missing file, not as "this flow has no
+        // data pool".
+        ...(fs.existsSync(path.join(outDir, `${safeName}_data.csv`))
+            ? [`  Test data ........... ${safeName}_data.csv  (keep it beside the script)`]
+            : []),
         '',
-        validated
-            ? 'This JMX is the final file selected by the agent after the JMeter feedback loop.'
-            : 'This JMX was generated but not proven by a JMeter validation run.',
+        `Verdict: ${verdict}   ·   JMeter validation: ${validated ? 'RAN' : 'NOT RUN'}`,
         '',
         businessVerified
             ? 'Business check: confirmed by an explicit business assertion.'
-            : 'Business check: HTTP GREEN only means enabled HTTP requests passed. It does not prove the business record was created unless the report/recording contains an explicit create assertion or you confirm the record in the app.',
+            : wrap('Business check: a green HTTP result only means the enabled requests answered. It does not prove the business record was created unless an explicit assertion checked it, or you confirm the record in the app.'),
         '',
-        'Folder guide:',
-        '- scripts/  final and generated JMX copies',
-        '- reports/  HTML, markdown, and gate summaries',
-        '- results/  JTL and runtime result artifacts',
-        '- evidence/ label map, forensics, lineage, and reasoning evidence',
-        '- data/     CSV data pools and upload staging references',
-        '',
-        'Keep the root-level files for compatibility/debugging; open the 00_USE_THIS... file in JMeter first.',
+        'If you need to dig:',
+        '  reports/   gate verdicts',
+        '  evidence/  label map, recording, parameters',
+        '  results/   JTL data JMeter reads',
+        '  scripts/   a backup copy of the script, and the pre-repair original',
+        '  log.txt    the full run log',
     ];
     fs.writeFileSync(guidePath, lines.join('\n') + '\n');
 
-    return { finalCopyPath, guidePath, staleEditorWarning: stale };
+    return { finalCopyPath, guidePath, staleEditorWarning: stale, action };
 }
 
 module.exports = { writeFinalJmxPointer, _internal: { sanitizeFinalXml } };

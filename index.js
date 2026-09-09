@@ -105,6 +105,8 @@ function warnIfStaleEditor(finalMarker, rec) {
 }
 const runProgress = require('./src/run-progress');
 const outputOrganizer = require('./src/output-organizer');
+const runSummary = require('./src/run-summary');
+const { runConfigForFlow } = require('./src/run-config');
 const { selectUnits } = require('./src/ui-inputs');
 
 const AGENT_OPTS = resolveAgentOptions(args, CONFIG);
@@ -131,10 +133,13 @@ const MAX_ITER = iterFlag >= 0
 const scenarioFlag = args.indexOf('--scenario');
 const SCENARIO_CODE = scenarioFlag >= 0 ? String(args[scenarioFlag + 1] || '') : '';
 
-/** run config for this process: stored settings + per-run-only overrides. */
-function runCfgForThisRun() {
-    const base = CONFIG.run || {};
-    return SCENARIO_CODE ? { ...base, scenarioCode: SCENARIO_CODE } : base;
+/**
+ * Run config for THIS flow: global settings, then anything the operator set
+ * for this flow specifically, then per-run flags. See src/run-config.js for why
+ * per-flow overrides exist and why lists replace instead of merging.
+ */
+function runCfgForThisRun(flowName = '') {
+    return runConfigForFlow({ config: CONFIG, flowName, scenarioCode: SCENARIO_CODE });
 }
 
 const processed = new Set();
@@ -252,7 +257,7 @@ async function processUnit(unit) {
     // so the operator can catch a misread instantly instead of after a run.
     try {
         const { summarizeFlow } = require('./src/flow-understanding');
-        const understanding = summarizeFlow({ entries, pages, runCfg: runCfgForThisRun() });
+        const understanding = summarizeFlow({ entries, pages, runCfg: runCfgForThisRun(name) });
         for (const line of understanding.lines) rec(line);
         fs.writeFileSync(path.join(outDir, `${name}_understanding.json`), JSON.stringify(understanding.summary, null, 2));
     } catch (e) { rec(`flow understanding skipped: ${e.message}`); }
@@ -283,7 +288,7 @@ async function processUnit(unit) {
     // runCfg reaches generate() on BOTH paths: runValidate overrides it with
     // the enriched copy (auto host-rewrite), and the generate-only fallback
     // below needs it for config-driven disableCalls / oauth gate / loadProfile.
-    const genOpts = { dualHarHints: notes, secondaryEntries, runCfg: runCfgForThisRun() };
+    const genOpts = { dualHarHints: notes, secondaryEntries, runCfg: runCfgForThisRun(name) };
 
     // Human-fixed working script for this flow (input/<flow>__golden.jmx):
     // its proven extractors / enable judgments are merged into generation.
@@ -301,7 +306,7 @@ async function processUnit(unit) {
     // is the Phase-2 localization the architecture calls for. The full --run
     // still owns "is this script good enough to ship."
     if (FAST_LOOP || DO_RUN) {
-        const runCfg = runCfgForThisRun();
+        const runCfg = runCfgForThisRun(name);
         const targetBase = (runCfg.targetBaseUrlOverride || '').trim() || null;
         if (!targetBase) {
             if (FAST_LOOP) rec('fast-replay pre-flight skipped: set run.targetBaseUrlOverride to enable it.');
@@ -324,7 +329,7 @@ async function processUnit(unit) {
             progressTimer = startRunProgressHeartbeat(outDir, rec);
             const out = await runValidate({
                 entries, pages, outDir, name,
-                runCfg: runCfgForThisRun(),
+                runCfg: runCfgForThisRun(name),
                 maxIterations: MAX_ITER,
                 onLog: rec,
                 genOpts,
@@ -340,7 +345,21 @@ async function processUnit(unit) {
                 const reqs = (out.result.samples || []).filter(s => !s.isTransaction);
                 const passed = reqs.filter(s => s.success).length;
                 const verdict = out.result.success ? 'GREEN' : 'needs attention';
+                // Compare against the PREVIOUS run of this same flow before we
+                // record this one — "why is this different today" should be
+                // answered by the agent, not by digging through old folders.
+                const previousRuns = runSummary.loadHistory(outDir);
+                const thisRun = runSummary.summarizeRun({
+                    result: out.result, gate: out.finalGate || null,
+                    disabledCount: (out.stats && out.stats.disabled) || 0, verdict,
+                });
+                const changeSummary = runSummary.describeChange(previousRuns[previousRuns.length - 1], thisRun);
+                runSummary.appendHistory(outDir, thisRun);
                 const finalMarker = writeFinalJmxPointer({
+                    greenGate: out.finalGate || null,
+                    blockers: out.humanBlockers || [],
+                    continuation: (out.result && out.result.continuation) || null,
+                    changeSummary,
                     outDir,
                     name,
                     finalJmxPath: out.result.finalJmxPath || path.join(outDir, `${name}.jmx`),
@@ -352,11 +371,17 @@ async function processUnit(unit) {
                 });
                 rec(`DONE — verdict=${verdict} · ` +
                     `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
-                rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
+                // Lead with the decision, not the status word: the operator's
+                // next question after "needs attention" was always "so do I run
+                // it or not?".
+                rec(`WHAT TO DO — ${finalMarker.action.headline}`);
+                if (changeSummary) rec(changeSummary);
+                rec(`open ${path.basename(finalMarker.finalCopyPath)} (start with 00_OPEN_THIS_FIRST.txt)`);
                 warnIfStaleEditor(finalMarker, rec);
                 if (out.result.continuation) rec(`NOT STUCK — ${out.result.continuation.message}`);
                 const reportPath = writeHtmlReport(outDir, name, {
                     mode: `generate + run (${mode})`, verdict,
+                    action: finalMarker.action, changeSummary,
                     stats: out.stats, samples: out.result.samples || [],
                     baselineDiff: out.baselineDiff,
                     memoryMatches: out.memoryMatches || [],
@@ -410,12 +435,14 @@ async function processUnit(unit) {
             `${gen.stats.parameterized} parameterized field(s)${gen.csvFile ? ` → ${gen.csvFile}` : ''}, ` +
             `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ` +
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
-        rec(`USE THIS JMX -> ${path.basename(finalMarker.finalCopyPath)}`);
+        rec(`WHAT TO DO — ${finalMarker.action.headline}`);
+        rec(`open ${path.basename(finalMarker.finalCopyPath)} (start with 00_OPEN_THIS_FIRST.txt)`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
         const verdict = runAttemptError ? 'not verified' : 'generated';
         const reportPath = writeHtmlReport(outDir, name, {
             mode: runAttemptError ? `${DO_AGENT ? 'agent validate' : 'generate + validate'} attempted (${mode})` : `generate only (${mode})`,
             verdict,
+            action: finalMarker.action,
             stats: gen.stats, samples: [],
             correlations: gen.correlations || [],
             dualHar: notes.dualHar || null,

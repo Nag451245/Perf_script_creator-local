@@ -156,6 +156,7 @@ function writeHtmlReport(outDir, name, data = {}) {
     const {
         mode = 'generate', verdict = 'generated', stats = {}, samples = [],
         baselineDiff = null, memoryMatches = [], learnedLessons = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [], businessVerification = null, disableDecisions = null,
+        action = null, changeSummary = '',
     } = data;
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
@@ -167,6 +168,16 @@ function writeHtmlReport(outDir, name, data = {}) {
     const decisionBySampler = buildDecisionMap(requestAdjudication || disableDecisions || data.samplerDecisions || (data.lineage && data.lineage.disableDecisions));
 
     const verdictClass = verdict === 'GREEN' ? 'ok' : (verdict === 'generated' ? 'neutral' : 'bad');
+
+    // The report opens with the same instruction as 00_OPEN_THIS_FIRST.txt.
+    // A verdict word alone left the reader to work out whether to run the thing;
+    // the decision belongs above the numbers, not inferred from them.
+    const actionBanner = action && action.headline ? `
+  <div class="action ${verdictClass}">
+    <div class="action-head">${esc(action.headline)}</div>
+    ${action.detail ? `<div class="action-detail">${esc(action.detail)}</div>` : ''}
+    ${changeSummary ? `<div class="action-change">${esc(changeSummary)}</div>` : ''}
+  </div>` : '';
 
     const cards = [
         statCard('Samplers', stats.samplers ?? '–'),
@@ -202,7 +213,7 @@ function writeHtmlReport(outDir, name, data = {}) {
         : ''}` : '';
 
     const pointerItems = fs.readdirSync(outDir)
-        .filter(file => file === '00_OPEN_THIS_FIRST.txt' || /^00_USE_THIS_.*\.jmx$/i.test(file))
+        .filter(file => file === '00_OPEN_THIS_FIRST.txt' || /^00_(RUN_THIS_SCRIPT|USE_THIS_.*)\.jmx$/i.test(file))
         .sort()
         .map(file => `<li><a href="${esc(file)}">${esc(file)}</a> — ${file.endsWith('.jmx') ? 'Final JMX to open in JMeter' : 'Read this first'}</li>`)
         .join('');
@@ -381,6 +392,12 @@ details{border:1px solid #d9e2e1;border-radius:8px;margin:8px 0;background:#fff}
   tr.ok td:first-child { color: #5fd98a; } tr.bad td:first-child { color: #ff8a8a; }
   tr.bad { background: #2a1414; }
   .muted { color: #9aa0a6; } a { color: #8fb6e0; }
+  .action { margin: 16px 0 20px; padding: 14px 16px; border-radius: 8px;
+            background: #161b22; border-left: 4px solid #4a5361; }
+  .action.ok { border-left-color: #5fd98a; } .action.bad { border-left-color: #ff8a8a; }
+  .action-head { font-size: 18px; font-weight: 600; }
+  .action-detail { margin-top: 6px; color: #c8ccd4; max-width: 76ch; }
+  .action-change { margin-top: 8px; color: #9aa0a6; font-size: 13px; max-width: 76ch; }
   h2 { font-size: 15px; margin: 24px 0 8px; border-top: 1px solid #242a34; padding-top: 16px; }
   ul { margin: 8px 0; padding-left: 20px; } li { margin: 4px 0; }
 </style></head>
@@ -389,6 +406,8 @@ details{border:1px solid #d9e2e1;border-radius:8px;margin:8px 0;background:#fff}
   <div class="sub">mode: ${esc(mode)} · generated ${esc(new Date().toLocaleString())} ·
     verdict: <span class="badge ${verdictClass}">${esc(verdict)}</span>
     ${reqs.length ? ` · ${passed}/${reqs.length} requests passed` : ''}</div>
+
+  ${actionBanner}
 
   <div class="grid">${cards}</div>
 

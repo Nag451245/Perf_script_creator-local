@@ -25,6 +25,8 @@ const { resolveGeminiModel } = require('../src/gemini-model');
 const inputState = require('../src/input-state');
 const { archiveSuccessfulRun } = require('../src/success-archive');
 const { writeFinalJmxPointer } = require('../src/final-artifact');
+const { nextAction, describeChange, appendHistory, loadHistory } = require('../src/run-summary');
+const { runConfigForFlow } = require('../src/run-config');
 const businessGuard = require('../src/business-guard');
 const { escalateToLlm, _internal: runnerInternal } = require('../src/runner');
 const learningStore = require('../src/learning-store');
@@ -220,6 +222,22 @@ test('HTML report: standalone file with verdict badge + artifact links', () => {
     assert.match(html, /<!doctype html>/i);
     assert.match(html, /badge/);
     assert.match(html, /login_data\.csv/, 'report should link the data CSV artifact');
+    assert.doesNotMatch(html, /class="action/, 'no banner when there is no action to state');
+});
+
+test('HTML report: opens with what to DO, above the numbers', () => {
+    const out = tmp();
+    const reportPath = writeHtmlReport(out, 'banner', {
+        mode: 'generate + run', verdict: 'needs attention',
+        action: nextAction({ gate: { failures: [{ category: 'auth_wall' }] } }),
+        changeSummary: 'Since the last run: 55/61 requests passed (was 86/86).',
+        stats: {}, samples: [],
+    });
+    const html = fs.readFileSync(reportPath, 'utf8');
+    assert.match(html, /Do not run this yet/, 'the instruction, not just the verdict word');
+    assert.match(html, /55\/61 requests passed/, 'and what moved since last time');
+    // It has to sit above the stat cards, or it is just another section.
+    assert.ok(html.indexOf('Do not run this yet') < html.indexOf('<div class="grid">'));
 });
 
 test('HTML report: renders verified learning matches and learned lessons', () => {
@@ -361,7 +379,7 @@ test('PE naming: run evidence aligns PE suffixed JTL labels to original recordin
 test('output organizer: files land in the right folder, and the manifest points at them', () => {
     const out = tmp();
     fs.writeFileSync(path.join(out, 'demo.jmx'), '<jmeterTestPlan/>');
-    fs.writeFileSync(path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx'), '<jmeterTestPlan/>');
+    fs.writeFileSync(path.join(out, '00_RUN_THIS_SCRIPT.jmx'), '<jmeterTestPlan/>');
     fs.writeFileSync(path.join(out, 'demo_report.html'), '<!doctype html>');
     fs.writeFileSync(path.join(out, 'final.jtl'), '<testResults/>');
     fs.writeFileSync(path.join(out, 'demo_label_map.json'), '{"requests":[]}');
@@ -371,7 +389,7 @@ test('output organizer: files land in the right folder, and the manifest points 
         outDir: out,
         name: 'demo',
         verdict: 'GREEN',
-        finalJmxPath: path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx'),
+        finalJmxPath: path.join(out, '00_RUN_THIS_SCRIPT.jmx'),
         reportPath: path.join(out, 'demo_report.html'),
         currentJtlPath: path.join(out, 'final.jtl'),
     });
@@ -381,8 +399,8 @@ test('output organizer: files land in the right folder, and the manifest points 
     // them and are archived rather than duplicated at the root.
     assert.ok(!fs.existsSync(path.join(out, 'demo.jmx')), 'the base script is filed away, not left at the root');
     assert.ok(fs.existsSync(path.join(out, 'scripts', 'base.jmx')));
-    assert.ok(fs.existsSync(path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx')), 'deliverable stays at the root');
-    assert.ok(fs.existsSync(path.join(out, 'scripts', '00_USE_THIS_FINAL_VALIDATED_demo.jmx')), 'and is archived');
+    assert.ok(fs.existsSync(path.join(out, '00_RUN_THIS_SCRIPT.jmx')), 'deliverable stays at the root');
+    assert.ok(fs.existsSync(path.join(out, 'scripts', '00_RUN_THIS_SCRIPT.jmx')), 'and is archived');
     // The report and the JTL live at the root; copying them into a folder as
     // well would just be the same file twice.
     assert.ok(fs.existsSync(path.join(out, 'demo_report.html')));
@@ -393,8 +411,15 @@ test('output organizer: files land in the right folder, and the manifest points 
     assert.ok(fs.existsSync(path.join(out, 'demo_data.csv')), 'the CSV stays beside the script that reads it');
     assert.ok(fs.existsSync(path.join(out, 'output_manifest.json')));
     assert.strictEqual(manifest.verdict, 'GREEN');
-    assert.strictEqual(manifest.whatToOpen.finalJmx, 'scripts/00_USE_THIS_FINAL_VALIDATED_demo.jmx');
-    assert.match(fs.readFileSync(path.join(out, '00_OUTPUT_INDEX.txt'), 'utf8'), /Data CSV:/);
+    // "Open first" must name the deliverable at the root, not its backup under
+    // scripts/ — sending someone to the archive copy is how a stale buffer got
+    // edited instead of the real script.
+    assert.strictEqual(manifest.whatToOpen.finalJmx, '00_RUN_THIS_SCRIPT.jmx');
+    assert.strictEqual(manifest.whatToOpen.labelMap, 'evidence/label_map.json',
+        'the index found the label map under the short name it was filed as');
+    const index = fs.readFileSync(path.join(out, '00_OUTPUT_INDEX.txt'), 'utf8');
+    assert.match(index, /Data CSV:/);
+    assert.doesNotMatch(index, /Label map: not available/, 'no "not available" for a file that is right there');
 });
 
 test('LLM escalation: clean no-op without a Gemini key', async () => {
@@ -1916,12 +1941,115 @@ test('final artifact pointer: creates an obvious top-sorted JMX and instructions
         businessVerified: false,
     });
 
-    assert.ok(fs.existsSync(path.join(outDir, '00_USE_THIS_FINAL_VALIDATED_createtask.jmx')));
+    assert.ok(fs.existsSync(path.join(outDir, '00_RUN_THIS_SCRIPT.jmx')), 'one stable name, not a 75-char one that changes each run');
     assert.ok(fs.existsSync(path.join(outDir, '00_OPEN_THIS_FIRST.txt')));
     const guide = fs.readFileSync(result.guidePath, 'utf8');
-    assert.match(guide, /USE THIS JMX/);
-    assert.match(guide, /00_USE_THIS_FINAL_VALIDATED_createtask\.jmx/);
+    assert.match(guide, /READY TO RUN|RUN IT|DO NOT RUN|NEEDS SOMETHING|NOT STUCK|GENERATED/i, 'the guide leads with an ACTION, not a status word');
+    assert.match(guide, /00_RUN_THIS_SCRIPT\.jmx/, 'the guide points at the file it actually wrote');
     assert.match(guide, /does not prove the business record was created/);
+});
+
+test('next action: says what to do, not just what the status is', () => {
+    const authWall = nextAction({ gate: { failures: [{ category: 'auth_wall' }] }, validated: true });
+    assert.match(authWall.headline, /Do not run this yet/i);
+
+    // A blocker outranks a soft gate: no amount of retrying fixes missing data.
+    const blocked = nextAction({
+        gate: { failures: [{ category: 'business_marker_missing' }] },
+        blockers: [{ blocker: 'A valid appointment date', ask: 'Provide a bookable date.' }],
+    });
+    assert.match(blocked.headline, /Needs something from you/i);
+    assert.ok(blocked.headline.length <= 60, 'headlines are shouted in caps — keep them short and constant');
+    assert.match(blocked.detail, /A valid appointment date — Provide a bookable date\./);
+
+    const outOfBudget = nextAction({ continuation: { status: 'fixable_out_of_budget', message: 'Two more iterations should clear it.' } });
+    assert.match(outOfBudget.headline, /ran out of iterations/i);
+    assert.match(outOfBudget.detail, /Two more iterations/);
+
+    // Soft gate: runnable, but read first.
+    const flagged = nextAction({ gate: { failures: [{ category: 'business_error_in_body' }] }, validated: true });
+    assert.match(flagged.headline, /^Run it, but/i);
+
+    // Built but never executed is NOT the same as proven.
+    assert.match(nextAction({ validated: false }).headline, /not proven yet/i);
+    assert.match(nextAction({ validated: true }).headline, /^Ready to run/i);
+});
+
+test('describe change: compares this run to the previous one of the same flow', () => {
+    const previous = { verdict: 'GREEN', requests: 86, passed: 86, disabled: 4, gates: [] };
+    const current = { verdict: 'NEEDS_ATTENTION', requests: 61, passed: 55, disabled: 29, gates: ['auth_wall'] };
+
+    const text = describeChange(previous, current);
+    // This is the exact regression the operator hit: requests silently vanished.
+    assert.match(text, /55\/61 requests passed \(was 86\/86\)/);
+    assert.match(text, /25 more request\(s\) disabled/);
+    assert.match(text, /new problem\(s\): auth_wall/);
+    assert.match(text, /verdict moved from "GREEN" to "NEEDS_ATTENTION"/);
+
+    assert.match(describeChange(previous, { ...previous }), /nothing material changed/);
+    assert.match(describeChange(current, previous), /fixed since last run: auth_wall/);
+    assert.equal(describeChange(null, current), '', 'a first run has nothing to compare against');
+});
+
+test('per-flow config: a setting tuned for one recording does not leak into another', () => {
+    const config = {
+        run: { disableCalls: ['/beacon'], thinkTime: 1000, transactionNames: { '/a': 'Global A' } },
+        flows: {
+            createtask: { disableCalls: ['/jwt/v2/create-cookie', '/beacon'] },
+            Loading: { thinkTime: 3000 },
+        },
+    };
+
+    // The exact regression: createtask's session-minter disable must NOT reach
+    // the Loading flow, which needs that call to sign in.
+    const loading = runConfigForFlow({ config, flowName: 'Loading' });
+    assert.deepEqual(loading.disableCalls, ['/beacon']);
+    assert.equal(loading.thinkTime, 3000, 'the flow wins over the shared default');
+
+    const createtask = runConfigForFlow({ config, flowName: 'createtask' });
+    assert.deepEqual(createtask.disableCalls, ['/jwt/v2/create-cookie', '/beacon'],
+        'lists REPLACE — a merge would silently reintroduce another flow disables');
+    assert.equal(createtask.thinkTime, 1000, 'settings it did not override still come from run');
+    assert.deepEqual(createtask.transactionNames, { '/a': 'Global A' });
+
+    // An unknown flow, or none at all, gets exactly the shared defaults.
+    assert.deepEqual(runConfigForFlow({ config, flowName: 'never-seen' }).disableCalls, ['/beacon']);
+    assert.deepEqual(runConfigForFlow({ config }).disableCalls, ['/beacon']);
+    assert.deepEqual(runConfigForFlow({}), {}, 'no config at all is not a crash');
+
+    // Mutating the resolved copy must not corrupt the config for the next flow.
+    runConfigForFlow({ config, flowName: 'Loading' }).thinkTime = 99;
+    assert.equal(config.run.thinkTime, 1000);
+
+    // Scenario code is per-RUN: applied when passed, never persisted.
+    assert.equal(runConfigForFlow({ config, flowName: 'createtask', scenarioCode: 'SC02' }).scenarioCode, 'SC02');
+    assert.equal(runConfigForFlow({ config, flowName: 'createtask' }).scenarioCode, undefined,
+        'the next run defaults back to SC01 rather than inheriting SC02');
+});
+
+test('run history: keeps only the recent past, newest last', () => {
+    const outDir = tmp();
+    for (let i = 1; i <= 12; i++) appendHistory(outDir, { flow: 'createtask', requests: i });
+    const history = loadHistory(outDir);
+    assert.equal(history.length, 10, 'history is capped so it never grows unbounded');
+    assert.equal(history[history.length - 1].requests, 12, 'newest last');
+    assert.equal(history[0].requests, 3, 'oldest entries fall off the front');
+    assert.ok(history[0].at, 'each entry is timestamped');
+    assert.deepEqual(loadHistory(tmp()), [], 'a fresh output folder has no history');
+
+    // It must survive the organizer, which files every stray ROOT file into
+    // evidence/. A history that moves each run is a history nobody can read.
+    assert.ok(fs.existsSync(path.join(outDir, 'evidence', 'run_history.json')));
+    assert.ok(!fs.existsSync(path.join(outDir, 'run_history.json')), 'not loose at the root');
+
+    // A folder written by an older build kept it at the root: still readable,
+    // and folded into the new location rather than left to disagree.
+    const legacyDir = tmp();
+    fs.writeFileSync(path.join(legacyDir, 'run_history.json'), JSON.stringify([{ requests: 7 }]));
+    assert.equal(loadHistory(legacyDir)[0].requests, 7);
+    appendHistory(legacyDir, { requests: 8 });
+    assert.ok(!fs.existsSync(path.join(legacyDir, 'run_history.json')), 'the old copy is cleared');
+    assert.deepEqual(loadHistory(legacyDir).map(h => h.requests), [7, 8]);
 });
 
 test('business guard: protects first-party mutating business samplers from disabling', () => {
@@ -7529,10 +7657,12 @@ test('output organizer: files are MOVED not duplicated, and the root stays short
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_org_'));
     const name = 'MyFlow__paired';
     const w = (f, c = 'x') => { fs.writeFileSync(path.join(dir, f), c); return path.join(dir, f); };
-    const finalJmx = w(`00_USE_THIS_FINAL_VALIDATED_${name}.jmx`, '<jmeterTestPlan/>');
+    const finalJmx = w('00_RUN_THIS_SCRIPT.jmx', '<jmeterTestPlan/>');
     w(`${name}.jmx`, '<jmeterTestPlan/>');                 // base script
     w(`${name}_patched_1.jmx`, '<jmeterTestPlan/>');
     w('final_validated.jmx', '<jmeterTestPlan/>');         // legacy duplicate deliverable
+    // A deliverable left by an older build, under the long name it used then.
+    w(`00_USE_THIS_FINAL_VALIDATED_${name}.jmx`, '<jmeterTestPlan/>');
     w(`${name}_report.html`, '<html></html>');
     w(`${name}_data.csv`, 'a|b\n1|2');
     w(`${name}_senior_pe_debrief.json`, '{}');
@@ -7545,7 +7675,9 @@ test('output organizer: files are MOVED not duplicated, and the root stays short
 
     const rootFiles = fs.readdirSync(dir).filter(f => fs.statSync(path.join(dir, f)).isFile());
     // The deliverable and the things a human opens stay put...
-    assert.ok(rootFiles.includes(`00_USE_THIS_FINAL_VALIDATED_${name}.jmx`), 'the deliverable stays at the root');
+    assert.ok(rootFiles.includes('00_RUN_THIS_SCRIPT.jmx'), 'the deliverable stays at the root');
+    assert.ok(!rootFiles.includes(`00_USE_THIS_FINAL_VALIDATED_${name}.jmx`),
+        'a previous run\'s deliverable is cleared — two "use this" files is how the wrong one got run');
     assert.ok(rootFiles.includes(`${name}_data.csv`), 'the CSV must sit beside the script that reads it');
     assert.ok(rootFiles.includes(`${name}_report.html`) && rootFiles.includes('log.txt'));
     // ...diagnostics are filed away, not copied, and lose the redundant prefix

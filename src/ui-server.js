@@ -62,7 +62,11 @@ function outputSummary(name) {
     const dir = path.join(OUTPUT, name);
     const files = fs.readdirSync(dir);
     const report = files.find(f => /_report\.html$/i.test(f));
-    const jmx = files.find(f => /^00_USE_THIS_.*\.jmx$/i.test(f))
+    // The current name first: a folder can still hold a previous build's
+    // 00_USE_THIS_* deliverable, and offering that one would hand back a script
+    // from an older run.
+    const jmx = files.find(f => f === '00_RUN_THIS_SCRIPT.jmx')
+        || files.find(f => /^00_USE_THIS_.*\.jmx$/i.test(f))
         || files.find(f => /\.jmx$/i.test(f) && !/recording/i.test(f))
         || files.find(f => /\.jmx$/i.test(f));
     const summary = {

@@ -464,6 +464,8 @@ function humanize(ln){
  if(/BLOCKED —/.test(t))return {icon:'🚧',cls:'l-warn',text:t};
  if(/^\\s*·\\s/.test(t)&&/ask/.test(logText))return {icon:'❓',cls:'l-warn',text:t};
  if(/verdict=GREEN|final green gate: GREEN/.test(t))return {icon:'✅',cls:'l-verdict',text:t.replace(/^\\s*/,'')};
+ if(/WHAT TO DO —/.test(t))return {icon:'👉',cls:'l-verdict',text:t.replace(/^\\s*WHAT TO DO —\\s*/,'')};
+ if(/^\\s*Since the last run:/.test(t))return {icon:'📊',cls:'',text:t.replace(/^\\s*/,'')};
  if(/USE THIS JMX/.test(t))return {icon:'📦',cls:'l-verdict',text:t.replace(/^\\s*USE THIS JMX ->/,'Final script:')};
  if(/verdict=needs attention|NOT GREEN/.test(t))return {icon:'⚠️',cls:'l-warn',text:t.replace(/^\\s*/,'')};
  if(/^\\s*\\[chat\\]\\s+you:/.test(t))return null;   // chat rendered in its own panel

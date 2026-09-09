@@ -162,23 +162,19 @@ right-click the request list → **Save all as HAR with content**. Record it twi
 
 ## E. Reading the output (`output\<name>\`)
 
-- **`00_OPEN_THIS_FIRST.txt`** — quick instructions for the folder.
-- **`00_USE_THIS_FINAL_VALIDATED_<name>.jmx`** — open this JMX first after a GREEN
-  Validate/Agent run. If JMeter validation did not run, the file says
-  `FINAL_GENERATED_NOT_VALIDATED` instead.
-- **`<name>_report.html`** — open this first: verdict, correlations, failures,
-  links to every artifact.
-- `<name>.jmx`, `final_validated.jmx`, and patched JMX files are kept for history
-  and debugging.
-- `<name>_data.csv` — synthesized unique test data (if the flow had user inputs).
-- `final.jtl` / dashboard — raw run results (Validate mode).
-- `_llm_suggestions.json`, `_llm_validation_round*.json`, `_llm_patches_round*.json`
-  — only when OpenAI/Gemini is configured and unresolved failures remain.
-- `_memory_matches.json`, `_memory_patches.json`, `_learned_lessons.json` —
-  verified learning store evidence: matched lessons, applied memory patches, and
-  newly saved redacted lessons after green verification.
-- `_java_safe_*.json` — JSR223/Groovy blocks removed before JMeter validation.
-- `log.txt`, `<name>_reasoning.md` — what the tool did and why.
+- **`00_OPEN_THIS_FIRST.txt`** — read this first. It opens with what to DO — run
+  it, run it but check these steps first, or do not run it yet and why — then
+  what changed since the last run of this flow, then where everything lives.
+- **`00_RUN_THIS_SCRIPT.jmx`** — the script to open in JMeter. The name is the
+  same every run, so reopening the same path always gives you the latest one.
+- **`<name>_report.html`** — the full picture in a browser: verdict, gates,
+  correlations, failures, and the long analyses as expandable sections.
+- `<name>_data.csv` — the test data. It must stay beside the script; JMeter reads
+  it by a relative path.
+- `final.jtl`, `log.txt`, `00_OUTPUT_INDEX.txt` — raw run results and the log.
+- Digging deeper: `scripts/` (backup copy + the pre-repair original), `reports/`
+  (gate verdicts), `results/` (JTL and dashboard), `evidence/` (label map,
+  recording, correlations, forensics, diagnosis, run history), `data/`.
 - GREEN Validate/Agent runs also get a ZIP copy in `output\successful\`. The
   normal output folder stays readable because `successArchive.keepOriginals` is
   true by default.

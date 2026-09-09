@@ -120,12 +120,20 @@ function organizeOutput({
             data: 'CSV data pools and upload staging references.',
         },
         whatToOpen: {
-            finalJmx: finalJmxRelative || relativeIfExists(outDir, finalJmxPath),
+            // Point at the copy AT THE ROOT, not the archive under scripts/.
+            // "Open first: scripts/00_RUN_THIS_SCRIPT.jmx" sent people to the
+            // backup while the deliverable sat at the top of the folder.
+            finalJmx: relativeIfExists(outDir, path.join(outDir, path.basename(finalJmxPath || ''))) ||
+                finalJmxRelative || relativeIfExists(outDir, finalJmxPath),
             report: reportRelative || relativeIfExists(outDir, reportPath || path.join(outDir, `${name}_report.html`)),
             currentJtl: currentJtlRelative || relativeIfExists(outDir, currentJtlPath || path.join(outDir, 'final.jtl')),
             dataCsv: dataCsvRelative || relativeIfExists(outDir, path.join(outDir, 'data', `${name}_data.csv`)) ||
                 relativeIfExists(outDir, path.join(outDir, `${name}_data.csv`)),
-            labelMap: relativeIfExists(outDir, path.join(outDir, 'evidence', `${name}_label_map.json`)) ||
+            // The flow prefix is stripped when a file moves into a subfolder, so
+            // look for the short name first — otherwise the index reported
+            // "Label map: not available" with the file sitting right there.
+            labelMap: relativeIfExists(outDir, path.join(outDir, 'evidence', 'label_map.json')) ||
+                relativeIfExists(outDir, path.join(outDir, 'evidence', `${name}_label_map.json`)) ||
                 relativeIfExists(outDir, path.join(outDir, `${name}_label_map.json`)),
         },
         compatibility: {
@@ -201,7 +209,7 @@ function pruneDiagnostics(outDir, level = 'summary') {
 function mustStayAtRoot(name, file) {
     if (file === '00_OPEN_THIS_FIRST.txt' || file === '00_OUTPUT_INDEX.txt') return true;
     if (file === 'output_manifest.json' || file === 'log.txt') return true;
-    if (/^00_USE_THIS_.*\.jmx$/i.test(file)) return true;
+    if (/^00_(RUN_THIS_SCRIPT|USE_THIS_.*)\.jmx$/i.test(file)) return true;
     if (file === `${name}_report.html`) return true;
     if (file === `${name}_data.csv`) return true;          // JMeter reads it relative to the script
     if (file === 'final.jtl') return true;                 // the next run looks for it here
@@ -261,7 +269,7 @@ function dropRedundantFinals(outDir, finalJmxPath) {
     const keep = finalJmxPath ? path.basename(finalJmxPath) : '';
     for (const file of fs.readdirSync(outDir)) {
         if (!/\.jmx$/i.test(file) || file === keep) continue;
-        const isPointer = /^00_USE_THIS_.*\.jmx$/i.test(file);
+        const isPointer = /^00_(RUN_THIS_SCRIPT|USE_THIS_.*)\.jmx$/i.test(file);
         const isLegacyFinal = /^final_validated\.jmx$/i.test(file);
         if (!isPointer && !isLegacyFinal) continue;
         try { fs.unlinkSync(path.join(outDir, file)); } catch { /* in use — harmless */ }
@@ -269,7 +277,7 @@ function dropRedundantFinals(outDir, finalJmxPath) {
 }
 
 function shouldCopyScriptFile(outDir, file, finalJmxPath) {
-    if (!/^00_USE_THIS_/i.test(file)) return true;
+    if (!/^00_(RUN_THIS_SCRIPT|USE_THIS_)/i.test(file)) return true;
     return !!finalJmxPath && path.resolve(path.join(outDir, file)) === path.resolve(finalJmxPath);
 }
 
@@ -278,7 +286,7 @@ function cleanStaleScriptPointers(outDir, finalJmxPath) {
     if (!fs.existsSync(scriptsDir)) return;
     const keep = finalJmxPath ? path.basename(finalJmxPath) : '';
     for (const file of fs.readdirSync(scriptsDir)) {
-        if (!/^00_USE_THIS_.*\.jmx$/i.test(file)) continue;
+        if (!/^00_(RUN_THIS_SCRIPT|USE_THIS_.*)\.jmx$/i.test(file)) continue;
         if (file === keep) continue;
         fs.unlinkSync(path.join(scriptsDir, file));
     }

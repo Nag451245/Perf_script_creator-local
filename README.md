@@ -73,48 +73,35 @@ node index.js --memory-export memory/team-lessons.json
 node index.js --memory-import memory/team-lessons.json
 ```
 
-Output per input file lands in `output/<name>/`:
-- `00_OPEN_THIS_FIRST.txt` — quick instructions for the folder.
-- `00_USE_THIS_FINAL_VALIDATED_<name>.jmx` — **open this JMX first** after a
-  GREEN Validate/Agent run. If validation did not run, the copy is named
-  `00_USE_THIS_FINAL_GENERATED_NOT_VALIDATED_<name>.jmx`.
-- `<name>_report.html` — **open this first**: browser-readable summary (verdict,
-  stats, request results, failures, links to every artifact)
-- `<name>.jmx`, `final_validated.jmx`, patched JMX files — kept for debugging and
-  history; use the top-sorted `00_USE_THIS...jmx` copy for normal JMeter opening.
-- `<name>.recording.xml` — full request/response bodies for reference
-- `<name>_data.csv` — synthesized unique-per-row data pool (avoids 409 collisions)
-- `<name>_parameters.json` — discovered user-input fields
-- `<name>_ghosts.json` — client-side (UUID/timestamp/trace) values + JMeter snippet
-- `<name>_polling.json` — detected polling loops (wrap in a While Controller)
-- `<name>_file_uploads.json` — multipart upload files detected from the HAR,
-  plus whether matching local files were staged from `input/`, `bin/`, or
-  configured upload search directories
-- `<name>_llm_suggestions.json` / `_llm_validation_round*.json` — AI proposals
-  and strict schema-gate results (`--agent`, or `agent.enabled=true`, on failure)
-- `<name>_java_safe_*.json` — JSR223 blocks stripped before JMeter when Java-safe
-  mode is enabled
-- `<name>_java_safe_generate.json` — Groovy JSR223 blocks stripped from the
-  shipped `.jmx` so manual JMeter runs work under Java 22+/25
-- `<name>_final_green_gate.json` — final verdict requiring JMeter success,
-  recording comparison, semantic checks when available, and business guard pass
-- `<name>_senior_pe_debrief.json` / `.md` — senior performance-engineering
-  objective, flow narrative, value ledger, native-manager audit, validity gates,
-  coverage estimate, and negative-space gaps
-- `<name>_domain_profile.json` — operator/domain/stack/SLO context normalized
-  into a profile and memory scope
-- `<name>_pe_analysis.json` / `.md` — post-evidence senior PE analysis of the
-  business journey, broken step, upstream cause, recommended strategy, and
-  remaining risk gaps
-- `<name>_ai_strategy.json`, `<name>_human_questions.md`, and
-  `<name>_evidence_citations.json` — bounded mature-mode strategy context,
-  specific questions, and cited evidence; these do not patch JMX or mark GREEN
-- `<name>_memory_matches.json` / `_memory_patches.json` — verified lessons the
-  agent tried before AI escalation, plus what the schema-gated patcher applied
-- `<name>_learned_lessons.json` — redacted lessons saved only after green
-  verification
-- `<name>_report.json` — raw stats / run results
-- `log.txt` — what happened, step by step
+Output per input file lands in `output/<name>/`. The root holds only what a
+human opens; everything else is filed into folders, moved rather than copied, so
+there is exactly one of each file:
+
+- **`00_OPEN_THIS_FIRST.txt`** — starts with what to DO with this script (run
+  it, run it but check these first, or do not run it yet and why), then what
+  changed since the last run of this flow, then where everything lives.
+- **`00_RUN_THIS_SCRIPT.jmx`** — the deliverable. One stable name every run, so
+  JMeter reopens the same path and no folder ends up with several near-identical
+  scripts. The verdict lives in the report, not in the filename.
+- **`<name>_report.html`** — the full picture in a browser: verdict, gates,
+  correlations, request results, failures, and the long-form analyses embedded
+  as expandable sections.
+- `<name>_data.csv` — the data pool, which must stay beside the script (the
+  CSVDataSet path is relative).
+- `final.jtl`, `log.txt`, `00_OUTPUT_INDEX.txt`, `output_manifest.json`.
+
+Folders, for when you need to dig:
+
+| folder | what is in it |
+| --- | --- |
+| `scripts/` | a backup copy of the deliverable, and the pre-repair original |
+| `reports/` | gate verdicts and run status |
+| `results/` | JTL data and the JMeter dashboard |
+| `evidence/` | label map, recording, parameters, correlations, forensics, diagnosis, run history |
+| `data/` | additional data pools and upload staging |
+
+Set `run.diagnostics` to `"full"` in the config to keep the machine-only JSON
+twins of artifacts that are already written for humans.
 
 When Validate/Agent finishes **GREEN**, the app also writes a ZIP copy under
 `output/successful/`. The normal `output/<name>/` files are kept readable by
@@ -170,10 +157,22 @@ to set things without command-line flags:
 - `run.mineAssertions` — default `false`; generic page-text assertions are
   opt-in because titles/headings can drift. Business outcome probes and protected
   sampler checks still run by default.
-- `run.protectedCalls` / `run.disableCalls` — per-flow business samplers to
-  protect or intentional noise/plumbing to disable. `disableCalls` will not
-  remove login/session/business producers unless `run.allowUnsafeDisableProtected`
+- `run.protectedCalls` / `run.disableCalls` — business samplers to protect, or
+  intentional noise/plumbing to disable. `disableCalls` will not remove
+  login/session/business producers unless `run.allowUnsafeDisableProtected`
   is deliberately set to `true`.
+- `flows.<name>` — **settings for one flow only.** Everything under `run` is
+  global, so a disable tuned for one recording used to apply to every other one:
+  `/jwt/v2/create-cookie`, added while working on `createtask`, disabled the
+  session minter on an unrelated flow and that script served login pages for
+  weeks. Put flow-specific settings under the flow's name instead, and they stay
+  there. Keys not overridden still come from `run`; **lists replace rather than
+  merge**, so a flow that names its own `disableCalls` never inherits another's:
+
+  ```json
+  "run":   { "disableCalls": ["/beacon"] },
+  "flows": { "createtask": { "disableCalls": ["/beacon", "/jwt/v2/create-cookie"] } }
+  ```
 - `run.parameterization.includeNames` / `excludeNames` — optional guardrails so
   CSV data is limited to business/user data, not auth/session/protocol values.
 

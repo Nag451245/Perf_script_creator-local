@@ -372,6 +372,7 @@ async function processUnit(unit) {
                 rec(`open ${name}_report.html for a summary`);
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
                 outputOrganizer.organizeOutput({
+                    diagnostics: (CONFIG.run||{}).diagnostics,
                     outDir,
                     name,
                     verdict,
@@ -422,6 +423,7 @@ async function processUnit(unit) {
             reasoning: gen.reasoning || [],
         });
         outputOrganizer.organizeOutput({
+            diagnostics: (CONFIG.run||{}).diagnostics,
             outDir,
             name,
             verdict,

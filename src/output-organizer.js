@@ -12,6 +12,7 @@ function organizeOutput({
     finalJmxPath = '',
     reportPath = '',
     currentJtlPath = '',
+    diagnostics = 'summary',
 } = {}) {
     if (!outDir || !name) throw new Error('outDir and name are required');
     fs.mkdirSync(outDir, { recursive: true });
@@ -31,8 +32,20 @@ function organizeOutput({
      * The long flow-name prefix is stripped inside subfolders: the folder is
      * already named for the flow, so repeating it 40 times is pure noise.
      */
-    const place = (source, folder, { keepAtRoot = false } = {}) => {
+    const place = (source, folder, { keepAtRoot = false, archive = true } = {}) => {
         if (!source || !fs.existsSync(source)) return '';
+        // A file that stays at the root AND is copied into a folder is simply
+        // the same file twice. Only the deliverable earns a second copy (that
+        // archive is what restored a script an editor had clobbered).
+        if (keepAtRoot && !archive) {
+            // An earlier build DID copy this one; that copy is a duplicate of a
+            // file sitting at the root, so clear it rather than leave the pair.
+            for (const candidate of [path.basename(source), shortName(path.basename(source), name)]) {
+                const stale = path.join(outDir, folder, candidate);
+                if (fs.existsSync(stale)) { try { fs.unlinkSync(stale); } catch { /* locked */ } }
+            }
+            return path.basename(source);
+        }
         const original = path.basename(source);
         const basename = shortName(original, name);
         const relative = `${folder}/${basename}`.replace(/\\/g, '/');
@@ -69,13 +82,13 @@ function organizeOutput({
         copy(byName(file), 'scripts');
     }
     // The report is what a human opens — it stays at the root AND is archived.
-    const reportRelative = place(reportPath || path.join(outDir, `${name}_report.html`), 'reports', { keepAtRoot: true });
+    const reportRelative = place(reportPath || path.join(outDir, `${name}_report.html`), 'reports', { keepAtRoot: true, archive: false });
     for (const file of rootFiles.filter(file => isReportArtifact(name, file))) {
-        place(byName(file), 'reports', { keepAtRoot: mustStayAtRoot(name, file) });
+        place(byName(file), 'reports', { keepAtRoot: mustStayAtRoot(name, file), archive: !mustStayAtRoot(name, file) });
     }
-    const currentJtlRelative = place(currentJtlPath || path.join(outDir, 'final.jtl'), 'results', { keepAtRoot: true });
+    const currentJtlRelative = place(currentJtlPath || path.join(outDir, 'final.jtl'), 'results', { keepAtRoot: true, archive: false });
     for (const file of rootFiles.filter(file => isResultArtifact(file))) {
-        place(byName(file), 'results', { keepAtRoot: mustStayAtRoot(name, file) });
+        place(byName(file), 'results', { keepAtRoot: mustStayAtRoot(name, file), archive: !mustStayAtRoot(name, file) });
     }
     for (const file of rootFiles.filter(file => isEvidenceArtifact(name, file))) place(byName(file), 'evidence');
     let dataCsvRelative = '';
@@ -83,7 +96,7 @@ function organizeOutput({
         // The CSV must sit beside the script that reads it: the CSVDataSet
         // holds a RELATIVE filename, so a data file tidied into data/ is a
         // script that starts up with no data at all.
-        const relative = place(byName(file), 'data', { keepAtRoot: mustStayAtRoot(name, file) });
+        const relative = place(byName(file), 'data', { keepAtRoot: mustStayAtRoot(name, file), archive: !mustStayAtRoot(name, file) });
         if (!dataCsvRelative && file === `${name}_data.csv`) dataCsvRelative = relative;
     }
     // Everything still loose at the root that nobody opens by hand is
@@ -123,9 +136,53 @@ function organizeOutput({
     };
 
     dropPrefixedTwins(outDir, FOLDERS, name);
+    manifest.pruned = pruneDiagnostics(outDir, diagnostics);
     fs.writeFileSync(path.join(outDir, 'output_manifest.json'), JSON.stringify(manifest, null, 2));
     fs.writeFileSync(path.join(outDir, '00_OUTPUT_INDEX.md'), renderOutputIndex(manifest));
     return manifest;
+}
+
+/**
+ * Machine-only artifacts a person never opens. Each is either the JSON twin of
+ * something already written in readable form, or an internal dump the agent
+ * produced for itself mid-run. They are written during the run (things read
+ * them while it is happening) and cleared afterwards unless the operator asks
+ * to keep everything with run.diagnostics = "full".
+ */
+const MACHINE_ONLY = new Set([
+    // JSON twins of a human-readable file that survives
+    'reports/report.json',              // report.html says the same thing
+    'evidence/reasoning.json',          // reports/reasoning.md
+    'evidence/senior_pe_debrief.json',  // reports/senior_pe_debrief.md
+    'evidence/pe_analysis.json',        // reports/pe_analysis.md
+    'evidence/blockers.json',           // reports/blockers.md
+    'evidence/failure_forensics.json',  // reports/failure_forensics.md
+    // internal dumps the agent writes for itself
+    'evidence/blueprint_context.json',
+    'evidence/lineage.json',
+    'evidence/ghosts.json',
+    'evidence/ai_strategy.json',
+    'evidence/evidence_citations.json',
+    'evidence/understanding.json',
+    'evidence/java_safe_generate.json',
+    'evidence/repair_rounds.json',
+]);
+
+/**
+ * Clear the machine-only artifacts. "summary" (the default) leaves every file
+ * a person reads, everything the next run needs, and the newer diagnostics
+ * worth a look when something goes wrong — the knowledge review, the live
+ * probe, the diagnosis, the green gate. "full" keeps the lot.
+ */
+function pruneDiagnostics(outDir, level = 'summary') {
+    if (String(level).toLowerCase() === 'full') return [];
+    const removed = [];
+    for (const rel of MACHINE_ONLY) {
+        const full = path.join(outDir, ...rel.split('/'));
+        if (!fs.existsSync(full)) continue;
+        try { fs.unlinkSync(full); removed.push(rel); } catch { /* locked */ }
+    }
+    return removed;
 }
 
 /**

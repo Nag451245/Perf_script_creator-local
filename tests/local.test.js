@@ -383,8 +383,12 @@ test('output organizer: files land in the right folder, and the manifest points 
     assert.ok(fs.existsSync(path.join(out, 'scripts', 'base.jmx')));
     assert.ok(fs.existsSync(path.join(out, '00_USE_THIS_FINAL_VALIDATED_demo.jmx')), 'deliverable stays at the root');
     assert.ok(fs.existsSync(path.join(out, 'scripts', '00_USE_THIS_FINAL_VALIDATED_demo.jmx')), 'and is archived');
-    assert.ok(fs.existsSync(path.join(out, 'reports', 'report.html')));
-    assert.ok(fs.existsSync(path.join(out, 'results', 'final.jtl')));
+    // The report and the JTL live at the root; copying them into a folder as
+    // well would just be the same file twice.
+    assert.ok(fs.existsSync(path.join(out, 'demo_report.html')));
+    assert.ok(!fs.existsSync(path.join(out, 'reports', 'report.html')), 'no duplicate of a root-kept file');
+    assert.ok(fs.existsSync(path.join(out, 'final.jtl')));
+    assert.ok(!fs.existsSync(path.join(out, 'results', 'final.jtl')), 'no duplicate of a root-kept file');
     assert.ok(fs.existsSync(path.join(out, 'evidence', 'label_map.json')));
     assert.ok(fs.existsSync(path.join(out, 'demo_data.csv')), 'the CSV stays beside the script that reads it');
     assert.ok(fs.existsSync(path.join(out, 'output_manifest.json')));
@@ -7545,9 +7549,12 @@ test('output organizer: files are MOVED not duplicated, and the root stays short
     assert.ok(rootFiles.includes(`${name}_data.csv`), 'the CSV must sit beside the script that reads it');
     assert.ok(rootFiles.includes(`${name}_report.html`) && rootFiles.includes('log.txt'));
     // ...diagnostics are filed away, not copied, and lose the redundant prefix
-    assert.ok(!rootFiles.includes(`${name}_senior_pe_debrief.json`), 'diagnostics move off the root');
-    assert.ok(fs.existsSync(path.join(dir, 'evidence', 'senior_pe_debrief.json')), 'and lose the flow-name prefix');
-    assert.ok(!fs.existsSync(path.join(dir, 'evidence', `${name}_senior_pe_debrief.json`)), 'exactly one copy exists');
+    assert.ok(!rootFiles.includes(`${name}_baseline_diff.json`), 'diagnostics move off the root');
+    assert.ok(fs.existsSync(path.join(dir, 'evidence', 'baseline_diff.json')), 'and lose the flow-name prefix');
+    assert.ok(!fs.existsSync(path.join(dir, 'evidence', `${name}_baseline_diff.json`)), 'exactly one copy exists');
+    // A machine-only twin of something already written for humans is cleared
+    // by default (the .md survives); "full" keeps everything for debugging.
+    assert.ok(!fs.existsSync(path.join(dir, 'evidence', 'senior_pe_debrief.json')), 'machine-only twin pruned by default');
     // the legacy second deliverable is gone; the base script keeps a real name
     assert.ok(!fs.existsSync(path.join(dir, 'final_validated.jmx')), 'only one deliverable survives');
     assert.ok(fs.existsSync(path.join(dir, 'scripts', 'base.jmx')), '"<flow>.jmx" must not become a file named "jmx"');
@@ -7557,5 +7564,18 @@ test('output organizer: files are MOVED not duplicated, and the root stays short
     const before = fs.readdirSync(path.join(dir, 'evidence')).length;
     organizer.organizeOutput({ outDir: dir, name, verdict: 'GREEN', finalJmxPath: finalJmx });
     assert.strictEqual(fs.readdirSync(path.join(dir, 'evidence')).length, before, 'a second organize adds nothing');
+    fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('output organizer: run.diagnostics="full" keeps the machine-only artifacts', () => {
+    const os = require('os');
+    const organizer = require('../src/output-organizer');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_diag_'));
+    const name = 'F';
+    fs.writeFileSync(path.join(dir, `${name}_senior_pe_debrief.json`), '{}');
+    fs.writeFileSync(path.join(dir, `${name}_lineage.json`), '{}');
+    organizer.organizeOutput({ outDir: dir, name, verdict: 'GREEN', diagnostics: 'full' });
+    assert.ok(fs.existsSync(path.join(dir, 'evidence', 'senior_pe_debrief.json')), 'full keeps the JSON twin');
+    assert.ok(fs.existsSync(path.join(dir, 'evidence', 'lineage.json')), 'full keeps internal dumps');
     fs.rmSync(dir, { recursive: true, force: true });
 });

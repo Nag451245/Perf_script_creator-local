@@ -73,4 +73,34 @@ function scrubRecordingXml(xml) {
     return { xml: out, hits };
 }
 
-module.exports = { scrubRecordingXml, SECRET_FIELD_NAMES, REDACT };
+/**
+ * Redact the same secret-NAMED fields from anything about to leave this
+ * machine — the LLM prompt payload above all. The README's promise is that
+ * PHI and credentials stay local; the prompt carries JMX snippets, failing
+ * response bodies and headers, so it needs the same treatment the shareable
+ * recording gets.
+ *
+ * Deliberately the SAME conservative rule, not a stronger one: session, CSRF,
+ * state and nonce values are exactly what the model must see to propose a
+ * correlation, and redacting them would leave it guessing — which is how
+ * hallucinated extractors get invented. Names on the secret list (password,
+ * Authorization, SSN, card, DOB…) are never correlation targets, so removing
+ * them costs the model nothing.
+ *
+ * Walks strings, arrays and objects; returns the same shape.
+ */
+function redactForExternal(value) {
+    if (value == null) return value;
+    if (typeof value === 'string') return scrubRecordingXml(value).xml;
+    if (typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map(redactForExternal);
+    const out = {};
+    for (const [key, val] of Object.entries(value)) {
+        out[key] = SECRET_FIELD_NAMES.includes(String(key).toLowerCase())
+            ? REDACT
+            : redactForExternal(val);
+    }
+    return out;
+}
+
+module.exports = { scrubRecordingXml, redactForExternal, SECRET_FIELD_NAMES, REDACT };

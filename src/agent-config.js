@@ -17,7 +17,11 @@ function resolveAgentOptions(args = [], config = {}) {
         doRun,
         agent: {
             enabled: agentEnabled,
-            maxLlmRounds: clampInt(configured.maxLlmRounds, 1, 3, 1),
+            // 0 is a MEANING, not an out-of-range value: without --ai the
+            // caller zeroes this to say "no LLM at all". Clamping it up to 1
+            // made the run announce "max LLM rounds=1" while every escalation
+            // then skipped for "no key" — the log contradicted the run.
+            maxLlmRounds: clampInt(configured.maxLlmRounds, 0, 3, 1),
             maxReplans: clampInt(configured.maxReplans, 0, 2, 0),
             javaSafeMode: configured.javaSafeMode !== false,
             seniorMode,

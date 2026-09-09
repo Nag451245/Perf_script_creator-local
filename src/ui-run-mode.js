@@ -65,4 +65,27 @@ function normalizeList(values) {
         : [];
 }
 
-module.exports = { flagsForRunMode, flagsForRunRequest };
+/**
+ * Build the request for "Rerun last". Anything the caller explicitly sends
+ * wins; everything else is carried from the run being repeated.
+ *
+ * This used to copy only mode + inputs, so a run made with AI assist, a
+ * scenario code and a paired second recording came back cheaper, unpaired and
+ * LLM-free — which reads as the product regressing rather than as a rerun.
+ */
+function rerunRequest(lastRun = {}, body = {}) {
+    const previous = (lastRun && lastRun.request) || {};
+    return {
+        ...previous,
+        ...body,
+        mode: body.mode || previous.mode || lastRun.mode || 'agent',
+        selectedInputs: normalizeList(
+            body.selectedInputs || previous.selectedInputs || lastRun.selectedInputs
+        ),
+        // A rerun is a deliberate repeat, so it re-processes inputs the state
+        // store would otherwise skip as unchanged.
+        force: body.force !== false,
+    };
+}
+
+module.exports = { flagsForRunMode, flagsForRunRequest, rerunRequest };

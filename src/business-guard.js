@@ -2,7 +2,12 @@
 
 const peNaming = require('./pe-naming');
 
-const FIRST_PARTY_HINT = /(?:^|\.)webpt\.com$|stage|stg|gateway|auth|app|tasks|emr/i;
+// Fallback only, for when the recording gives us no dominant host to compare
+// against (a single ${var} domain, say). "First party" is normally DERIVED from
+// the recording — see primaryDomainOf. Hardcoding one customer's domain here
+// meant every other app fell back to these generic words and got weaker
+// protection than the app this was built against.
+const FIRST_PARTY_HINT = /stage|stg|gateway|auth|app|tasks|emr/i;
 const THIRD_PARTY_NOISE = /gstatic|google|beacon|domainreliability|analytics|dynatrace|newrelic|pendo|launchdarkly|sentry|ruxit|gravatar/i;
 const NOISE_PATH = /\/(?:ohttp_gateway|domainreliability\/upload|favicon\.ico|robots\.txt)|\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff2?)(?:\?|$)/i;
 const REDIRECT_PLUMBING_PATH = /\/(?:s\/interceptor|interceptor|authorize\/resume|iam\/callback|oauth\/token|user\/iam\/authorize|logout|v2\/logout)(?:\/|\?|$)/i;
@@ -13,6 +18,8 @@ const MUTATING_METHOD = /^(POST|PUT|PATCH|DELETE)$/i;
 function buildBusinessGuard({ xml, flowName = '', runCfg = {}, valueFlowDecisions = null, duplicateHopLabels = [] } = {}) {
     const samplers = indexSamplers(xml || '');
     const goalTerms = goalTermsFor(flowName, runCfg);
+    // Which host IS the app under test — read off this recording, not assumed.
+    const primaryDomain = primaryDomainOf(samplers);
     // Operator tier is ABSOLUTE: run.disableCalls entries are deliberate
     // per-flow decisions and heuristics may never protect them (gating this
     // behind allowUnsafeDisableProtected made the guard veto the operator's
@@ -26,7 +33,7 @@ function buildBusinessGuard({ xml, flowName = '', runCfg = {}, valueFlowDecision
     // preserves a session-tripping replay. Evidence outranks priors.
     const duplicateHops = new Set((duplicateHopLabels || []).map(String));
     const protectedSamplers = samplers
-        .filter(s => isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions))
+        .filter(s => isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions, primaryDomain))
         .filter(s => matchesAnyConfigured(s, operatorProtects) ||
             (!matchesAnyConfigured(s, operatorDisables) && !duplicateHops.has(s.name)))
         .map(s => ({
@@ -131,7 +138,7 @@ function indexSamplers(xml) {
     return samplers;
 }
 
-function isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions = null) {
+function isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions = null, primaryDomain = '') {
     if (!s || !s.name) return false;
     const hay = `${s.name} ${s.domain} ${s.path} ${s.body}`;
     if (THIRD_PARTY_NOISE.test(hay) || NOISE_PATH.test(s.path || '')) return false;
@@ -144,8 +151,8 @@ function isProtectedSampler(s, goalTerms, runCfg, valueFlowDecisions = null) {
     if (goalTerms.length && goalTerms.every(term => hay.toLowerCase().includes(term))) return true;
     if (/\bcreate\b|\/tasks\b|task/i.test(hay) && MUTATING_METHOD.test(s.method || '')) return true;
     if (/GraphQL mutation/i.test(s.name) && /(create|task|login|authenticate|verify)/i.test(hay)) return true;
-    if (MUTATING_METHOD.test(s.method || '') && isFirstParty(s.domain) && !NOISE_PATH.test(s.path || '')) return true;
-    if (AUTH_OR_SESSION_PATH.test(s.path || '') && isFirstParty(s.domain)) return true;
+    if (MUTATING_METHOD.test(s.method || '') && isFirstParty(s.domain, primaryDomain) && !NOISE_PATH.test(s.path || '')) return true;
+    if (AUTH_OR_SESSION_PATH.test(s.path || '') && isFirstParty(s.domain, primaryDomain)) return true;
     return false;
 }
 
@@ -198,10 +205,42 @@ function matchesAnyConfigured(s, patterns) {
     return patterns.some(p => p && samplerPatternMatches(String(p), { name: s.name, path: s.path, method: s.method }, hay));
 }
 
-function isFirstParty(domain) {
-    const d = String(domain || '').replace(/^\$\{|\}$/g, '');
-    if (!d) return true;
-    return FIRST_PARTY_HINT.test(d) && !THIRD_PARTY_NOISE.test(d);
+/**
+ * The app under test, derived from the recording itself: the registrable domain
+ * most of the non-noise samplers point at. Every app has one; only ours was
+ * ever hardcoded.
+ */
+function primaryDomainOf(samplers = []) {
+    const tally = new Map();
+    for (const s of samplers) {
+        const d = String(s && s.domain || '').replace(/^\$\{|\}$/g, '').toLowerCase();
+        if (!d || THIRD_PARTY_NOISE.test(d)) continue;
+        const reg = registrableDomain(d);
+        if (reg) tally.set(reg, (tally.get(reg) || 0) + 1);
+    }
+    let best = '', bestN = 0;
+    for (const [d, n] of tally) if (n > bestN) { best = d; bestN = n; }
+    return best;
+}
+
+/** Last two labels. Enough to group stgapp.x.com with stage-gateway.x.com. */
+function registrableDomain(host) {
+    const parts = String(host || '').split('.').filter(Boolean);
+    return parts.length >= 2 ? parts.slice(-2).join('.') : (parts[0] || '');
+}
+
+function isFirstParty(domain, primaryDomain = '') {
+    const raw = String(domain || '');
+    const d = raw.replace(/^\$\{|\}$/g, '');
+    // An unresolved variable host cannot be compared to anything. Protecting a
+    // sampler we cannot classify costs a possibly-redundant request; disabling
+    // one silently removes a business step, so unknown means protected.
+    if (!d || raw.includes('${')) return true;
+    if (THIRD_PARTY_NOISE.test(d)) return false;
+    // Recording-derived truth first: same registrable domain as the app the
+    // flow is against. This is what makes the guard work on any customer's app.
+    if (primaryDomain) return registrableDomain(d.toLowerCase()) === primaryDomain;
+    return FIRST_PARTY_HINT.test(d);
 }
 
 function isBadStatus(sample) {
@@ -240,5 +279,5 @@ module.exports = {
     buildBusinessGuard,
     filterProtectedDisables,
     evaluateBusinessResult,
-    _internal: { indexSamplers, goalTermsFor, isProtectedSampler, valueFlowDecisionFor, protectionCategory },
+    _internal: { indexSamplers, goalTermsFor, isProtectedSampler, isFirstParty, primaryDomainOf, valueFlowDecisionFor, protectionCategory },
 };

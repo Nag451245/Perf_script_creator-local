@@ -37,13 +37,18 @@ const args = process.argv.slice(2);
 // BEFORE requiring the engine: the ai-service singleton reads GOOGLE_API_KEY at
 // construction time (transitively constructed by the engine require below), so
 // this must run first or the Gemini fallback key is never picked up.
+let CONFIG_PARSE_ERROR = '';
 function loadConfig() {
     const p = path.join(ROOT, 'perfscript.config.json');
     if (!fs.existsSync(p)) return {};
     // Strip a leading UTF-8 BOM — Windows editors / PowerShell Out-File add one
     // and it makes JSON.parse throw, silently dropping the whole config.
     try { return JSON.parse(fs.readFileSync(p, 'utf8').replace(/^﻿/, '')); }
-    catch (e) { console.warn(`WARNING: perfscript.config.json is not valid JSON (${e.message}) — ignoring it.`); return {}; }
+    catch (e) {
+        CONFIG_PARSE_ERROR = e.message;
+        console.warn(`WARNING: perfscript.config.json is not valid JSON (${e.message}) — ignoring it.`);
+        return {};
+    }
 }
 const CONFIG = loadConfig();
 if (CONFIG.jmeterHome && !process.env.JMETER_HOME) process.env.JMETER_HOME = CONFIG.jmeterHome;
@@ -112,6 +117,17 @@ const { selectUnits } = require('./src/ui-inputs');
 const AGENT_OPTS = resolveAgentOptions(args, CONFIG);
 const DO_RUN = AGENT_OPTS.doRun;
 const DO_AGENT = AGENT_OPTS.doAgent;
+// A broken config is survivable for a generate-only run, but not for one that
+// touches a live environment: jmeterHome, javaHome, targetBaseUrlOverride,
+// credentials, protectedCalls and disableCalls ALL live in that file. Running
+// on an empty config means replaying against the recorded host with no
+// protection — failures that look like correlation bugs and are not. Stop.
+if (CONFIG_PARSE_ERROR && AGENT_OPTS.doRun) {
+    console.error(`perfscript.config.json is not valid JSON (${CONFIG_PARSE_ERROR}).`);
+    console.error('Refusing to run or validate: the target URL, credentials, JMeter path and protected/disabled call lists all come from that file, so this run would use none of them. Fix the JSON and try again (generate-only runs still work).');
+    process.exit(1);
+}
+
 const WATCH = args.includes('--watch');
 const FAST_LOOP = args.includes('--fast-loop');
 const FORCE = args.includes('--force');
@@ -262,8 +278,15 @@ async function processUnit(unit) {
         fs.writeFileSync(path.join(outDir, `${name}_understanding.json`), JSON.stringify(understanding.summary, null, 2));
     } catch (e) { rec(`flow understanding skipped: ${e.message}`); }
 
+    // One recording or two is the single biggest lever on correlation quality,
+    // and it is the operator's to pull — so say which one this run got instead
+    // of silently producing a script that looks equally trustworthy either way.
+    const SINGLE_RECORDING = !notes.dualHar;
     if (notes.dualHar) rec(`dual-recording variance: ${notes.dualHar.dynamicValueCount} dynamic values across the two runs`);
     if (notes.dualHarError) rec(`dual-recording comparison failed (${notes.dualHarError}) — continuing with first recording only`);
+    if (SINGLE_RECORDING) {
+        rec('correlation confidence LOW — only ONE recording. A single capture cannot separate a fixed value from a session value that happened not to change, so some dynamics will be hardcoded. Record the flow again and add it as <flow>__run2 for provable correlation.');
+    }
     if (notes.jmxJtl) rec(`JMX paired with ${notes.jmxJtl.sidecar}: ${notes.jmxJtl.paired}/${entries.length} response sides matched`);
     if (notes.jmxJtlError) rec(notes.jmxJtlError);
 
@@ -325,7 +348,13 @@ async function processUnit(unit) {
         let progressTimer = null;
         try {
             rec(`running bounded feedback loop (max ${MAX_ITER})…`);
-            if (DO_AGENT) rec(`agent mode enabled · max LLM rounds=${AGENT_OPTS.agent.maxLlmRounds} · java-safe=${AGENT_OPTS.agent.javaSafeMode ? 'on' : 'off'}`);
+            // Say plainly whether an LLM is in this run. "agent mode" alone was
+            // read as "AI ran"; without --ai nothing leaves the machine and the
+            // repair is entirely deterministic.
+            if (DO_AGENT) {
+                rec(`agent mode enabled · ${AI_ON ? `LLM: ON (max ${AGENT_OPTS.agent.maxLlmRounds} round(s))` : 'LLM: OFF — deterministic repair only, nothing leaves this machine'}` +
+                    ` · java-safe=${AGENT_OPTS.agent.javaSafeMode ? 'on' : 'off'}`);
+            }
             progressTimer = startRunProgressHeartbeat(outDir, rec);
             const out = await runValidate({
                 entries, pages, outDir, name,
@@ -360,6 +389,7 @@ async function processUnit(unit) {
                     blockers: out.humanBlockers || [],
                     continuation: (out.result && out.result.continuation) || null,
                     changeSummary,
+                    singleRecording: SINGLE_RECORDING,
                     outDir,
                     name,
                     finalJmxPath: out.result.finalJmxPath || path.join(outDir, `${name}.jmx`),
@@ -381,7 +411,7 @@ async function processUnit(unit) {
                 if (out.result.continuation) rec(`NOT STUCK — ${out.result.continuation.message}`);
                 const reportPath = writeHtmlReport(outDir, name, {
                     mode: `generate + run (${mode})`, verdict,
-                    action: finalMarker.action, changeSummary,
+                    action: finalMarker.action, changeSummary, llmUsed: AI_ON,
                     stats: out.stats, samples: out.result.samples || [],
                     baselineDiff: out.baselineDiff,
                     memoryMatches: out.memoryMatches || [],
@@ -428,6 +458,11 @@ async function processUnit(unit) {
             verdict: runAttemptError ? 'not verified' : 'generated',
             validated: false,
             businessVerified: false,
+            // A validate that DIED (JMeter missing, network gone, Stop pressed)
+            // is not the same as a generate-only run: it must not replace a
+            // previously verified deliverable with this unverified one.
+            abortedRun: runAttemptError || '',
+            singleRecording: SINGLE_RECORDING,
             labelMapPath: path.join(outDir, `${name}_label_map.json`),
         });
         rec(`generated JMX — ${gen.stats.samplers} samplers, ${gen.stats.correlations} correlations` +
@@ -436,13 +471,16 @@ async function processUnit(unit) {
             `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ` +
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
         rec(`WHAT TO DO — ${finalMarker.action.headline}`);
+        if (finalMarker.keptPrevious) {
+            rec(`run aborted — kept the last VERIFIED ${path.basename(finalMarker.finalCopyPath)}; this run's unverified regenerate is parked as ${path.basename(finalMarker.writtenPath)}`);
+        }
         rec(`open ${path.basename(finalMarker.finalCopyPath)} (start with 00_OPEN_THIS_FIRST.txt)`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
         const verdict = runAttemptError ? 'not verified' : 'generated';
         const reportPath = writeHtmlReport(outDir, name, {
             mode: runAttemptError ? `${DO_AGENT ? 'agent validate' : 'generate + validate'} attempted (${mode})` : `generate only (${mode})`,
             verdict,
-            action: finalMarker.action,
+            action: finalMarker.action, llmUsed: AI_ON,
             stats: gen.stats, samples: [],
             correlations: gen.correlations || [],
             dualHar: notes.dualHar || null,

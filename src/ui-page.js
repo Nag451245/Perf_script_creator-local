@@ -202,9 +202,14 @@ button:disabled{opacity:.4;cursor:not-allowed}
       <div class="card-b">
         <div class="field">
           <label>Mode</label>
+          <!-- The mode names describe what RUNS. "Senior AI Agent" was the
+               default while AI assist defaulted to off, so the headline
+               feature of every run was a claim the run did not make. AI is the
+               separate control below; these modes are deterministic without
+               it. -->
           <select id="mode">
-            <option value="agent">Senior AI Agent — generate, validate, self-repair</option>
-            <option value="senior-agent">Mature PE Agent — deeper reasoning</option>
+            <option value="agent">Agent — generate, validate, self-repair</option>
+            <option value="senior-agent">Agent + senior PE evidence — deeper analysis</option>
             <option value="run">Generate + Validate</option>
             <option value="generate">Generate only</option>
             <option value="agent-watch">Watch input folder</option>
@@ -512,7 +517,7 @@ q('#rec1').onchange=updateSelected;q('#rec2').onchange=updateSelected;
 q('#hist-search').oninput=function(){histPage=0;paintHistory()};
 q('#ai-assist').onchange=function(){var v=q('#ai-assist').value,n=q('#ai-note');
  if(v==='off'){n.style.color='var(--accent)';n.textContent='Deterministic only — generation, correlation & self-repair run free. No LLM calls.';}
- else{n.style.color='var(--warn)';n.textContent='AI assist ON'+(v==='pro'?' (Gemini Pro)':'')+' — the LLM may be consulted for unresolved failures. This can incur cost.';}};
+ else{n.style.color='var(--warn)';n.textContent='AI assist ON'+(v==='pro'?' (Gemini Pro)':'')+' — for unresolved failures, redacted JMX snippets and response excerpts are sent to the LLM and LEAVE THIS MACHINE. This can incur cost.';}};
 q('#copy-log').onclick=function(){navigator.clipboard&&navigator.clipboard.writeText(logText)};
 q('#clear-log').onclick=function(){logText='';q('#log').textContent=''};
 q('#raw-log').onchange=renderLog;

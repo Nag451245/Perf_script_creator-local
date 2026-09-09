@@ -40,6 +40,11 @@
  */
 const { injectAfterSampler, _internal: { escXmlAttr, indexSamplers } } = require('./extractors');
 
+// Shortest literal we will swap across the WHOLE plan when no sampler is named.
+// Real dynamic values (session ids, CSRF tokens, view states, GUIDs) are far
+// longer than this; the values that wrecked plans were short and shared.
+const MIN_GLOBAL_REPLACE_LENGTH = 8;
+
 const PATCH_SCHEMAS = {
     addExtractor: {
         keys: new Set(['kind', 'sampler', 'variable', 'type', 'path', 'regex', 'template', 'useHeaders', 'selector', 'attribute']),
@@ -126,6 +131,22 @@ function validateOne(raw) {
 
     if (kind === 'setSamplerEnabled' && typeof raw.enabled !== 'boolean') {
         return { ok: false, rejected: { reason: 'invalid_field', kind, field: 'enabled', raw } };
+    }
+
+    // A plan-WIDE literal swap is the most destructive patch shape we accept:
+    // omitting `sampler` rewrites every occurrence in the JMX. That is right for
+    // a long unique token and catastrophic for a short one — replacing "true",
+    // an ID fragment, or a shared `state=` value shreds unrelated samplers. A
+    // short literal must therefore name the sampler it belongs to.
+    if (kind === 'replaceValueWithVar' && !raw.sampler && String(raw.value).length < MIN_GLOBAL_REPLACE_LENGTH) {
+        return {
+            ok: false,
+            rejected: {
+                reason: 'global_replace_too_short', kind, value: raw.value,
+                detail: `A plan-wide replace needs a literal of at least ${MIN_GLOBAL_REPLACE_LENGTH} characters, or an explicit sampler.`,
+                raw,
+            },
+        };
     }
 
     return { ok: true, fix: { ...raw } };

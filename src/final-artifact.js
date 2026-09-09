@@ -147,6 +147,30 @@ function fingerprintOf(xml) {
 }
 
 /**
+ * What did the last completed run ship here, and had JMeter actually proven it?
+ * Read before we overwrite anything: a run that dies mid-validation (JMeter
+ * crash, network loss, operator Stop) must not replace a script a previous run
+ * VERIFIED with an unverified regenerate that looks identical in the folder.
+ */
+function previousDeliverable({ finalCopyPath, outDir, safeName }) {
+    try {
+        const fpPath = path.join(outDir, `${safeName}_final_fingerprint.json`);
+        if (!fs.existsSync(finalCopyPath) || !fs.existsSync(fpPath)) return null;
+        const prev = JSON.parse(fs.readFileSync(fpPath, 'utf8'));
+        const onDisk = fs.readFileSync(finalCopyPath, 'utf8');
+        return {
+            validated: prev.validated === true,
+            verdict: prev.verdict || '',
+            writtenAt: prev.writtenAt || '',
+            // Only vouch for a file we can still prove we wrote. If something
+            // else rewrote it, "keep the verified one" is not a claim we can
+            // make about the bytes on disk.
+            intact: !!prev.sha256 && fingerprintOf(onDisk) === prev.sha256,
+        };
+    } catch { return null; }
+}
+
+/**
  * Was the final we shipped last time rewritten by something other than us?
  * The tell is a file whose hash no longer matches the fingerprint we recorded.
  * JMeter's serializer also leaves a mark: it emits HTTPSampler.postBodyRaw for
@@ -187,6 +211,13 @@ function writeFinalJmxPointer({
     blockers = [],
     continuation = null,
     changeSummary = '',
+    // Set when the run could not finish verifying (JMeter failed to launch, the
+    // network dropped, the operator pressed Stop). The value is the reason.
+    abortedRun = '',
+    // True when only ONE recording was available. Correlation quality depends
+    // on comparing two captures of the same flow, so this is a caveat on every
+    // verdict — including a green one.
+    singleRecording = false,
 } = {}) {
     if (!outDir || !name || !finalJmxPath) {
         throw new Error('outDir, name, and finalJmxPath are required');
@@ -222,14 +253,33 @@ function writeFinalJmxPointer({
     // what we ship, and notice when what is on disk is not it.
     const shipped = fingerprintOf(sanitized.xml);
     const stale = detectExternalEdit({ finalCopyPath, outDir, safeName });
-    fs.writeFileSync(finalCopyPath, sanitized.xml);
-    fs.writeFileSync(path.join(outDir, `${safeName}_final_fingerprint.json`), JSON.stringify({
-        file: finalName,
-        sha256: shipped,
-        bytes: Buffer.byteLength(sanitized.xml),
-        writtenAt: new Date().toISOString(),
-        note: 'If the file no longer matches this hash, something outside the agent rewrote it (most often a JMeter save from a buffer opened before this run). Reopen the file in JMeter before trusting what you see.',
-    }, null, 2));
+
+    // AN ABORTED RUN MUST NOT DEMOTE A VERIFIED SCRIPT. When JMeter cannot
+    // launch or the network drops mid-validation, the fallback regenerates the
+    // script WITHOUT validating it — and writing that over the deliverable
+    // silently replaced a proven script with an unproven one under the same
+    // name, which is indistinguishable in the folder. Keep the proven file and
+    // park the regenerate beside it.
+    const previous = previousDeliverable({ finalCopyPath, outDir, safeName });
+    const keepPrevious = !!abortedRun && !validated && !!previous && previous.validated && previous.intact;
+    const parkedName = 'UNVERIFIED_REGENERATE.jmx';
+    const writtenPath = keepPrevious ? path.join(outDir, parkedName) : finalCopyPath;
+    fs.writeFileSync(writtenPath, sanitized.xml);
+    if (!keepPrevious) {
+        // The parked copy belongs to one aborted run; leaving it around after a
+        // run that DID write the deliverable makes two candidate scripts again.
+        const parked = path.join(outDir, parkedName);
+        if (fs.existsSync(parked)) { try { fs.unlinkSync(parked); } catch { /* locked */ } }
+        fs.writeFileSync(path.join(outDir, `${safeName}_final_fingerprint.json`), JSON.stringify({
+            file: finalName,
+            sha256: shipped,
+            bytes: Buffer.byteLength(sanitized.xml),
+            validated: !!validated,
+            verdict,
+            writtenAt: new Date().toISOString(),
+            note: 'If the file no longer matches this hash, something outside the agent rewrote it (most often a JMeter save from a buffer opened before this run). Reopen the file in JMeter before trusting what you see.',
+        }, null, 2));
+    }
     if (sanitized.notes.length) {
         fs.writeFileSync(path.join(outDir, `${safeName}_final_sanitizer.json`), JSON.stringify(sanitized.notes, null, 2));
     }
@@ -237,7 +287,14 @@ function writeFinalJmxPointer({
     // The first thing anyone reads should answer "what do I do now?", not make
     // them interpret a status word. Action first, then why, then the details.
     const guidePath = path.join(outDir, '00_OPEN_THIS_FIRST.txt');
-    const action = nextAction({ verdict, gate: greenGate, blockers, continuation, validated });
+    const action = keepPrevious
+        ? {
+            headline: 'This run stopped early — the script here is the last verified one.',
+            detail: `The run could not finish verifying (${abortedRun}), so nothing was proven this time. `
+                + `${finalName} is untouched from the last run that passed${previous.writtenAt ? ` (${previous.writtenAt})` : ''}. `
+                + `What this run regenerated — unverified — is parked beside it as ${parkedName}; do not run that as load until a validate run passes.`,
+        }
+        : nextAction({ verdict, gate: greenGate, blockers, continuation, validated });
     const lines = [
         action.headline.toUpperCase(),
         '',
@@ -259,12 +316,21 @@ function writeFinalJmxPointer({
             ? [`  Test data ........... ${safeName}_data.csv  (keep it beside the script)`]
             : []),
         '',
-        `Verdict: ${verdict}   ·   JMeter validation: ${validated ? 'RAN' : 'NOT RUN'}`,
+        `Verdict: ${keepPrevious ? `${previous.verdict || 'verified'} (carried over from the last completed run)` : verdict}` +
+            `   ·   JMeter validation: ${validated ? 'RAN' : (keepPrevious ? 'ABORTED this run' : 'NOT RUN')}`,
         '',
         businessVerified
             ? 'Business check: confirmed by an explicit business assertion.'
             : wrap('Business check: a green HTTP result only means the enabled requests answered. It does not prove the business record was created unless an explicit assertion checked it, or you confirm the record in the app.'),
         '',
+        // The single biggest determinant of correlation quality, and the one
+        // thing the operator controls. Two captures of the same flow prove
+        // which values change per session; one capture cannot, so anything that
+        // merely LOOKS constant gets hardcoded and breaks later or under load.
+        ...(singleRecording ? [
+            wrap('Correlation confidence: LOW — built from ONE recording. With a single capture there is no way to tell a genuinely fixed value from a session value that happened not to change, so some dynamic values are likely hardcoded. Record the same flow a second time and drop both in as <flow>__run1 and <flow>__run2; the agent then correlates only what provably differs.'),
+            '',
+        ] : []),
         'If you need to dig:',
         '  reports/   gate verdicts',
         '  evidence/  label map, recording, parameters',
@@ -274,7 +340,7 @@ function writeFinalJmxPointer({
     ];
     fs.writeFileSync(guidePath, lines.join('\n') + '\n');
 
-    return { finalCopyPath, guidePath, staleEditorWarning: stale, action };
+    return { finalCopyPath, guidePath, staleEditorWarning: stale, action, keptPrevious: keepPrevious, writtenPath };
 }
 
 module.exports = { writeFinalJmxPointer, _internal: { sanitizeFinalXml } };

@@ -156,7 +156,7 @@ function writeHtmlReport(outDir, name, data = {}) {
     const {
         mode = 'generate', verdict = 'generated', stats = {}, samples = [],
         baselineDiff = null, memoryMatches = [], learnedLessons = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [], businessVerification = null, disableDecisions = null,
-        action = null, changeSummary = '',
+        action = null, changeSummary = '', llmUsed = null,
     } = data;
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
@@ -405,7 +405,10 @@ details{border:1px solid #d9e2e1;border-radius:8px;margin:8px 0;background:#fff}
   <h1>perfscript-local · ${esc(name)}</h1>
   <div class="sub">mode: ${esc(mode)} · generated ${esc(new Date().toLocaleString())} ·
     verdict: <span class="badge ${verdictClass}">${esc(verdict)}</span>
-    ${reqs.length ? ` · ${passed}/${reqs.length} requests passed` : ''}</div>
+    ${reqs.length ? ` · ${passed}/${reqs.length} requests passed` : ''}
+    ${llmUsed === null ? '' : (llmUsed
+        ? ' · <span class="badge neutral" title="An LLM was consulted; recording snippets left this machine.">LLM USED</span>'
+        : ' · <span class="badge neutral" title="No LLM was called. Generation, correlation and repair were deterministic and nothing left this machine.">NO_LLM</span>')}</div>
 
   ${actionBanner}
 

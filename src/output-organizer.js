@@ -210,6 +210,9 @@ function mustStayAtRoot(name, file) {
     if (file === '00_OPEN_THIS_FIRST.txt' || file === '00_OUTPUT_INDEX.txt') return true;
     if (file === 'output_manifest.json' || file === 'log.txt') return true;
     if (/^00_(RUN_THIS_SCRIPT|USE_THIS_.*)\.jmx$/i.test(file)) return true;
+    // An aborted run parks its unverified regenerate beside the verified
+    // deliverable, and the guide tells the operator to look for it there.
+    if (file === 'UNVERIFIED_REGENERATE.jmx') return true;
     if (file === `${name}_report.html`) return true;
     if (file === `${name}_data.csv`) return true;          // JMeter reads it relative to the script
     if (file === 'final.jtl') return true;                 // the next run looks for it here

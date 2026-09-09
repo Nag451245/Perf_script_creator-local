@@ -8,7 +8,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { flagsForRunRequest } = require('./ui-run-mode');
+const { flagsForRunRequest, rerunRequest } = require('./ui-run-mode');
 const { buildInputModel } = require('./ui-inputs');
 const steering = require('./steering');
 const { cancelChildProcess } = require('./ui-process-control');
@@ -167,6 +167,11 @@ function startRun(request) {
         mode: request.mode || 'generate',
         selectedInputs: request.selectedInputs || [],
         force: !!request.force,
+        // Keep the WHOLE request, not the three fields rerun happened to read.
+        // "Rerun last" replayed mode and inputs only, so a run made with AI
+        // assist, a scenario code and a paired recording came back cheaper,
+        // unpaired and LLM-free — which reads as the product regressing.
+        request: { ...request },
         flags,
         lines: [],
         done: false,
@@ -211,17 +216,9 @@ function startRun(request) {
     return { id, flags };
 }
 
+/** Repeat the last run with its full intent. See ui-run-mode.rerunRequest. */
 function rerun(body = {}) {
-    const source = lastRun || {};
-    const request = {
-        mode: body.mode || source.mode || 'agent',
-        selectedInputs: normalizeStringList(body.selectedInputs || source.selectedInputs),
-        force: body.force !== false,
-        iterations: body.iterations,
-        retryFailed: body.retryFailed,
-        geminiPro: !!body.geminiPro,
-    };
-    return startRun(request);
+    return startRun(rerunRequest(lastRun || {}, body));
 }
 
 function send(res, code, body, headers = {}) {
@@ -279,11 +276,38 @@ function safeUploadName(name) {
     return base;
 }
 
+/**
+ * On loopback the only client is the operator's own browser, so the UI is
+ * unauthenticated by design. Bound to a LAN address it is not: /api/run
+ * executes a child process and /api/config returns and writes credentials.
+ * A non-loopback bind therefore requires PERFSCRIPT_UI_TOKEN, handed to the
+ * browser once via ?t=… and kept in an HttpOnly cookie afterwards.
+ */
+const IS_LOOPBACK_BIND = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1';
+const UI_TOKEN = String(process.env.PERFSCRIPT_UI_TOKEN || '');
+
+function tokenAccepted(req, url) {
+    if (IS_LOOPBACK_BIND) return true;
+    if (url.searchParams.get('t') === UI_TOKEN) return true;
+    const cookie = String(req.headers.cookie || '');
+    return cookie.split(';').some(c => c.trim() === `perfscript_ui=${UI_TOKEN}`);
+}
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const p = url.pathname;
     try {
-        if (p === '/' && req.method === 'GET') return send(res, 200, PAGE, { 'Content-Type': 'text/html; charset=utf-8' });
+        if (!tokenAccepted(req, url)) {
+            return send(res, 401, { error: 'This UI is bound to a network address and needs the access token. Open it as http://<host>:<port>/?t=<PERFSCRIPT_UI_TOKEN>.' });
+        }
+        if (p === '/' && req.method === 'GET') {
+            // Trade the one-time query token for a cookie so the token stops
+            // riding in URLs (and out of them into history and logs).
+            const setCookie = (!IS_LOOPBACK_BIND && url.searchParams.get('t') === UI_TOKEN)
+                ? { 'Set-Cookie': `perfscript_ui=${UI_TOKEN}; HttpOnly; SameSite=Strict; Path=/` }
+                : {};
+            return send(res, 200, PAGE, Object.assign({ 'Content-Type': 'text/html; charset=utf-8' }, setCookie));
+        }
         if (p === '/api/state' && req.method === 'GET') return send(res, 200, buildState());
         if (p === '/api/config' && req.method === 'GET') return send(res, 200, readConfigForUi());
         if (p === '/api/config' && req.method === 'POST') return send(res, 200, writeConfigFromUi(await readJsonBody(req)));
@@ -346,6 +370,16 @@ const server = http.createServer(async (req, res) => {
         return send(res, e.httpStatus || 500, { error: e.message });
     }
 });
+
+// Fail before binding, not after: a LAN-exposed UI with no token would hand
+// anyone on the network a "run this process" and "read the stored password"
+// endpoint, and printing a warning is not a control.
+if (!IS_LOOPBACK_BIND && !UI_TOKEN) {
+    process.stderr.write(
+        `Refusing to bind ${HOST}: exposing this UI beyond loopback also exposes /api/run (starts a process) and /api/config (stores and returns credentials).\n` +
+        'Set PERFSCRIPT_UI_TOKEN to a long random value and open the UI as http://<host>:<port>/?t=<that value>, or leave PERFSCRIPT_UI_HOST unset for loopback-only.\n');
+    process.exit(1);
+}
 
 function listenWithFallback(port, attemptsLeft) {
     server.once('error', (e) => {

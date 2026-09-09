@@ -62,10 +62,11 @@ const {
 } = require('./transforms');
 
 // Elastic polling (blueprint #3): a run of >=3 consecutive requests to the same
-// method+path (query stripped, so cache-busted poll URLs still match) is a
-// poll loop. The engine can't yet EMIT a While Controller (no renderer support,
-// and adding it would touch the current app), so we detect + report with a
-// termination hint for the user to wrap manually.
+// method+path (query stripped, so cache-busted poll URLs still match) is a poll
+// loop. The engine's renderer cannot emit a While Controller, so the wrap
+// happens as a post-XML transform below (wrapPollingInWhileController) rather
+// than being deferred — with a per-loop counter cap, because a condition that
+// is never satisfied would otherwise spin for the whole test.
 /**
  * Disambiguate correlation variable-name collisions. Real flows reuse the same
  * param NAME for many DIFFERENT values — e.g. an auth0 login has `state` 7×

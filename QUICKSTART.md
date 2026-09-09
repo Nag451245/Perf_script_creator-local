@@ -67,8 +67,9 @@ Use this when you want one clean launcher instead of choosing between scripts.
    - `flow__run1.jmx` + `flow__run1.recording.xml`
    - `flow__run2.jmx` + `flow__run2.recording.xml`
 4. Select one or many logical scripts in the left panel.
-5. Choose **Senior AI Agent**, **Mature PE Agent**, **Generate + Validate**,
-   **Generate only**, or **Watch input folder**.
+5. Choose **Agent**, **Agent + senior PE evidence**, **Generate + Validate**,
+   **Generate only**, or **Watch input folder**. These are all deterministic;
+   **AI assist** below them is the separate control that brings in an LLM.
 6. Watch the right-side live log. Use **Stop** to cancel the active run, **Rerun
    last** to repeat the previous script, or **Force rerun selected** when the
    input-state cache would otherwise skip unchanged files.
@@ -100,10 +101,13 @@ Close the console window to stop the UI server.
 3. **Run:**
    - **Generate only** — correlate and build the `.jmx` with no execution.
    - **Generate + Validate** — also runs it and reports pass/fail.
-   - **Senior AI Agent** — validates, uses OpenAI/Gemini only for unresolved
-     failures, applies safe JSON patches, and re-runs JMeter.
-   - **Mature PE Agent** — adds deeper objective, stack, domain, SLO, and
-     business-flow reasoning.
+   - **Agent** — validates, then diagnoses and repairs unresolved failures and
+     re-runs JMeter. Deterministic: no LLM unless AI assist is on.
+   - **Agent + senior PE evidence** — adds deeper objective, stack, domain, SLO,
+     and business-flow reasoning.
+   - **AI assist** (separate control, default off) — when on, redacted JMX
+     snippets and response excerpts for unresolved failures are sent to the
+     configured LLM and leave this machine. Off means nothing does.
    - **Watch input folder** — keeps the agent running for new files.
 
    Watch the right-side **live log**. Use **Stop** to cancel a run.
@@ -121,10 +125,11 @@ Run from a terminal in the project folder:
 |---|---|
 | Generate only | `node index.js` |
 | Generate + Validate | `node index.js --run` |
-| One-shot Senior AI agent | `node index.js --agent` or `npm run agent` |
-| Mature PE agent | `node index.js --agent --senior` |
+| One-shot agent (no LLM) | `node index.js --agent` or `npm run agent` |
+| Agent with LLM escalation | `node index.js --agent --ai` |
+| Agent + senior PE evidence | `node index.js --agent --senior` |
 | Process selected scripts only | `node index.js --agent --input Batch_Print --input login.jmx --force` |
-| Always-on Senior AI agent | `node index.js --agent --watch` or `npm run agent:watch` |
+| Always-on agent | `node index.js --agent --watch` or `npm run agent:watch` |
 | Watch input\ and generate only | `node index.js --watch` |
 | Start the web UI | `npm run ui` or double-click `START_AGENT.cmd` |
 | Export verified lessons | `node index.js --memory-export memory/team-lessons.json` |
@@ -132,7 +137,7 @@ Run from a terminal in the project folder:
 
 Useful flags: `--input NAME` (process only matching logical input units/files),
 `--iterations N` (auto-fix loop budget, default 3), `--agent`
-(bounded AI diagnose/patch/re-verify when a key is configured), `--fast-loop`
+(bounded diagnose/patch/re-verify, no LLM), `--ai` (allow LLM escalation), `--fast-loop`
 (quick Node pre-flight without JMeter), `--gemini-pro` (use Gemini 3.1 Pro
 Preview instead of default Gemini 3.5 Flash), `--force` (reprocess unchanged
 input files after code/prompt changes), `--memory-export FILE`, and

@@ -38,6 +38,7 @@ const knowledgeBase = require('./knowledge-base');
 const diagnosisModule = require('./diagnosis');
 const experimentsModule = require('./experiments');
 const nonLoadBearingFold = require('./nonloadbearing-fold');
+const { redactForExternal } = require('./scrubber');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
 const seniorPeAnalysis = require('./senior-pe-analysis');
@@ -67,6 +68,11 @@ async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLo
     try {
         const jmxContent = fs.readFileSync(jmxPath, 'utf8');
         const prompt = buildGeminiFixPrompt({ failures, jmxContent, correlations, flowNotes, blueprintEvidence });
+        // Say it out loud. Everything else in this product runs locally, so the
+        // one step that ships recording content to a third party should not be
+        // something the operator has to infer from a mode name.
+        onLog(`AI escalation: sending ${failures.length} failure(s) plus redacted JMX snippets and response excerpts to the configured LLM — ` +
+            'this content leaves this machine. Credential/PHI-named fields are redacted; session and CSRF values are not.');
         // Provider order with failover: prefer OpenAI when its key is set, but
         // if the OpenAI call fails (bad model, 5xx, network) fall back to Gemini
         // when a Gemini key exists, instead of abandoning the whole escalation.
@@ -252,6 +258,20 @@ function buildGeminiFixPrompt({ failures, jmxContent, correlations = [], flowNot
     }));
     const snippets = extractRelevantJmxSnippets(jmxContent, prioritizedFailures.failures || []);
 
+    // EVERYTHING BELOW LEAVES THIS MACHINE. The payload carries JMX snippets,
+    // failing response bodies and header blocks, so it gets the same
+    // secret-name redaction as the shareable recording — passwords,
+    // Authorization headers, SSN/DOB/card fields. Session, CSRF and state
+    // values deliberately survive: they are what the model needs to propose a
+    // correlation, and blanking them is how hallucinated extractors start.
+    const safe = {
+        failures: redactForExternal(failureSummary),
+        triage: redactForExternal(prioritizedFailures.triage),
+        snippets: redactForExternal(snippets),
+        correlations: redactForExternal(corrSummary),
+        blueprint: blueprintEvidence ? redactForExternal(blueprintEvidence) : null,
+    };
+
     const systemInstruction = `You are a senior performance engineer specializing in JMeter correlation, OAuth/OIDC/SAML replay, GraphQL/API validation, and load-test script hardening.
 
 Operate like the senior engineer who manually fixed the Tasking script:
@@ -307,20 +327,20 @@ Hard rules:
 - Remove assertions only when failing response evidence shows the assertion is wrong for a healthy response shape.
 - If a failure cannot be fixed from the provided evidence, omit it. An empty fix list is better than a hallucinated patch.
 
-${blueprintEvidence ? `## BLUEPRINT EVIDENCE
-${JSON.stringify(blueprintEvidence, null, 2)}
+${safe.blueprint ? `## BLUEPRINT EVIDENCE
+${JSON.stringify(safe.blueprint, null, 2)}
 
 ` : ''}## FAILURES
-${JSON.stringify(failureSummary, null, 2)}
+${JSON.stringify(safe.failures, null, 2)}
 
 ## FAILURE TRIAGE
-${JSON.stringify(prioritizedFailures.triage, null, 2)}
+${JSON.stringify(safe.triage, null, 2)}
 
 ## RELEVANT JMX SNIPPETS
-${snippets}
+${safe.snippets}
 
 ## KNOWN CORRELATIONS
-${JSON.stringify(corrSummary, null, 2)}
+${JSON.stringify(safe.correlations, null, 2)}
 
 Return format:
 {"fixes":[]}`;
@@ -1638,7 +1658,7 @@ async function tryVerifiedCorrelationRepairRound({
         entries: gen.flat,
         fixes: validation.accepted,
         targetBaseUrl: config.targetBaseUrl,
-        insecure: true,
+        insecure: !!config.fastReplayInsecure,
         timeoutMs: config.timeoutMs,
         onLog,
     });
@@ -1805,7 +1825,7 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
                 entries: gen.flat,
                 fixes: validation.accepted,
                 targetBaseUrl: config.targetBaseUrl,
-                insecure: true,
+                insecure: !!config.fastReplayInsecure,
                 timeoutMs: config.timeoutMs,
                 onLog,
             });
@@ -1982,6 +2002,12 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         outputDir: outDir,
         targetBaseUrl,
         credentials,
+        // TLS verification stays ON unless the operator opts out for a
+        // self-signed staging box. Two repair paths used to hardcode
+        // insecure:true, which silently accepted any certificate — including a
+        // corporate interception proxy — while fast-replay.js documented the
+        // opposite. Carry the real setting instead of assuming.
+        fastReplayInsecure: !!(enrichedRunCfg.fastReplay && enrichedRunCfg.fastReplay.insecure),
         maxIterations,
         disableOnly: true, // already correlated; the loop only disables un-replayables
         timeoutMs: 4 * 60 * 1000,

@@ -1075,6 +1075,110 @@ test('run flags: iterations honor the new max of 6', () => {
     assert.ok(flagsForRunRequest({ mode: 'agent', iterations: 9 }).join(' ').includes('--iterations 6'), 'above max clamps to 6');
 });
 
+test('LLM patcher: a plan-wide literal swap needs a literal long enough to be unique', () => {
+    const { validateLlmPatches } = require('../src/llm-patcher');
+
+    // Omitting `sampler` rewrites EVERY occurrence in the plan. For a short or
+    // shared literal that shreds unrelated samplers.
+    const bad = validateLlmPatches([{ kind: 'replaceValueWithVar', value: 'true', variable: 'flag' }]);
+    assert.equal(bad.accepted.length, 0);
+    assert.equal(bad.rejected[0].reason, 'global_replace_too_short');
+    assert.match(bad.rejected[0].detail, /at least 8 characters, or an explicit sampler/);
+
+    // The same short literal is fine when it is scoped to one sampler.
+    const scoped = validateLlmPatches([
+        { kind: 'replaceValueWithVar', sampler: 'Step 04 - POST /tasks', value: 'true', variable: 'flag' },
+    ]);
+    assert.equal(scoped.accepted.length, 1);
+
+    // A real dynamic value is long and unique, so the global form still works —
+    // that is the case this patch shape exists for.
+    const token = validateLlmPatches([
+        { kind: 'replaceValueWithVar', value: 'L18BrkEI32zpxYSz1OqPfA', variable: 'sessionId' },
+    ]);
+    assert.equal(token.accepted.length, 1, 'a real session token is still swapped plan-wide');
+});
+
+test('LLM prompt: credentials are redacted, correlation material is not', () => {
+    const { redactForExternal } = require('../src/scrubber');
+
+    const jmxSnippet = [
+        '<stringProp name="Argument.value">username=NagendraPT&password=Password1!</stringProp>',
+        '<stringProp name="Header.value">Authorization: Bearer eyJhbGciOi.super.secret</stringProp>',
+        '<stringProp name="Argument.value">__RequestVerificationToken=a7f3c9d1e5b2&state=xyz789</stringProp>',
+        '{"ssn":"123-45-6789","dob":"1980-04-02","patientId":"P-4471"}',
+    ].join('\n');
+    const out = redactForExternal(jmxSnippet);
+
+    // Credentials and PHI must not leave the machine.
+    assert.ok(!out.includes('Password1!'), 'password redacted');
+    assert.ok(!out.includes('eyJhbGciOi.super.secret'), 'bearer token redacted');
+    assert.ok(!out.includes('123-45-6789'), 'SSN redacted');
+    assert.ok(!out.includes('1980-04-02'), 'DOB redacted');
+
+    // ...but the values the model must SEE to propose a correlation survive.
+    // Blanking these leaves it guessing, which is how hallucinated extractors
+    // get invented.
+    assert.ok(out.includes('a7f3c9d1e5b2'), 'CSRF token survives — it is the correlation target');
+    assert.ok(out.includes('xyz789'), 'OAuth state survives');
+    assert.ok(out.includes('P-4471'), 'business ids survive');
+    assert.ok(out.includes('NagendraPT'), 'the username is a CSV parameter, not a secret to hide from the model');
+
+    // Structured payloads are walked, not just flat strings.
+    const nested = redactForExternal({
+        sampler: 'Login',
+        headers: [{ authorization: 'Bearer abc', cookie: 'sid=keepme' }],
+        body: { password: 'hunter2', csrf: 'tok-123' },
+    });
+    assert.equal(nested.headers[0].authorization, '***REDACTED***');
+    assert.equal(nested.body.password, '***REDACTED***');
+    assert.equal(nested.body.csrf, 'tok-123');
+    assert.equal(nested.sampler, 'Login');
+});
+
+test('rerun last: repeats the whole run, not just mode and inputs', () => {
+    const { rerunRequest, flagsForRunRequest } = require('../src/ui-run-mode');
+    const lastRun = {
+        mode: 'senior-agent',
+        selectedInputs: ['flow__run1', 'flow__run2'],
+        request: {
+            mode: 'senior-agent',
+            selectedInputs: ['flow__run1', 'flow__run2'],
+            aiAssist: 'pro',
+            scenarioCode: 'SC02',
+            pair: true,
+            iterations: 5,
+            retryFailed: 2,
+        },
+    };
+
+    const repeat = rerunRequest(lastRun, {});
+    // The three that used to vanish, turning "rerun" into a different, cheaper run.
+    assert.equal(repeat.aiAssist, 'pro');
+    assert.equal(repeat.scenarioCode, 'SC02');
+    assert.equal(repeat.pair, true);
+    assert.equal(repeat.iterations, 5);
+    assert.equal(repeat.retryFailed, 2);
+    assert.deepEqual(repeat.selectedInputs, ['flow__run1', 'flow__run2']);
+
+    const flags = flagsForRunRequest(repeat).join(' ');
+    assert.ok(flags.includes('--ai') && flags.includes('--gemini-pro'), 'AI assist survives the rerun');
+    assert.ok(flags.includes('--scenario SC02'));
+    assert.ok(flags.includes('--pair'));
+
+    // An explicit override still wins over what was carried forward.
+    assert.equal(rerunRequest(lastRun, { aiAssist: 'off' }).aiAssist, 'off');
+    assert.equal(rerunRequest(lastRun, { mode: 'generate' }).mode, 'generate');
+
+    // A rerun always forces, so the input-state cache cannot silently skip it.
+    assert.equal(repeat.force, true);
+    assert.equal(rerunRequest(lastRun, { force: false }).force, false);
+
+    // No previous run at all is not a crash.
+    assert.equal(rerunRequest({}, {}).mode, 'agent');
+    assert.deepEqual(rerunRequest({}, {}).selectedInputs, []);
+});
+
 test('playbooks: protectedCalls carry app-specific business nouns (de-WebPT the regexes)', () => {
     const { applyPlaybooks } = require('../src/playbooks');
     const entries = [
@@ -1947,6 +2051,110 @@ test('final artifact pointer: creates an obvious top-sorted JMX and instructions
     assert.match(guide, /READY TO RUN|RUN IT|DO NOT RUN|NEEDS SOMETHING|NOT STUCK|GENERATED/i, 'the guide leads with an ACTION, not a status word');
     assert.match(guide, /00_RUN_THIS_SCRIPT\.jmx/, 'the guide points at the file it actually wrote');
     assert.match(guide, /does not prove the business record was created/);
+});
+
+test('business guard: first-party is derived from the recording, not one customer domain', () => {
+    const { _internal: { primaryDomainOf, isFirstParty } } = require('../src/business-guard');
+
+    // A bank's recording: the app under test is the host most samplers use.
+    const samplers = [
+        { domain: 'app.examplebank.io' }, { domain: 'app.examplebank.io' },
+        { domain: 'api.examplebank.io' }, { domain: 'login.examplebank.io' },
+        { domain: 'www.google-analytics.com' }, { domain: 'cdn.gstatic.com' },
+    ];
+    assert.equal(primaryDomainOf(samplers), 'examplebank.io', 'noise hosts do not win the vote');
+    assert.ok(isFirstParty('api.examplebank.io', 'examplebank.io'));
+    assert.ok(isFirstParty('login.examplebank.io', 'examplebank.io'));
+    assert.ok(!isFirstParty('cdn.gstatic.com', 'examplebank.io'));
+    assert.ok(!isFirstParty('id.auth0.com', 'examplebank.io'), 'a third-party IdP is not the app');
+
+    // The old behaviour, kept only as the no-evidence fallback.
+    assert.ok(isFirstParty('stgapp.anything.com', ''), 'generic hints still apply with nothing to compare');
+    // An unresolved variable host cannot be classified. Protecting it costs a
+    // redundant request; disabling it would drop a business step silently.
+    assert.ok(isFirstParty('${host}', 'examplebank.io'));
+    assert.ok(isFirstParty('', 'examplebank.io'));
+
+    // The app this was built against keeps working — it just is not special.
+    const webpt = [{ domain: 'stgapp.webpt.com' }, { domain: 'stage-gateway.webpt.com' }, { domain: 'stgauth.webpt.com' }];
+    assert.equal(primaryDomainOf(webpt), 'webpt.com');
+    assert.ok(isFirstParty('stgemr.webpt.com', 'webpt.com'));
+});
+
+test('single recording: the guide says correlation confidence is low and how to fix it', () => {
+    const outDir = tmp();
+    const jmx = path.join(outDir, 'gen.jmx');
+    fs.writeFileSync(jmx, '<jmeterTestPlan/>');
+
+    // Even a GREEN run built from one capture cannot prove which values are
+    // dynamic — a stable-looking session value gets hardcoded and breaks later.
+    const single = writeFinalJmxPointer({
+        outDir, name: 'solo', finalJmxPath: jmx,
+        verdict: 'GREEN', validated: true, singleRecording: true,
+    });
+    const guide = fs.readFileSync(single.guidePath, 'utf8');
+    assert.match(guide, /Correlation confidence: LOW/);
+    assert.match(guide, /__run1 and <flow>__run2/, 'it says exactly how to fix it');
+
+    const paired = writeFinalJmxPointer({
+        outDir, name: 'solo', finalJmxPath: jmx,
+        verdict: 'GREEN', validated: true, singleRecording: false,
+    });
+    assert.doesNotMatch(fs.readFileSync(paired.guidePath, 'utf8'), /Correlation confidence: LOW/,
+        'a dual-recording run is not nagged about it');
+});
+
+test('aborted run: does not replace a verified script with an unverified regenerate', () => {
+    const outDir = tmp();
+    const good = path.join(outDir, 'validated.jmx');
+    fs.writeFileSync(good, '<jmeterTestPlan>GOOD</jmeterTestPlan>');
+
+    // Run 1: a real validate that passed.
+    writeFinalJmxPointer({ outDir, name: 'flow', finalJmxPath: good, verdict: 'GREEN', validated: true });
+    const deliverable = path.join(outDir, '00_RUN_THIS_SCRIPT.jmx');
+    assert.match(fs.readFileSync(deliverable, 'utf8'), /GOOD/);
+
+    // Run 2: JMeter never launched, so the fallback regenerated WITHOUT
+    // validating. That must not overwrite the proven script.
+    const regen = path.join(outDir, 'regen.jmx');
+    fs.writeFileSync(regen, '<jmeterTestPlan>UNPROVEN</jmeterTestPlan>');
+    const aborted = writeFinalJmxPointer({
+        outDir, name: 'flow', finalJmxPath: regen,
+        verdict: 'not verified', validated: false,
+        abortedRun: 'cannot run: JMeter not found',
+    });
+    assert.match(fs.readFileSync(deliverable, 'utf8'), /GOOD/, 'the verified script survives an aborted run');
+    assert.ok(aborted.keptPrevious);
+    assert.match(fs.readFileSync(path.join(outDir, 'UNVERIFIED_REGENERATE.jmx'), 'utf8'), /UNPROVEN/,
+        'the regenerate is parked, not thrown away');
+    const guide = fs.readFileSync(aborted.guidePath, 'utf8');
+    assert.match(guide, /stopped early/i);
+    assert.match(guide, /UNVERIFIED_REGENERATE\.jmx/);
+    assert.doesNotMatch(guide, /^READY TO RUN/im, 'an aborted run never reads as ready');
+
+    // Run 3: validation runs properly again — the deliverable updates and the
+    // parked copy is cleared, so there is one candidate script again.
+    const fixed = path.join(outDir, 'fixed.jmx');
+    fs.writeFileSync(fixed, '<jmeterTestPlan>FIXED</jmeterTestPlan>');
+    const ok = writeFinalJmxPointer({ outDir, name: 'flow', finalJmxPath: fixed, verdict: 'GREEN', validated: true });
+    assert.match(fs.readFileSync(deliverable, 'utf8'), /FIXED/);
+    assert.ok(!ok.keptPrevious);
+    assert.ok(!fs.existsSync(path.join(outDir, 'UNVERIFIED_REGENERATE.jmx')));
+});
+
+test('aborted run: with nothing verified to protect, it still ships the regenerate', () => {
+    const outDir = tmp();
+    const gen = path.join(outDir, 'gen.jmx');
+    fs.writeFileSync(gen, '<jmeterTestPlan>FIRST</jmeterTestPlan>');
+    // First ever run of this flow: there is no proven script to keep, so the
+    // operator must still get something — clearly marked as unproven.
+    const res = writeFinalJmxPointer({
+        outDir, name: 'flow', finalJmxPath: gen,
+        verdict: 'not verified', validated: false, abortedRun: 'network unreachable',
+    });
+    assert.ok(!res.keptPrevious);
+    assert.match(fs.readFileSync(path.join(outDir, '00_RUN_THIS_SCRIPT.jmx'), 'utf8'), /FIRST/);
+    assert.match(fs.readFileSync(res.guidePath, 'utf8'), /not proven yet/i);
 });
 
 test('next action: says what to do, not just what the status is', () => {

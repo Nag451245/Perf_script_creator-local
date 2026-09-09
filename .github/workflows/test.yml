@@ -51,3 +51,10 @@ jobs:
 
       - name: Run tests
         run: node --test
+
+      # The unit suite proves the pieces; the eval proves the JUDGMENT calls on
+      # whole recordings — what gets correlated, parameterized and disabled. A
+      # correlator or prompt tweak can pass every unit test and still wreck
+      # those, so the eval is part of the gate, not a manual step.
+      - name: Run eval corpus
+        run: npm run eval

@@ -19,18 +19,32 @@ generation, the feedback loop) — it does not copy or modify the current app.
 **Single Agent Launcher (Windows):** double-click **`START_AGENT.cmd`**. Your
 browser opens `http://localhost:7070` with one control center for everything:
 drag-drop recordings, see logical HAR/JMX/XML script groups, select one or many
-scripts, run Generate / Validate / Senior Agent / Mature PE Agent / Watch mode,
-rerun the last script, force rerun selected scripts, stop the active run, and
-watch live logs beside the controls. Keep the launcher console open; close it to
-stop the UI server. The port auto-falls back if 7070 is busy.
+scripts, run Generate / Validate / Agent / Agent + senior PE evidence / Watch
+mode, rerun the last script, force rerun selected scripts, stop the active run,
+and watch live logs beside the controls. Keep the launcher console open; close
+it to stop the UI server. The port auto-falls back if 7070 is busy.
+
+The UI binds to loopback only, and is unauthenticated on that basis — the only
+client is your own browser. `/api/run` starts a process and `/api/config` stores
+and returns credentials, so exposing it to a network requires a token: set
+`PERFSCRIPT_UI_HOST` **and** `PERFSCRIPT_UI_TOKEN` (a long random value), then
+open `http://<host>:<port>/?t=<token>` once — the token moves to an HttpOnly
+cookie after that. Setting the host without a token is refused rather than
+warned about.
+
+**CLI flags do not mean AI.** `--agent` is the deterministic
+validate → diagnose → repair → re-verify loop. An LLM is consulted only with
+`--ai` (the UI's "AI assist" control); without it no key is loaded, nothing
+leaves the machine, and the report is stamped `NO_LLM`.
 
 **CLI (terminal only):**
 ```bat
 node index.js            :: generate scripts from every HAR/JMX unit in input\
 node index.js --run      :: also validate with local JMeter
-node index.js --agent    :: validate + bounded AI diagnose/patch/re-verify
+node index.js --agent    :: validate + bounded diagnose/patch/re-verify (NO LLM)
+node index.js --agent --ai :: same loop, plus LLM escalation on unresolved failures
 node index.js --agent --senior :: mature mode with deeper business/stack/SLO evidence
-node index.js --agent --gemini-pro :: use Gemini 3.1 Pro Preview for agent fixes
+node index.js --agent --ai --gemini-pro :: escalate with Gemini 3.1 Pro Preview
 node index.js --agent --watch :: keep watching input\ and agent-process new files
 node index.js --agent --force :: reprocess unchanged input files
 node index.js --agent --input Batch_Print :: process only a selected logical script
@@ -197,9 +211,12 @@ Phases 1–5 are built and runnable (see ARCHITECTURE.md for details):
 - **4** safe bounded AI agent escalation (OpenAI preferred, Gemini fallback) · **5** headless verify via
   the bounded `--run` / `--agent` feedback loop, summarized in the HTML report
 
-Cross-environment host rewrite is now **built** (recorded host → target, third-
-party hosts untouched). Deferred (needs engine IR/renderer changes): auto-
-emitting While Controllers for polling.
+Cross-environment host rewrite is **built** (recorded host → target, third-party
+hosts untouched). So is polling: a run of ≥3 consecutive requests to the same
+method+path (query stripped, so cache-busted poll URLs still match) is wrapped
+in a While Controller as a post-XML transform, with a per-loop counter cap so a
+never-satisfied condition cannot spin forever. Check the cap against your own
+timeout before running it at load — the cap is a safety net, not a tuned value.
 
 ## Development
 ```bash

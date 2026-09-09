@@ -11,7 +11,10 @@ async function runFastRepairLoop({
     entries = [],
     fixes = [],
     targetBaseUrl = '',
-    insecure = true,
+    // Verify TLS unless the caller explicitly opts out (runCfg.fastReplay.
+    // insecure, for a self-signed staging box). Defaulting to true here meant
+    // a caller that simply forgot the option got certificate checks turned off.
+    insecure = false,
     timeoutMs,
     onLog = () => {},
 } = {}) {

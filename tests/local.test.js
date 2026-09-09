@@ -394,7 +394,7 @@ test('output organizer: files land in the right folder, and the manifest points 
     assert.ok(fs.existsSync(path.join(out, 'output_manifest.json')));
     assert.strictEqual(manifest.verdict, 'GREEN');
     assert.strictEqual(manifest.whatToOpen.finalJmx, 'scripts/00_USE_THIS_FINAL_VALIDATED_demo.jmx');
-    assert.match(fs.readFileSync(path.join(out, '00_OUTPUT_INDEX.md'), 'utf8'), /Data CSV:/);
+    assert.match(fs.readFileSync(path.join(out, '00_OUTPUT_INDEX.txt'), 'utf8'), /Data CSV:/);
 });
 
 test('LLM escalation: clean no-op without a Gemini key', async () => {

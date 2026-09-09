@@ -138,7 +138,7 @@ function organizeOutput({
     dropPrefixedTwins(outDir, FOLDERS, name);
     manifest.pruned = pruneDiagnostics(outDir, diagnostics);
     fs.writeFileSync(path.join(outDir, 'output_manifest.json'), JSON.stringify(manifest, null, 2));
-    fs.writeFileSync(path.join(outDir, '00_OUTPUT_INDEX.md'), renderOutputIndex(manifest));
+    fs.writeFileSync(path.join(outDir, '00_OUTPUT_INDEX.txt'), renderOutputIndex(manifest));
     return manifest;
 }
 
@@ -157,6 +157,14 @@ const MACHINE_ONLY = new Set([
     'evidence/pe_analysis.json',        // reports/pe_analysis.md
     'evidence/blockers.json',           // reports/blockers.md
     'evidence/failure_forensics.json',  // reports/failure_forensics.md
+    // rendered into report.html by report-docs.js — a loose .md opens in
+    // nothing on Windows, so the copy is noise once the report carries it
+    'reports/blockers.md',
+    'reports/human_questions.md',
+    'reports/failure_forensics.md',
+    'reports/pe_analysis.md',
+    'reports/senior_pe_debrief.md',
+    'reports/reasoning.md',
     // internal dumps the agent writes for itself
     'evidence/blueprint_context.json',
     'evidence/lineage.json',
@@ -191,7 +199,7 @@ function pruneDiagnostics(outDir, level = 'summary') {
  * NEXT run reads (the fingerprint that catches an editor clobbering the final).
  */
 function mustStayAtRoot(name, file) {
-    if (file === '00_OPEN_THIS_FIRST.txt' || file === '00_OUTPUT_INDEX.md') return true;
+    if (file === '00_OPEN_THIS_FIRST.txt' || file === '00_OUTPUT_INDEX.txt') return true;
     if (file === 'output_manifest.json' || file === 'log.txt') return true;
     if (/^00_USE_THIS_.*\.jmx$/i.test(file)) return true;
     if (file === `${name}_report.html`) return true;

@@ -9,6 +9,7 @@
 const fs = require('fs');
 const path = require('path');
 const peNaming = require('./pe-naming');
+const { embeddedDocs } = require('./report-docs');
 
 const esc = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -212,7 +213,7 @@ function writeHtmlReport(outDir, name, data = {}) {
         [`results/final.jtl`, 'Current JTL copy'],
     ].map(([file, desc]) => fs.existsSync(path.join(outDir, file)) ? `<li><a href="${esc(file)}">${esc(file)}</a> — ${esc(desc)}</li>` : '')
         .filter(Boolean).join('');
-    const manifestItems = ['00_OUTPUT_INDEX.md', 'output_manifest.json']
+    const manifestItems = ['00_OUTPUT_INDEX.txt', 'output_manifest.json']
         .map(file => fs.existsSync(path.join(outDir, file)) ? `<li><a href="${esc(file)}">${esc(file)}</a> — Output folder index and manifest</li>` : '')
         .filter(Boolean).join('');
     const artifactItems = pointerItems + manifestItems + explicitArtifacts + ARTIFACTS
@@ -363,6 +364,7 @@ function writeHtmlReport(outDir, name, data = {}) {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>perfscript-local — ${esc(name)}</title>
 <style>
+details{border:1px solid #d9e2e1;border-radius:8px;margin:8px 0;background:#fff}details>summary{cursor:pointer;padding:10px 14px;font-weight:600}details[open]>summary{border-bottom:1px solid #eef3f2}.doc{padding:6px 16px 14px;line-height:1.55}.doc h3,.doc h4,.doc h5{margin:14px 0 6px}.doc ul{margin:6px 0 10px 18px}.doc pre{background:#f6f9f9;padding:10px;border-radius:6px;overflow-x:auto}.doc code{background:#f0f5f5;padding:1px 4px;border-radius:4px}
   :root { color-scheme: light dark; }
   body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; background: #0f1115; color: #e6e6e6; }
   h1 { font-size: 20px; margin: 0 0 4px; }
@@ -420,6 +422,7 @@ function writeHtmlReport(outDir, name, data = {}) {
 
   ${transactionSummarySection}
 
+  ${embeddedDocs(outDir, name)}
   <h2>Artifacts</h2>
   <ul>${artifactItems || '<li class="muted">none</li>'}</ul>
 </body></html>`;

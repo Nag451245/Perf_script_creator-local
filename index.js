@@ -399,8 +399,18 @@ async function processUnit(unit) {
                     currentJtlPath: path.join(outDir, 'final.jtl'),
                     labelMapPath: path.join(outDir, `${name}_label_map.json`),
                 });
+                const itersRun = Number(out.result.iterationsRun) || 0;
                 rec(`DONE — verdict=${verdict} · ` +
-                    `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see the HTML report`);
+                    `${passed}/${reqs.length} requests passed · ${itersRun} of up to ${MAX_ITER} iteration(s) · see the HTML report`);
+                // "Fix iterations = 3" but it ran once. That is not the budget
+                // being ignored — the loop stops as soon as it has no further
+                // fix it is allowed to apply. Saying so is the difference
+                // between a understood stop and a broken-looking agent.
+                if (verdict !== 'GREEN' && itersRun > 0 && itersRun < MAX_ITER && !out.result.continuation) {
+                    rec(`stopped after ${itersRun} of ${MAX_ITER} iteration(s): the remaining failures had no fix the agent is allowed to apply on its own` +
+                        `${(out.humanBlockers || []).length ? ' — see the BLOCKED ask above, which no number of iterations can resolve' : ''}` +
+                        '. More iterations would repeat the same run.');
+                }
                 // The small file the run list reads. <flow>_report.json used to
                 // be that file, but the output tidy-up prunes it as a twin of
                 // report.html — so every organized folder showed "0 samples ·
@@ -411,7 +421,8 @@ async function processUnit(unit) {
                     passed,
                     total: reqs.length,
                     failed: reqs.length - passed,
-                    iterations: Number(out.result.iterationsRun) || 1,
+                    iterations: itersRun,
+                    maxIterations: MAX_ITER,
                     businessVerified: !!(out.businessVerification && out.businessVerification.ok),
                 });
                 // Lead with the decision, not the status word: the operator's

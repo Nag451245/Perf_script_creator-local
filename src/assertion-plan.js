@@ -232,12 +232,13 @@ function planAssertions({
     cfg = {},
 } = {}) {
     const notes = [];
-    // OFF unless asked for. Shipped on by default, this pass put the same six
-    // failure phrases under all 25 business steps of a script — identical
-    // assertions that told a reviewer nothing, and ~175 extra substring scans
-    // over multi-hundred-KB bodies on every iteration, which is real time at
-    // load. Assertion coverage is the operator's call, not a default.
-    if (cfg.enabled !== true) {
+    // On by default again, but ONLY in the narrow form below. The first version
+    // ran automatically and put the same six failure phrases under all 25
+    // business steps — identical assertions that told a reviewer nothing and
+    // cost ~175 substring scans of large bodies per iteration. It was switched
+    // off wholesale, which left the plan with no verification at all. Neither
+    // extreme is right: a handful of assertions that each mean something is.
+    if (cfg.enabled === false) {
         return { assertions: [], notes: [], dualRecording: false, disabled: true };
     }
 

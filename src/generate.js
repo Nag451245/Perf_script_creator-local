@@ -54,6 +54,7 @@ const {
     injectGhostSynthesizers,
     injectAssertionsFromMined,
     injectGaussianTimers,
+    repairTautologicalSizeAssertions,
     applyLoadProfile,
     disableSamplersByPattern,
     repairAuth0LoginStateExtractors,
@@ -1239,6 +1240,15 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // Evidence-based assertions — see src/assertion-plan.js. This is the pass
     // that puts the agent's own body-truth into the artifact, so the operator
     // running the JMX at 50 users gets the same protection the agent had.
+    // The engine's download SizeAssertion says "size >= 0" — true of every
+    // response including an empty one. Make it mean what its name says.
+    const sizeFix = repairTautologicalSizeAssertions(xml);
+    xml = sizeFix.xml;
+    if (sizeFix.repaired) note('assertions',
+        `${sizeFix.repaired} download size assertion(s) asserted nothing (size >= 0)`,
+        'always true — it passes on a zero-byte response, which is the case it was meant to catch',
+        'changed to size > 0, so "Non-empty download" now actually checks that');
+
     const assertionCfg = runCfg.assertions || {};
     const samplerNamesForAssert = indexSamplersForGenerate(xml).map(s => s.name);
     // The same set the strict guard protects at run time — those are the steps

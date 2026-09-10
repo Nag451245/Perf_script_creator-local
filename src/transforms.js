@@ -460,6 +460,13 @@ function buildResponseAssertion(texts) {
 /**
  * Read inter-request gaps from HAR (`startedDateTime + time` -> next
  * `startedDateTime`), group by pageref, compute mean+stdev per group, and
+ * The delay is a JMeter PROPERTY whose DEFAULT is the recorded value, so the
+ * shipped script paces exactly as recorded when a human opens it — while the
+ * agent's own validation runs pass -Jperfscript.thinkTime=0 and skip the sleep
+ * entirely. Measured with real JMeter: ONE such timer cost 18s of wall clock
+ * per run, and a real flow carries ~9 of them, so validation was spending ~40s
+ * per iteration asleep. The operator can also override it at load time.
+ *
  * inject a GaussianRandomTimer right inside each TransactionController's
  * hashTree. Skips groups with too few samples or a sub-second mean (think
  * times below 1s create false load shape; better to omit).
@@ -485,8 +492,8 @@ function injectGaussianTimers(xml, flatEntries, pages) {
         if (!s || s.mean < 1000) continue;
         const timer = `
           <GaussianRandomTimer guiclass="GaussianRandomTimerGui" testclass="GaussianRandomTimer" testname="Pacing (Transaction)" enabled="true">
-            <stringProp name="ConstantTimer.delay">${Math.round(s.mean)}</stringProp>
-            <stringProp name="RandomTimer.range">${Math.round(s.stdev)}</stringProp>
+            <stringProp name="ConstantTimer.delay">\${__P(perfscript.thinkTime,${Math.round(s.mean)})}</stringProp>
+            <stringProp name="RandomTimer.range">\${__P(perfscript.thinkTimeRange,${Math.round(s.stdev)})}</stringProp>
           </GaussianRandomTimer>
           <hashTree/>`;
         const insertAt = m.index + m[0].length;
@@ -976,8 +983,38 @@ function stripGuiListenersForRun(xml, jtlPath) {
     return { xml: writerInsert, disabled, writerJtlPath: jtlPath };
 }
 
+/**
+ * The engine attaches a "Assert: Non-empty download" SizeAssertion to file
+ * downloads — as `size >= 0`, which is true of every response ever returned,
+ * including a zero-byte one. It is the only assertion in an otherwise
+ * assertion-free plan, so it reads as the agent's idea of verification while
+ * asserting nothing at all.
+ *
+ * Operators: 1 =, 2 !=, 3 >, 4 <, 5 >=, 6 <=. "Non-empty" is `> 0`, so make the
+ * assertion say what its own name claims. The engine is read-only, so this is
+ * repaired here on the generated XML.
+ */
+function repairTautologicalSizeAssertions(xml) {
+    let repaired = 0;
+    const out = String(xml || '').replace(
+        /<SizeAssertion\b[\s\S]*?<\/SizeAssertion>/g,
+        (block) => {
+            const size = (block.match(/<stringProp name="SizeAssertion\.size">\s*(\d+)\s*<\/stringProp>/) || [])[1];
+            const op = (block.match(/<intProp name="SizeAssertion\.operator">\s*(\d+)\s*<\/intProp>/) || [])[1];
+            // Only the always-true shape: ">= 0". Anything an operator wrote
+            // deliberately is left alone.
+            if (size !== '0' || op !== '5') return block;
+            repaired++;
+            return block.replace(
+                /<intProp name="SizeAssertion\.operator">\s*5\s*<\/intProp>/,
+                '<intProp name="SizeAssertion.operator">3</intProp>');
+        });
+    return { xml: out, repaired };
+}
+
 module.exports = {
     disableSamplersByPattern,
+    repairTautologicalSizeAssertions,
     samplerPatternMatches,
     wrapPollingInWhileController,
     injectGhostSynthesizers,

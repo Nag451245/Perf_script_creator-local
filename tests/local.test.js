@@ -7983,15 +7983,16 @@ test('assertions: a single recording proves nothing, so no content is asserted',
     assert.match(plan.notes.join(' '), /only one recording/i);
 });
 
-test('assertions: the pass does nothing unless it is switched on', () => {
-    // It used to run automatically and stamped the same six failure phrases
-    // under every business step — no information, and a scan of every response
-    // body per iteration. Coverage is the operator's call now.
+test('assertions: enabled by default, and switchable off', () => {
     const entries = [assertEntry('https://app.test/home', '<html><body>a real page of content</body></html>')];
-    const off = assertionPlanner.planAssertions({ entries, samplerNames: ['Step 01'] });
-    assert.deepEqual(off.assertions, []);
+    // Default ON — but the narrow form: this lone HTML GET is not a login and
+    // has no marker two recordings agree on, so it still gets nothing.
+    const on = assertionPlanner.planAssertions({ entries, samplerNames: ['Step 01'] });
+    assert.notEqual(on.disabled, true, 'the pass runs without being asked');
+    assert.deepEqual(on.assertions, [], 'and still refuses to invent an assertion it cannot justify');
+
+    const off = assertionPlanner.planAssertions({ entries, samplerNames: ['Step 01'], cfg: { enabled: false } });
     assert.equal(off.disabled, true);
-    assert.deepEqual(off.notes, [], 'silence, not a nag about a feature nobody asked for');
 });
 
 test('assertions: failure text is asserted on the login step only', () => {
@@ -8433,4 +8434,39 @@ test('stale editor: a JMeter overwrite becomes the headline, not a footnote', ()
     const guide = fs.readFileSync(res.guidePath, 'utf8');
     assert.match(guide.split('\n')[0], /CLOSE THIS FILE IN JMETER/i, 'first line of the guide, not a note further down');
     assert.doesNotMatch(guide.split('\n')[0], /READY TO RUN/i);
+});
+
+// ── Pacing must not be paid during validation ────────────────────────────
+test('pacing: validation does not pay the think time a load run keeps', () => {
+    // Generated pacing timers hold their delay in a JMeter PROPERTY whose
+    // default is the recorded value, so the shipped script paces realistically
+    // while the agent's own correctness runs set it to zero. Measured with real
+    // JMeter: ONE timer cost 18s of wall clock per run (22.2s -> 4.1s), and a
+    // real flow carries ~9 of them.
+    const { bodyCaptureProperties } = require('../src/runner')._internal;
+    const props = bodyCaptureProperties({});
+    assert.equal(props['perfscript.thinkTime'], '0', 'validation sleeps for nothing otherwise');
+    assert.equal(props['perfscript.thinkTimeRange'], '0');
+});
+
+test('size assertion: "non-empty download" must not mean "size >= 0"', () => {
+    const { repairTautologicalSizeAssertions } = require('../src/transforms');
+    // What the engine emits: >= 0, which is true of every response including a
+    // zero-byte one — the exact case the assertion is named for.
+    const tautology = `<SizeAssertion testname="Assert: Non-empty download" enabled="true">
+        <stringProp name="SizeAssertion.size">0</stringProp>
+        <intProp name="SizeAssertion.operator">5</intProp>
+      </SizeAssertion>`;
+    const fixed = repairTautologicalSizeAssertions(tautology);
+    assert.equal(fixed.repaired, 1);
+    assert.match(fixed.xml, /<intProp name="SizeAssertion\.operator">3<\/intProp>/, '> 0, i.e. actually non-empty');
+    assert.match(fixed.xml, /<stringProp name="SizeAssertion\.size">0<\/stringProp>/, 'the threshold itself is unchanged');
+
+    // A deliberate assertion is left alone.
+    const deliberate = `<SizeAssertion testname="at least 1KB" enabled="true">
+        <stringProp name="SizeAssertion.size">1024</stringProp>
+        <intProp name="SizeAssertion.operator">5</intProp>
+      </SizeAssertion>`;
+    assert.equal(repairTautologicalSizeAssertions(deliberate).repaired, 0);
+    assert.equal(repairTautologicalSizeAssertions('<jmeterTestPlan/>').repaired, 0);
 });

@@ -1212,6 +1212,14 @@ function bodyCaptureMode(runCfg = {}) {
 function bodyCaptureProperties(runCfg = {}) {
     const mode = bodyCaptureMode(runCfg);
     const props = {
+        // VALIDATION DOES NOT NEED THINK TIME. The generated pacing timers hold
+        // their delay in a JMeter property (see transforms.injectGaussianTimers)
+        // whose default is the recorded value, so the shipped script still paces
+        // realistically for a human — but the agent's correctness runs skip it.
+        // Measured: one timer = 18s of wall clock; a real flow has ~9, so every
+        // iteration was spending ~40s asleep proving nothing.
+        'perfscript.thinkTime': '0',
+        'perfscript.thinkTimeRange': '0',
         'jmeter.save.saveservice.output_format': 'xml',
         'jmeter.save.saveservice.samplerData': 'false',
         'jmeter.save.saveservice.responseHeaders': 'true',

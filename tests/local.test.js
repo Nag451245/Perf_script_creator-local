@@ -3512,14 +3512,34 @@ test('final green gate: operator soft-failure pattern extends the built-in body 
         rows: [{
             entryIndex: 0, label: 'Step 01 - GET /account', isTransaction: false,
             observedStatus: 200, success: true, recordedBodyLength: 10, observedBodyLength: 30,
-            recordedBody: '{"ok":true}', observedBody: '{"code":"ACCT_LOCKED"}',
+            // Deliberately wording that reads like ordinary content: it states
+            // no failure, so nothing but an operator pattern can object to it.
+            recordedBody: '{"ok":true}', observedBody: '{"code":"ACCT_TIER_B"}',
             entry: { response: { status: 200 } },
         }],
     };
     const clean = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence });
-    assert.strictEqual(clean.ok, true); // ACCT_LOCKED is not a built-in marker
-    const strict = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence, softFailurePatterns: ['ACCT_LOCKED'] });
-    assert.strictEqual(strict.ok, false);
+    assert.strictEqual(clean.ok, true, 'a body that states no failure is not a failure');
+    const strict = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence, softFailurePatterns: ['ACCT_TIER_B'] });
+    assert.strictEqual(strict.ok, false, 'the operator can still add their own marker');
+});
+
+test('final green gate: a status word the recording never returned IS caught without an operator pattern', () => {
+    // The counterpart to the test above, and the whole point of the recording
+    // comparison: nobody should have to predict their app's failure wording in
+    // advance. "ACCT_LOCKED" where the recording said {"ok":true} is a failed
+    // step, whether or not anyone listed it.
+    const evidence = {
+        rows: [{
+            entryIndex: 0, label: 'Step 01 - GET /account', isTransaction: false,
+            observedStatus: 200, success: true, recordedBodyLength: 11, observedBodyLength: 22,
+            recordedBody: '{"ok":true}', observedBody: '{"code":"ACCT_LOCKED"}',
+            entry: { response: { status: 200 } },
+        }],
+    };
+    const gate = finalGreenGate.evaluateFinalGreenGate({ result: { success: true }, evidence });
+    assert.strictEqual(gate.ok, false);
+    assert.ok(gate.categories.includes('business_error_in_body'));
 });
 
 test('runner: body-capture properties default to onError, honor off/full + byte cap', () => {
@@ -8507,4 +8527,56 @@ test('run list: a completed run reports samples, iterations and how long it took
     assert.equal(s.durationMs, 173000);
     assert.equal(s.startedAt, '2026-09-10T14:36:24.000Z');
     assert.equal(s.finishedAt, '2026-09-10T14:39:17.000Z');
+});
+
+// ── A 200 whose body says it failed must not count as a pass ─────────────
+test('false pass: a success status with a failure body is caught by comparing to the recording', () => {
+    const gate = require('../src/final-green-gate');
+    // Real body from a Logi Analytics report that answered HTTP 200. Every
+    // hardcoded soft-failure pattern misses it — "unable to authenticate" is
+    // not "unauthenticated", there is no error envelope, no SOAP fault. Nine
+    // EMRAnalytics steps were counted as passing while none rendered a report.
+    const failed = "<html><body onload='document.rdMessage.submit0;'><form name='rdMessage' " +
+        "Action='Redirect.jsp' method='POST' rdSecureKeyFailure='True'><input type='hidden' " +
+        "name='rdLogonFailMessage' value='Unable to authenticate the user. Missing rdSecureKey parameter.' />" +
+        '</form></body></html>';
+    const healthy = '<html><body><div id=rdReport>KPI Landing Page</div><table><tr><td>row</td></tr></table></body></html>';
+
+    const evidence = { rows: [
+        { entryIndex: 54, label: 'SC01_T04_/EMRAnalytics/rdPage.aspx-054', observedStatus: 200, success: true,
+            observedBody: failed, recordedBody: healthy, observedBodyLength: failed.length, recordedBodyLength: healthy.length },
+        { entryIndex: 62, label: 'SC01_T05_/EMRAnalytics/rdPage.aspx-062', observedStatus: 200, success: true,
+            observedBody: healthy, recordedBody: healthy, observedBodyLength: healthy.length, recordedBodyLength: healthy.length },
+    ] };
+
+    const out = gate.evaluateFinalGreenGate({ result: { success: true, samples: [] }, evidence });
+    assert.equal(out.ok, false, 'a run where a step never did its job is not green');
+    const found = (out.failures || []).find(f => f.category === 'business_error_in_body');
+    assert.ok(found, 'the false pass is a gate FAILURE, not a warning');
+    assert.match(found.reason, /rdPage\.aspx-054/, 'and it names the sampler');
+    assert.match(found.reason, /Missing rdSecureKey parameter/, 'quoting the server, not a guessed pattern');
+    // The healthy sibling with the same URL must NOT be flagged.
+    assert.doesNotMatch(found.reason, /-062/);
+});
+
+test('false pass: wording the recording ALSO returned is not a failure', () => {
+    const gate = require('../src/final-green-gate');
+    // The recording proves what healthy looks like here. An app whose normal
+    // page carries the phrase must not be gated on it, or the check becomes
+    // the brittle pattern list it replaced.
+    const body = '<html><body><div class="legend">Access is denied for unlicensed modules</div></body></html>';
+    const evidence = { rows: [
+        { entryIndex: 1, label: 'Step 01', observedStatus: 200, success: true,
+            observedBody: body, recordedBody: body, observedBodyLength: body.length, recordedBodyLength: body.length },
+    ] };
+    const out = gate.evaluateFinalGreenGate({ result: { success: true, samples: [] }, evidence });
+    assert.ok(!(out.failures || []).some(f => f.category === 'business_error_in_body'),
+        'unchanged wording proves nothing broke');
+
+    // With no recorded body there is nothing to compare, so it stays silent
+    // rather than guessing.
+    const noBaseline = gate.evaluateFinalGreenGate({ result: { success: true, samples: [] }, evidence: { rows: [
+        { entryIndex: 1, label: 'Step 01', observedStatus: 200, success: true, observedBody: body, recordedBody: '' },
+    ] } });
+    assert.ok(!(noBaseline.failures || []).some(f => f.marker === 'Access is denied'));
 });

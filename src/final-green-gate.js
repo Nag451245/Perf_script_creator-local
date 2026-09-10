@@ -20,6 +20,20 @@ const DEFAULT_SOFT_FAILURE_RES = [
     /"status"\s*:\s*"(?:error|failed|unauthorized|forbidden)"/i,
 ];
 
+/**
+ * Compare two stated reasons for meaning, not for bytes. Ids, dates, GUIDs and
+ * case differ between a recording and a live run without the MEANING changing,
+ * and a reason that only differs by a record number is the same reason.
+ */
+function normalizeReason(text) {
+    return String(text || '')
+        .toLowerCase()
+        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '#')
+        .replace(/\d{2,}/g, '#')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 function evaluateFinalGreenGate({
     result = {},
     baselineDiff = null,
@@ -193,6 +207,32 @@ function evaluateEvidenceGate(evidence, opts = {}) {
                     reason: `${row.label} returned status ${row.observedStatus || '?'} but its body contains an application-level failure (matched /${hit.source}/).`,
                     marker: hit.source,
                 });
+            }
+            // THE PATTERN LIST CANNOT KNOW YOUR APP'S WORDING. A Logi Analytics
+            // report handed back
+            //   rdSecureKeyFailure='True' ... 'Unable to authenticate the user.
+            //    Missing rdSecureKey parameter.'
+            // with HTTP 200, and every pattern above missed it, so nine
+            // EMRAnalytics steps were counted as passing while none of them
+            // rendered a report. Patterns are a guess; the RECORDING is
+            // evidence. If the live body states a failure reason that the
+            // recorded body for the SAME step did not, that step did not do its
+            // job — no app knowledge required.
+            const recordedBody = String(row.recordedBody || '');
+            if (recordedBody) {
+                const wasHealthy = new Set(semanticTriage.serverReasons(recordedBody).map(normalizeReason));
+                const nowStates = semanticTriage.serverReasons(observedBody)
+                    .filter(r => !wasHealthy.has(normalizeReason(r)));
+                if (nowStates.length) {
+                    businessErrors.push({
+                        index: row.entryIndex,
+                        sampler: row.label,
+                        reason: `${row.label} returned status ${row.observedStatus || '?'} but the server states a failure the recording never returned here: "${nowStates[0]}".`,
+                        marker: nowStates[0],
+                        serverStated: nowStates.slice(0, 4),
+                        provenBy: 'recording comparison',
+                    });
+                }
             }
         }
         if (isLogoutRow(row) && rowFailed(row)) {

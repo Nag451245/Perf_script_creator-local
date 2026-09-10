@@ -261,6 +261,32 @@ function writeHtmlReport(outDir, name, data = {}) {
     // What the SHIPPED SCRIPT checks for itself. The operator needs to see this
     // before running at load: an assertion they disagree with is one they can
     // delete in JMeter, and one they cannot see is one they will not trust.
+    // PASSED BUT WRONG. A sampler that returns 200 while the body says the step
+    // failed shows as a green tick in JMeter's tree, so the only way to find it
+    // was to click every sampler and read the response by hand. The gate
+    // already knows; this puts it on the first screen, with the server's own
+    // words and the response excerpt.
+    let falsePassSection = '';
+    const gate = data.greenGate || readJsonIfExists(path.join(outDir, `${name}_final_green_gate.json`));
+    const bodyFailures = gate && Array.isArray(gate.failures)
+        ? gate.failures.filter(f => f && (f.category === 'business_error_in_body' || f.category === 'auth_wall'))
+        : [];
+    if (bodyFailures.length) {
+        const rows = bodyFailures.flatMap(f => {
+            const items = Array.isArray(f.details) && f.details.length ? f.details : [f];
+            return items.slice(0, 25).map(d => `<tr>
+                <td><b>${esc(d.sampler || f.sampler || '')}</b></td>
+                <td>${esc(String(d.marker || d.reason || f.reason || '').slice(0, 200))}</td>
+            </tr>`);
+        }).join('');
+        falsePassSection = `<h2 style="border-top-color:#7a2230">⚠ Passed in JMeter, but the body says otherwise (${bodyFailures.length})</h2>
+            <p class="muted">These samplers returned a success status. Their response bodies state a failure the
+            recording never returned for that step, so the step did not do its job — JMeter's green tick is
+            measuring the status line, not the outcome. Check these before trusting any number from this run.</p>
+            <table><thead><tr><th>Sampler</th><th>What the server actually said</th></tr></thead>
+            <tbody>${rows}</tbody></table>`;
+    }
+
     let assertionSection = '';
     const assertionPlan = data.assertionPlan || readJsonIfExists(path.join(outDir, `${name}_assertions.json`));
     if (assertionPlan && Array.isArray(assertionPlan.assertions) && assertionPlan.assertions.length) {
@@ -431,6 +457,8 @@ details{border:1px solid #d9e2e1;border-radius:8px;margin:8px 0;background:#fff}
         : ' · <span class="badge neutral" title="No LLM was called. Generation, correlation and repair were deterministic and nothing left this machine.">NO_LLM</span>')}</div>
 
   ${actionBanner}
+
+  ${falsePassSection}
 
   <div class="grid">${cards}</div>
 

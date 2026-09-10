@@ -327,6 +327,7 @@ function readHarFingerprint(file) {
         if (!entries.length) return { ok: false, reason: 'HAR has no log.entries[] requests' };
         const sequence = [];
         const hosts = new Set();
+        const hostList = [];
         const urls = [];
         const uploadEndpoints = [];
         const downloadEndpoints = [];
@@ -337,7 +338,7 @@ function readHarFingerprint(file) {
             const method = String(req.method || 'GET').toUpperCase();
             let u;
             try { u = new URL(req.url || ''); } catch { u = null; }
-            if (u) hosts.add(u.hostname);
+            if (u) { hosts.add(u.hostname); hostList.push(u.hostname); }
             if (u) urls.push(u.toString());
             const pathPart = u ? u.pathname : req.url || '';
             sequence.push(`${method} ${pathPart}`);
@@ -359,6 +360,7 @@ function readHarFingerprint(file) {
             entries: entries.length,
             sequence,
             hosts: [...hosts].sort(),
+            primaryHost: primaryHostOf(hostList),
             firstBusinessUrl: urls[0] || '',
             lastBusinessUrl: urls[urls.length - 1] || '',
             uploadEndpoints,
@@ -394,9 +396,45 @@ function readSidecarFingerprint(file) {
     }
 }
 
+/**
+ * Hosts that are never the app under test. A browser recording is full of them,
+ * and they are what an alphabetical "hosts[0]" tends to pick.
+ */
+const THIRD_PARTY_HOST_RE = /gstatic|googleapis|google-analytics|googletagmanager|clients\d*\.google|doubleclick|pendo\.io|launchdarkly|dynatrace|newrelic|nr-data|sentry|segment\.(io|com)|hotjar|fullstory|mixpanel|amplitude|optimizely|cloudflareinsights|anthropic|mozilla|firefox|msftconnecttest|windowsupdate|bing\.com/i;
+
+/**
+ * WHICH HOST IS THIS RECORDING ACTUALLY OF? The unit list used to show
+ * `hosts[0]` — the alphabetically first host — so a WebPT script was labelled
+ * "api.anthropic.com" or "android.clients.google.com" purely by accident of
+ * sorting, and every recording in the picker looked like it belonged to some
+ * other app. Rank by how many requests each host carries, ignoring known
+ * telemetry/CDN hosts.
+ */
+function primaryHostOf(hostList = []) {
+    const tally = new Map();
+    for (const host of hostList) {
+        if (!host) continue;
+        tally.set(host, (tally.get(host) || 0) + 1);
+    }
+    const best = (skipThirdParty) => {
+        let name = '', count = 0;
+        for (const [host, n] of tally) {
+            if (skipThirdParty && THIRD_PARTY_HOST_RE.test(host)) continue;
+            if (n > count) { name = host; count = n; }
+        }
+        return name;
+    };
+    // If literally everything looked third-party, name the busiest host anyway
+    // rather than showing nothing.
+    return best(true) || best(false);
+}
+
 function fingerprintFromSamplers(samplers, type) {
     const sequence = [];
     const hosts = new Set();
+    // Kept WITH duplicates alongside the Set: primaryHostOf ranks by how many
+    // requests each host carries, which a Set has already thrown away.
+    const hostList = [];
     const urls = [];
     const uploadEndpoints = [];
     const downloadEndpoints = [];
@@ -406,7 +444,7 @@ function fingerprintFromSamplers(samplers, type) {
         const method = String(s.method || 'GET').toUpperCase();
         const pathPart = s.path || '/';
         sequence.push(`${method} ${pathPart}`);
-        if (s.host) hosts.add(s.host);
+        if (s.host) { hosts.add(s.host); hostList.push(s.host); }
         if (s.url) urls.push(s.url);
         if (s.files && s.files.length) {
             for (const name of s.files) referencedFilenames.add(path.basename(name));
@@ -424,6 +462,7 @@ function fingerprintFromSamplers(samplers, type) {
         entries: samplers.length,
         sequence,
         hosts: [...hosts].sort(),
+        primaryHost: primaryHostOf(hostList),
         firstBusinessUrl: urls[0] || '',
         lastBusinessUrl: urls[urls.length - 1] || '',
         uploadEndpoints,
@@ -723,6 +762,9 @@ function publicFingerprint(fp) {
         requestCount: fp.requestCount,
         sequence: fp.sequence,
         hosts: fp.hosts,
+        // The app under test, not whichever host sorts first. Without this the
+        // picker labelled every recording with a telemetry domain.
+        primaryHost: fp.primaryHost,
         firstBusinessUrl: fp.firstBusinessUrl,
         lastBusinessUrl: fp.lastBusinessUrl,
         uploadEndpoints: fp.uploadEndpoints,
@@ -1012,4 +1054,4 @@ function mergeUnitsAsDual(unitA, unitB) {
     };
 }
 
-module.exports = { groupInputs, loadUnit, analyzeInputFiles, writeIntakeArtifacts, mergeUnitsAsDual };
+module.exports = { groupInputs, loadUnit, analyzeInputFiles, writeIntakeArtifacts, mergeUnitsAsDual, _internal: { primaryHostOf } };

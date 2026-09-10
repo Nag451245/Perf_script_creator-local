@@ -40,6 +40,10 @@ function projectUnit(unit, analysis, rootDir) {
         golden: unit.golden,
         requestCount: fingerprints.reduce((max, fp) => Math.max(max, Number(fp.requestCount) || 0), 0),
         hosts: unique(fingerprints.flatMap(fp => fp.hosts || [])),
+        // The app under test. `hosts[0]` was alphabetical, so a WebPT script
+        // was labelled "api.anthropic.com" and looked like somebody else's.
+        primaryHost: primaryHostForUnit(fingerprints),
+        recording: recordingStateFor(unit),
         files: unitFiles.map(file => projectUnitFile(unit, file, rootDir)),
         runnable: true,
         warnings,
@@ -132,6 +136,48 @@ function unitId(unit) {
     return `${safeId(unit.kind)}-${safeId(unit.name)}-${safeId(path.basename(unit.primary || 'input'))}`;
 }
 
+/** The busiest non-telemetry host across the unit's files. */
+function primaryHostForUnit(fingerprints = []) {
+    const ranked = fingerprints
+        .filter(fp => fp && fp.primaryHost)
+        .sort((a, b) => (Number(b.requestCount) || 0) - (Number(a.requestCount) || 0));
+    return ranked.length ? ranked[0].primaryHost : '';
+}
+
+/**
+ * Does this unit have the response side, and does it need one?
+ *
+ * A HAR carries requests AND responses. A JMX carries only REQUESTS — without
+ * its recording XML/JTL there is nothing to correlate FROM, so every token and
+ * session id ships hardcoded and the script fails on the second run. The picker
+ * used to look identical either way, which is why "upload the XML for a JMX"
+ * was not obviously already possible.
+ */
+function recordingStateFor(unit) {
+    const kind = String(unit.kind || '');
+    if (kind === 'har' || kind === 'dual-har') {
+        return { needed: false, have: 2, of: 2, label: 'responses included' };
+    }
+    if (kind === 'dual-jmx') {
+        const sidecars = unit.sidecars || {};
+        const have = [sidecars.primary, sidecars.secondary].filter(Boolean).length;
+        return {
+            needed: true, have, of: 2,
+            label: have === 2 ? 'both recordings attached'
+                : have === 1 ? 'only 1 of 2 recordings — add the missing XML/JTL'
+                    : 'NO recordings — add the XML/JTL captured with these scripts',
+        };
+    }
+    if (kind === 'jmx') {
+        const have = unit.secondary ? 1 : 0;
+        return {
+            needed: true, have, of: 1,
+            label: have ? 'recording attached' : 'NO recording — add its XML/JTL',
+        };
+    }
+    return { needed: false, have: 0, of: 0, label: '' };
+}
+
 function roleForUnitFile(unit, file) {
     const key = pathKey(file);
     if (pathKey(unit.primary) === key) return 'primary';
@@ -176,5 +222,5 @@ module.exports = {
     buildInputModel,
     selectUnits,
     unitId,
-    _internal: { listInputFiles, projectUnit, filesForUnit, unitMatches },
+    _internal: { listInputFiles, projectUnit, filesForUnit, unitMatches, recordingStateFor, primaryHostForUnit },
 };

@@ -8128,3 +8128,94 @@ test('assertions: the whole pass can be turned off', () => {
     const plan = assertionPlanner.planAssertions({ entries, samplerNames: ['Step 01'], cfg: { enabled: false } });
     assert.deepEqual(plan.assertions, []);
 });
+
+// ── Input picker: name the app, and say when a JMX has no recording ──────
+test('input picker: the host shown is the app under test, not a telemetry host', () => {
+    const { _internal } = require('../src/ingest');
+    const primaryHostOf = _internal.primaryHostOf;
+
+    // A browser recording is mostly third-party noise. The picker used to show
+    // hosts[0] — ALPHABETICALLY first — so a WebPT script was labelled
+    // "api.anthropic.com" and looked like somebody else's file.
+    const hosts = [
+        'api.anthropic.com',
+        'android.clients.google.com', 'android.clients.google.com',
+        'app.pendo.io', 'app.pendo.io', 'app.pendo.io',
+        'stgapp.webpt.com', 'stgapp.webpt.com', 'stgapp.webpt.com', 'stgapp.webpt.com',
+        'stage-gateway.webpt.com',
+    ];
+    assert.equal(primaryHostOf(hosts), 'stgapp.webpt.com');
+    assert.notEqual([...hosts].sort()[0], 'stgapp.webpt.com', 'alphabetical really would pick the wrong one');
+
+    // Busiest wins among real hosts, even when a telemetry host has more calls.
+    assert.equal(primaryHostOf([
+        'app.pendo.io', 'app.pendo.io', 'app.pendo.io', 'app.pendo.io',
+        'shop.example.com', 'shop.example.com',
+    ]), 'shop.example.com');
+
+    // A recording that really is only third-party still names something rather
+    // than showing a blank label.
+    assert.equal(primaryHostOf(['app.pendo.io', 'app.pendo.io', 'cdn.gstatic.com']), 'app.pendo.io');
+    assert.equal(primaryHostOf([]), '');
+});
+
+test('input picker: a JMX without its recording XML says so', () => {
+    const { _internal } = require('../src/ui-inputs');
+    const recordingStateFor = _internal.recordingStateFor;
+
+    // A JMX holds only REQUESTS. Without the recording there is nothing to
+    // correlate from, so every token ships hardcoded — but the picker used to
+    // look identical either way.
+    const lonely = recordingStateFor({ kind: 'jmx', primary: 'a.jmx' });
+    assert.equal(lonely.needed, true);
+    assert.equal(lonely.have, 0);
+    assert.match(lonely.label, /NO recording/);
+
+    const paired = recordingStateFor({ kind: 'jmx', primary: 'a.jmx', secondary: 'a.xml' });
+    assert.equal(paired.have, 1);
+    assert.match(paired.label, /recording attached/);
+
+    // A dual-JMX pair needs TWO recordings; one is a half-blind run.
+    const half = recordingStateFor({ kind: 'dual-jmx', sidecars: { primary: 'a.xml' } });
+    assert.equal(half.have, 1);
+    assert.match(half.label, /only 1 of 2/);
+    const both = recordingStateFor({ kind: 'dual-jmx', sidecars: { primary: 'a.xml', secondary: 'b.xml' } });
+    assert.match(both.label, /both recordings attached/);
+
+    // A HAR carries its own responses — never nag about it.
+    assert.equal(recordingStateFor({ kind: 'har' }).needed, false);
+    assert.equal(recordingStateFor({ kind: 'dual-har' }).needed, false);
+});
+
+test('input picker: every JMX in the folder becomes a selectable unit', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const { buildInputModel } = require('../src/ui-inputs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'picker_'));
+
+    // A JMX that fails to fingerprint would silently vanish from the picker,
+    // which reads to the operator as "the agent is not picking up my scripts".
+    const jmx = `<?xml version="1.0"?><jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /home" enabled="true">
+        <stringProp name="HTTPSampler.domain">shop.example.com</stringProp>
+        <stringProp name="HTTPSampler.path">/home</stringProp>
+        <stringProp name="HTTPSampler.method">GET</stringProp>
+      </HTTPSamplerProxy><hashTree/>
+    </hashTree></jmeterTestPlan>`;
+    fs.writeFileSync(path.join(dir, 'Alpha.jmx'), jmx);
+    fs.writeFileSync(path.join(dir, 'Beta.jmx'), jmx.replace('/home', '/basket'));
+
+    const model = buildInputModel(dir);
+    const names = model.units.map(u => u.name);
+    // Every script is selectable. Two captures of a similar flow also get
+    // offered as a paired unit, but neither script may DISAPPEAR from the
+    // picker — a missing script reads as "the agent didn't pick up my file".
+    assert.ok(names.includes('Alpha'), 'Alpha is offered');
+    assert.ok(names.includes('Beta'), 'Beta is offered');
+    for (const u of model.units) {
+        assert.equal(u.primaryHost, 'shop.example.com', 'labelled with the app, not a CDN');
+        assert.ok(u.requestCount > 0, 'a unit showing 0 requests reads as a broken file');
+        assert.equal(u.recording.have, 0, 'neither has a recording XML...');
+        assert.match(u.recording.label, /NO recording/i, '...and the picker says so');
+    }
+});

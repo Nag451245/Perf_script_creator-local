@@ -180,7 +180,10 @@ button:disabled{opacity:.4;cursor:not-allowed}
     <section class="card">
       <div class="card-h"><h2>Input recordings</h2><span id="input-count" class="count">0</span></div>
       <div class="card-b">
-        <div id="drop" class="drop">Drop <b>HAR</b>, <b>JMX</b>, <b>XML</b>, or <b>JTL</b> files &mdash; or click to browse</div>
+        <div id="drop" class="drop">Drop <b>HAR</b>, <b>JMX</b>, <b>XML</b>, or <b>JTL</b> files &mdash; or click to browse
+          <div class="hint" style="margin-top:6px;font-weight:400">A <b>JMX needs its recording</b> (.xml / .jtl):
+          a JMX holds only requests, so without responses there is nothing to correlate from. Drop both &mdash;
+          they are paired by request sequence, so the filenames do not have to match.</div></div>
         <input id="file" type="file" multiple style="display:none">
         <div class="field" style="margin-top:12px">
           <label>Recording 1 &mdash; primary</label>
@@ -322,7 +325,22 @@ function qa(s){return Array.prototype.slice.call(document.querySelectorAll(s))}
 function esc(s){return String(s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
 async function j(url,opt){var r=await fetch(url,opt||{});var d=await r.json();if(!r.ok)throw new Error(d.error||r.statusText);return d}
 function selectedInputs(){return [q('#rec1').value,q('#rec2').value].filter(Boolean)}
-function unitFilesHtml(u){if(!u)return '';return (u.files||[]).map(function(f){return '<b>'+esc(f.role)+'</b>: '+esc(f.name)}).join('<br>');}
+function unitFilesHtml(u){
+ if(!u)return '';
+ var rows=(u.files||[]).map(function(f){
+  var role=f.role==='sidecar'?'recording':f.role;
+  return '<b>'+esc(role)+'</b>: '+esc(f.name);
+ }).join('<br>');
+ var r=u.recording;
+ if(r&&r.label){
+  var missing=r.needed&&r.have<r.of;
+  rows+='<div style="margin-top:6px;color:'+(missing?'var(--warn)':'var(--accent)')+'">'
+   +(missing?'⚠ ':'✓ ')+esc(r.label)
+   +(missing?'<br><span style="color:var(--mut)">Drop the .xml / .jtl captured with this script into the box above — it is matched to this JMX by its request sequence, so the filename does not have to match.</span>':'')
+   +'</div>';
+ }
+ return rows;
+}
 function updateSelected(){
   var ins=selectedInputs();
   q('#selected-pill').textContent=ins.length+' selected';
@@ -359,10 +377,15 @@ async function refresh(){
  updateSelected();return s;
 }
 function unitLabel(u){
- var host=(u.hosts||[])[0]?' · '+u.hosts[0]:'';
+ // The app under test, not whichever host sorted first — that showed WebPT
+ // scripts as "api.anthropic.com" and made them look like the wrong files.
+ var h=u.primaryHost||(u.hosts||[])[0];
+ var host=h?' · '+h:'';
  var lead=u.individual?'↳ ':'';
  var tail=u.individual&&u.derivedFrom?', single run of '+u.derivedFrom:'';
- return lead+u.name+'  ['+u.kind+', '+(u.requestCount||0)+' req'+(u.golden?', golden':'')+tail+host+']';
+ // A JMX with no recording XML cannot be correlated. Say so in the picker.
+ var rec=u.recording&&u.recording.needed&&u.recording.have<u.recording.of?', ⚠ NO RECORDING XML':'';
+ return lead+u.name+'  ['+u.kind+', '+(u.requestCount||0)+' req'+(u.golden?', golden':'')+rec+tail+host+']';
 }
 function fillSelect(sel,units,keep,firstLabel){
  var prev=sel.value;

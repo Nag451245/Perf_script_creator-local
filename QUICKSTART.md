@@ -184,6 +184,15 @@ right-click the request list → **Save all as HAR with content**. Record it twi
   normal output folder stays readable because `successArchive.keepOriginals` is
   true by default.
 
+The script ships with **Response Assertions already in it**, so running it at
+load in JMeter catches a login page or an error page served with a 200 — not
+just a non-2xx status. Open the *Assertions* section of the report to see
+exactly what each step checks. Text is only asserted as "must contain" when both
+recordings returned it there, so a second recording buys you real content
+checks; with one recording you get failure-text checks only. Anything you
+disagree with can be deleted in JMeter, or switch the pass off with
+`run.assertions.enabled: false`.
+
 ---
 
 ## F. When Validate shows failures

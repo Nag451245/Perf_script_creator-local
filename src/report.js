@@ -258,6 +258,26 @@ function writeHtmlReport(outDir, name, data = {}) {
 
     // Correlation table: which variables came from where, and how. Counts
     // alone don't help a reviewer decide if the correlations are sound.
+    // What the SHIPPED SCRIPT checks for itself. The operator needs to see this
+    // before running at load: an assertion they disagree with is one they can
+    // delete in JMeter, and one they cannot see is one they will not trust.
+    let assertionSection = '';
+    const assertionPlan = data.assertionPlan || readJsonIfExists(path.join(outDir, `${name}_assertions.json`));
+    if (assertionPlan && Array.isArray(assertionPlan.assertions) && assertionPlan.assertions.length) {
+        const rows = assertionPlan.assertions.map(a => `<tr>
+            <td>${esc(a.label || a.path)}</td>
+            <td>${a.positive.length ? a.positive.map(t => `<code>${esc(t)}</code>`).join(' + ') : '<span class="muted">—</span>'}</td>
+            <td>${a.negative.length ? `${a.negative.length} failure phrase(s)` : '<span class="muted">—</span>'}</td>
+            <td>${a.proven ? 'both recordings' : '<span class="muted">error text only</span>'}</td>
+        </tr>`).join('');
+        assertionSection = `<h2>Assertions in the shipped script (${assertionPlan.assertions.length} step(s))</h2>
+            <p class="muted">These run inside JMeter, so a load run catches an auth wall or an error page
+            served with a 200 — not just a non-2xx status. "Must contain" text is only asserted where BOTH
+            recordings returned it for that step and the login page does not also carry it.</p>
+            <table><thead><tr><th>Step</th><th>Must contain</th><th>Must not contain</th><th>Proven by</th></tr></thead>
+            <tbody>${rows}</tbody></table>`;
+    }
+
     let correlationSection = '';
     if (Array.isArray(correlations) && correlations.length) {
         const rows = correlations.slice(0, 200).map(c => {
@@ -431,6 +451,8 @@ details{border:1px solid #d9e2e1;border-radius:8px;margin:8px 0;background:#fff}
   ${failures.length ? `<h2>Failures (${failures.length})</h2><ul>${failures.map(f => `<li><b>${esc(f.label || f.name)}</b>${firstPresent(f.transactionName, f.transaction, f.parentTransaction, '') ? ` <span class="muted">in ${esc(firstPresent(f.transactionName, f.transaction, f.parentTransaction, ''))}</span>` : ''} — ${esc(f.responseCode || '')} ${esc(f.responseMessage || f.failureMessage || '')}</li>`).join('')}</ul>` : ''}
 
   ${dualHarSection}
+
+  ${assertionSection}
 
   ${correlationSection}
 

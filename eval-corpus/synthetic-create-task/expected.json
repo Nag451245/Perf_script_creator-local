@@ -1,10 +1,18 @@
 {
-  "_comment": "Synthetic login+create-task flow. Pins the agent's JUDGMENT: form-input correlation fires, the Next.js playbook disables build-data, the outcome probe lands on the echoing read, and no orphan variables ship.",
+  "_comment": "Synthetic login+create-task flow. Pins the agent's JUDGMENT: form-input correlation fires, the Next.js playbook disables build-data, the outcome probe lands on the echoing read, and no orphan variables ship. Also pins that every business step ships a failure-text assertion, so an error page served with a 200 fails in JMeter itself.",
   "stats": {
-    "samplers": { "min": 4, "max": 6 },
+    "samplers": {
+      "min": 4,
+      "max": 6
+    },
     "formCorrelations": 1,
     "orphans": 0,
-    "parameterized": { "min": 1 },
-    "outcomeProbe.injected": 1
+    "parameterized": {
+      "min": 1
+    },
+    "outcomeProbe.injected": 1,
+    "assertions": {
+      "min": 3
+    }
   }
 }

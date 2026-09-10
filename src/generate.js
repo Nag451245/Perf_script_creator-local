@@ -37,6 +37,7 @@ const seniorPe = require('./senior-pe');
 const playbooks = require('./playbooks');
 const scenario = require('./scenario');
 const outcomeProbe = require('./outcome-probe');
+const assertionPlanner = require('./assertion-plan');
 const redirectHops = require('./redirect-hops');
 const foldSafetyModule = require('./fold-safety');
 const renderedRequestCheck = require('./rendered-request-check');
@@ -1222,22 +1223,65 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         formCorr.wired.map(w => `${w.input} produced by "${w.producerSampler}" (recorded page body carries the hidden input; later requests consume it)`).join('; '),
         `emitted CSS extractor per producer + substituted \${var} at ${formCorr.wired.reduce((n, w) => n + w.substitutions, 0)} consumer field(s)`);
 
-    // Generic mined page-text assertions are opt-in. They catch false-200 pages,
-    // but they also overfit titles/headings such as "WebPT Dashboard" and made
-    // previously valid scripts red after routine copy/layout changes. Business
-    // outcome probe + strict business guard remain enabled by default.
-    const assertInj = runCfg.mineAssertions === true
-        ? injectAssertionsFromMined(xml, flat, corrs.map(c => c.value).filter(Boolean))
-        : { xml, injected: 0 };
+    // The engine's generic page-text miner stays OFF. It asserted whatever text
+    // it found in one capture, overfitted headings like "WebPT Dashboard", and
+    // turned working scripts red after routine copy changes — which is why it
+    // was disabled and why the shipped scripts had no assertions at all.
+    if (runCfg.mineAssertions === true) {
+        const legacy = injectAssertionsFromMined(xml, flat, corrs.map(c => c.value).filter(Boolean));
+        xml = legacy.xml;
+        if (legacy.injected) note('assertions',
+            `${legacy.injected} sampler(s) got LEGACY mined text assertions (run.mineAssertions=true)`,
+            'single-capture page text — brittle by nature',
+            'prefer the evidence-based assertions below; this switch exists for back-compat');
+    }
+
+    // Evidence-based assertions — see src/assertion-plan.js. This is the pass
+    // that puts the agent's own body-truth into the artifact, so the operator
+    // running the JMX at 50 users gets the same protection the agent had.
+    const assertionCfg = runCfg.assertions || {};
+    const samplerNamesForAssert = indexSamplersForGenerate(xml).map(s => s.name);
+    // The same set the strict guard protects at run time — those are the steps
+    // that carry the business, so they are the ones that get asserted first
+    // when the cap bites.
+    let businessGuardLabels = null;
+    try {
+        businessGuardLabels = require('./business-guard')
+            .buildBusinessGuard({ xml, flowName: name, runCfg }).protectedNames;
+    } catch { /* non-fatal: ranking falls back to recording evidence alone */ }
+    const assertionPlan = assertionPlanner.planAssertions({
+        entries: flat,
+        secondaryEntries: opts.secondaryEntries || [],
+        samplerNames: samplerNamesForAssert,
+        // Never assert on a value the run already treats as per-user: a
+        // correlated token or a CSV column is different on every thread.
+        excludedValues: [
+            ...corrs.map(c => c.value).filter(Boolean),
+            ...params.map(p => p.originalValue).filter(Boolean),
+        ],
+        businessLabels: businessGuardLabels,
+        cfg: assertionCfg,
+    });
+    const assertInj = assertionPlanner.injectAssertions(xml, assertionPlan.assertions);
     xml = assertInj.xml;
-    if (assertInj.injected) note('assertions',
-        `${assertInj.injected} sampler(s) had stable response text to assert on`,
-        `mined HTML titles / JSON status keys / page headings from recording`,
-        `injected ResponseAssertion (substring, OR) per sampler`);
-    if (runCfg.mineAssertions !== true) note('assertions',
-        'mined text assertions disabled by default',
-        'separate brittle page text from real flow breakage',
-        'no mined ResponseAssertions injected (outcome probe and business guard still verify)');
+    // The operator has to be able to SEE what the script now checks — an
+    // assertion they cannot review is one they will not trust, and one they
+    // disagree with is one they should be able to delete in JMeter.
+    if (assertionPlan.assertions.length) {
+        try {
+            fs.writeFileSync(path.join(outDir, `${name}_assertions.json`), JSON.stringify(assertionPlan, null, 2));
+        } catch { /* non-fatal: the assertions are in the JMX either way */ }
+    }
+    if (assertInj.injected) {
+        const proven = assertionPlan.assertions.filter(a => a.positive.length).length;
+        note('assertions',
+            `${assertInj.injected} step(s) now assert their own success (${assertInj.elements} assertion element(s))`,
+            proven
+                ? `${proven} step(s) assert content BOTH recordings returned there; every asserted step also rejects failure text the recording never contained`
+                : 'failure-text and login-page checks only — no content marker was provable for these steps',
+            'the script no longer passes on HTTP status alone: an auth wall, an error page or a wrong response fails the step in JMeter itself');
+    }
+    for (const n of assertionPlan.notes) note('assertions', n, '', '');
 
     // Outcome probe: the recording shows some later read ECHOES the value the
     // business mutation submitted. Assert that echo so "every request 200s

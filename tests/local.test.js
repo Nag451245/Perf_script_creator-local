@@ -7919,3 +7919,212 @@ test('output organizer: run.diagnostics="full" keeps the machine-only artifacts'
     assert.ok(fs.existsSync(path.join(dir, 'evidence', 'lineage.json')), 'full keeps internal dumps');
     fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ── Response assertions: the discipline a manual PE applies ──────────────
+const assertionPlanner = require('../src/assertion-plan');
+
+/** Minimal recorded entry helper. */
+function assertEntry(url, body, { status = 200, mime = 'text/html', method = 'GET' } = {}) {
+    return {
+        request: { method, url, headers: [] },
+        response: { status, content: { mimeType: mime, text: body } },
+    };
+}
+
+test('assertions: content markers need BOTH recordings to agree', () => {
+    // A three-step flow captured twice. Each step's own keys are the same in
+    // both captures; every VALUE differs (different user, different session,
+    // different day). `requestId` is on every step, so it is boilerplate and
+    // proves nothing about which step you are looking at.
+    const json = { mime: 'application/json' };
+    const summary = (id, tok, day) => `{"requestId":"r-${id}","accountId":"${id}","balance":100,"sessionToken":"${tok}","asOf":"${day}"}`;
+    const txns = (id, tok) => `{"requestId":"r-${id}","transactions":[],"pageSize":25,"sessionToken":"${tok}"}`;
+    const profile = (id, tok) => `{"requestId":"r-${id}","displayName":"x","preferences":{},"sessionToken":"${tok}"}`;
+
+    const rec1 = [
+        assertEntry('https://bank.test/api/summary', summary('A-1', 'aaa111', '2026-01-01'), json),
+        assertEntry('https://bank.test/api/txns', txns('A-1', 'aaa111'), json),
+        assertEntry('https://bank.test/api/profile', profile('A-1', 'aaa111'), json),
+    ];
+    const rec2 = [
+        assertEntry('https://bank.test/api/summary', summary('A-2', 'bbb222', '2026-02-09'), json),
+        assertEntry('https://bank.test/api/txns', txns('A-2', 'bbb222'), json),
+        assertEntry('https://bank.test/api/profile', profile('A-2', 'bbb222'), json),
+    ];
+
+    const plan = assertionPlanner.planAssertions({
+        entries: rec1, secondaryEntries: rec2,
+        samplerNames: ['Step 01 - GET /api/summary', 'Step 02 - GET /api/txns', 'Step 03 - GET /api/profile'],
+    });
+    const summaryStep = plan.assertions.find(a => a.path === '/api/summary');
+    assert.ok(summaryStep.positive.includes('"accountId"'));
+    assert.ok(summaryStep.positive.includes('"balance"'));
+    assert.ok(summaryStep.proven, 'both recordings vouch for this step');
+
+    // The VALUES differ between runs and must never be asserted.
+    assert.ok(!summaryStep.positive.some(t => /A-1|aaa111|2026-01-01/.test(t)),
+        'per-run values are never asserted — that is a red run tomorrow with nothing broken');
+    // A key every step carries cannot tell you the right step answered.
+    assert.ok(!summaryStep.positive.includes('"requestId"'), 'boilerplate present everywhere proves nothing');
+    // Each step asserts its OWN content.
+    assert.ok(plan.assertions.find(a => a.path === '/api/txns').positive.includes('"transactions"'));
+});
+
+test('assertions: a single recording proves nothing, so no content is asserted', () => {
+    const only = [assertEntry('https://bank.test/api/summary', '{"accountId":"A-1","balance":100}',
+        { mime: 'application/json' })];
+    const plan = assertionPlanner.planAssertions({ entries: only, samplerNames: ['Step 01'] });
+    assert.equal(plan.dualRecording, false);
+    assert.deepEqual(plan.assertions[0].positive, [], 'one capture cannot separate stable from lucky');
+    assert.ok(plan.assertions[0].negative.length, 'but failure text can still be rejected');
+    assert.match(plan.notes.join(' '), /only one recording/i);
+});
+
+test('assertions: a marker the login page also carries is rejected', () => {
+    // The auth wall serves the login page with a 200. A marker that appears on
+    // BOTH the real page and the login page cannot catch that — which is the
+    // failure this whole feature exists to catch.
+    const login = '<html><head><title>Sign in</title></head><body><h1>Acme Portal</h1>' +
+        '<form action="/login"><input type="password" name="pw"></form></body></html>';
+    const dash = '<html><head><title>Dashboard</title></head><body><h1>Acme Portal</h1>' +
+        '<div id="ledger">Statements</div></body></html>';
+
+    const rec1 = [assertEntry('https://acme.test/login', login), assertEntry('https://acme.test/home', dash)];
+    const rec2 = [assertEntry('https://acme.test/login', login), assertEntry('https://acme.test/home', dash)];
+    const plan = assertionPlanner.planAssertions({
+        entries: rec1, secondaryEntries: rec2, samplerNames: ['Step 01 - GET /login', 'Step 02 - GET /home'],
+    });
+
+    const home = plan.assertions.find(a => a.path === '/home');
+    assert.ok(!home.positive.includes('Acme Portal'),
+        'the brand string is on the login page too, so it cannot prove you are signed in');
+    assert.ok(home.negative.includes('Sign in'), 'after login, assert you are not back at the login page');
+
+    const loginStep = plan.assertions.find(a => a.path === '/login');
+    if (loginStep) {
+        assert.ok(!loginStep.negative.includes('Sign in'), 'the login page is allowed to be the login page');
+    }
+});
+
+test('assertions: an error phrase the healthy response already contains is dropped', () => {
+    const { usableErrorMarkers } = assertionPlanner._internal;
+    // This app's working page genuinely renders "Access Denied" in a legend.
+    // Asserting NotContains would fail every run.
+    const healthy = '<html><body>Legend: Access Denied = no permission</body></html>';
+    const usable = usableErrorMarkers([healthy]);
+    assert.ok(!usable.includes('Access Denied'), 'never gate on wording the recording proves is normal here');
+    assert.ok(usable.includes('Invalid login'), 'the rest of the list still applies');
+});
+
+test('assertions: only real business responses are asserted on', () => {
+    const { isAssertable } = assertionPlanner._internal;
+    const html = '<html><body>a real page with enough content</body></html>';
+
+    assert.ok(isAssertable(assertEntry('https://app.test/home', html)).ok);
+    // A recorded 3xx replays as a FOLLOWED redirect — the body JMeter sees is
+    // the destination's, so asserting the hop's recorded body is a false red.
+    assert.ok(!isAssertable(assertEntry('https://app.test/go', html, { status: 302 })).ok);
+    assert.ok(!isAssertable(assertEntry('https://app.test/a.css', 'body{}', { mime: 'text/css' })).ok);
+    assert.ok(!isAssertable(assertEntry('https://app.test/logo.png', 'x', { mime: 'image/png' })).ok);
+    assert.ok(!isAssertable(assertEntry('https://www.google-analytics.com/collect', html)).ok);
+    assert.ok(!isAssertable(assertEntry('https://app.test/favicon.ico', html)).ok);
+    // An auto-submit SSO bridge: with redirects followed the replay lands past
+    // it, so anything asserted here fails on a CORRECT run.
+    const bridge = '<html><body><form action="/sso"><input type="hidden" name="SAMLResponse" value="x"></form>' +
+        '<script>document.forms[0].submit()</script></body></html>';
+    assert.ok(!isAssertable(assertEntry('https://app.test/sso', bridge)).ok);
+});
+
+test('assertions: emitted JMeter XML uses Substring, not the regex Contains', () => {
+    const { assertionElement } = assertionPlanner._internal;
+    // test_type 2 is "Contains" and JMeter treats it as a REGEX, so real page
+    // text with parentheses or dots matches something other than intended.
+    // 16 is Substring (literal); 20 is Substring+NOT.
+    const positive = assertionElement({ testname: 't', texts: ['Order (pending)'], negate: false, message: 'm', idPrefix: 'p' });
+    assert.match(positive, /<intProp name="Assertion.test_type">16<\/intProp>/);
+    assert.ok(positive.includes('Order (pending)'), 'literal text needs no escaping for a substring match');
+
+    const negative = assertionElement({ testname: 't', texts: ['Invalid login'], negate: true, message: 'm', idPrefix: 'n' });
+    assert.match(negative, /<intProp name="Assertion.test_type">20<\/intProp>/);
+
+    // XML-unsafe text must not break the plan file.
+    const escaped = assertionElement({ testname: 'a & b', texts: ['<b>"x"</b>'], negate: false, message: 'm', idPrefix: 'p' });
+    assert.ok(escaped.includes('&lt;b&gt;&quot;x&quot;&lt;/b&gt;'));
+    assert.ok(escaped.includes('testname="a &amp; b"'));
+    // JMeter's own property name carries this typo; matching it is required.
+    assert.ok(escaped.includes('collectionProp name="Asserion.test_strings"'));
+});
+
+test('assertions: correlated and CSV values are never asserted', () => {
+    const body = '{"csrf":"TOKEN-abc123","user":"NagendraPT","status":"ok"}';
+    const rec1 = [assertEntry('https://app.test/api/me', body, { mime: 'application/json' })];
+    const rec2 = [assertEntry('https://app.test/api/me', body, { mime: 'application/json' })];
+    const plan = assertionPlanner.planAssertions({
+        entries: rec1, secondaryEntries: rec2, samplerNames: ['Step 01'],
+        excludedValues: ['TOKEN-abc123', 'NagendraPT'],
+    });
+    const texts = plan.assertions[0].positive;
+    assert.ok(!texts.some(t => t.includes('TOKEN-abc123')), 'a correlated token differs per thread');
+    assert.ok(!texts.some(t => t.includes('NagendraPT')), 'a CSV value differs per thread');
+});
+
+test('assertions: they are actually written into the JMX under the right sampler', () => {
+    const xml = `<?xml version="1.0"?>
+<jmeterTestPlan><hashTree>
+  <HTTPSamplerProxy testname="Step 01 - GET /login" enabled="true">
+    <stringProp name="HTTPSampler.path">/login</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+  <HTTPSamplerProxy testname="Step 02 - GET /home" enabled="true">
+    <stringProp name="HTTPSampler.path">/home</stringProp>
+  </HTTPSamplerProxy><hashTree/>
+</hashTree></jmeterTestPlan>`;
+
+    const out = assertionPlanner.injectAssertions(xml, [
+        { samplerIndex: 1, path: '/home', positive: ['Statements'], negative: ['Invalid login'] },
+    ]);
+    assert.equal(out.injected, 1);
+    assert.equal(out.elements, 2, 'positive and negative are separate elements — NOT applies to the whole assertion');
+
+    // It must land under sampler 2, not sampler 1.
+    const homeIdx = out.xml.indexOf('Step 02 - GET /home');
+    assert.ok(out.xml.indexOf('Statements') > homeIdx, 'the assertion sits under the sampler it belongs to');
+    assert.ok(out.xml.indexOf('Invalid login') > homeIdx);
+    // The self-closed hashTree had to be expanded to hold it.
+    assert.match(out.xml.slice(homeIdx), /<hashTree>[\s\S]*ResponseAssertion[\s\S]*<\/hashTree>/);
+});
+
+test('assertions: a sampler/recording length mismatch stops rather than misplacing', () => {
+    // Placing by order is only safe while sampler N is entry N. Landing an
+    // assertion on the wrong request fails a healthy step — worse than none.
+    const entries = [
+        assertEntry('https://app.test/a', '<html><body>page a content here</body></html>'),
+        assertEntry('https://app.test/b', '<html><body>page b content here</body></html>'),
+        assertEntry('https://app.test/c', '<html><body>page c content here</body></html>'),
+    ];
+    const plan = assertionPlanner.planAssertions({ entries, samplerNames: ['Step 01', 'Step 02'] });
+    assert.ok(plan.assertions.every(a => a.samplerIndex < 2));
+    assert.match(plan.notes.join(' '), /alignment is partial/i);
+});
+
+test('assertions: business steps win the cap', () => {
+    const entries = [];
+    const names = [];
+    for (let i = 0; i < 6; i++) {
+        entries.push(assertEntry(`https://app.test/page${i}`, `<html><body>content for page ${i} here</body></html>`));
+        names.push(`Step 0${i} - GET /page${i}`);
+    }
+    const plan = assertionPlanner.planAssertions({
+        entries, samplerNames: names,
+        businessLabels: new Set(['Step 05 - GET /page5']),
+        cfg: { maxSamplers: 2 },
+    });
+    assert.equal(plan.assertions.length, 2);
+    assert.ok(plan.assertions.some(a => a.path === '/page5'), 'the business step is never the one dropped');
+    assert.match(plan.notes.join(' '), /left alone at the cap/);
+});
+
+test('assertions: the whole pass can be turned off', () => {
+    const entries = [assertEntry('https://app.test/home', '<html><body>enough content here</body></html>')];
+    const plan = assertionPlanner.planAssertions({ entries, samplerNames: ['Step 01'], cfg: { enabled: false } });
+    assert.deepEqual(plan.assertions, []);
+});

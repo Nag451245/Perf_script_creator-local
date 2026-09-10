@@ -168,9 +168,15 @@ to set things without command-line flags:
 - `run.allowJsr223` — default `false`; keep generated JMX Java-safe by stripping
   Groovy helpers. Set `true` only when you intentionally need JSR223 and have a
   compatible JMeter/Java runtime.
-- `run.mineAssertions` — default `false`; generic page-text assertions are
-  opt-in because titles/headings can drift. Business outcome probes and protected
-  sampler checks still run by default.
+- `run.assertions` — **on by default.** The shipped JMX carries real Response
+  Assertions, chosen the way an engineer chooses them by hand (see
+  "Assertions" below). `enabled: false` turns the pass off; `maxSamplers`
+  (default 25) caps how many steps get them; `errorMarkers` adds your own
+  must-never-appear phrases to the built-in list.
+- `run.mineAssertions` — default `false`, and leave it there. This is the OLD
+  generic text miner, kept only for back-compat: it asserts whatever text it
+  finds in a single capture, which overfits page titles and turns working
+  scripts red after a copy change. `run.assertions` replaces it.
 - `run.protectedCalls` / `run.disableCalls` — business samplers to protect, or
   intentional noise/plumbing to disable. `disableCalls` will not remove
   login/session/business producers unless `run.allowUnsafeDisableProtected`
@@ -191,6 +197,40 @@ to set things without command-line flags:
   CSV data is limited to business/user data, not auth/session/protocol values.
 
 Secrets can equivalently come from the environment (see `.env.example`).
+
+## Assertions
+The agent has always read response bodies to decide whether a run really
+passed — the auth-wall check, the outcome probe, the invariants gate. None of
+that used to travel with the script. You opened the JMX in JMeter, scaled it to
+50 users, and JMeter was back to judging HTTP status alone, which is how a login
+page served with a 200 becomes a green load test.
+
+The shipped script now carries that knowledge as real Response Assertions,
+picked the way an engineer picks them by hand:
+
+- **Only on business steps.** Not on a `.css`, a font, a beacon, a third-party
+  host, or a recorded 3xx hop (with redirects followed, JMeter sees the
+  destination's body, not the hop's).
+- **"Must contain" only where it is provable.** A marker is asserted only if
+  BOTH recordings of the flow returned it for that step — that is what makes it
+  stable business truth rather than one lucky capture — AND the login page does
+  not also carry it, or it could not catch the auth wall. Values that change per
+  user or per run (dates, ids, tokens, correlated values, CSV columns) are never
+  asserted. With a single recording, nothing is provable, so no content is
+  asserted and the report says so.
+- **"Must not contain" on every asserted step.** A spread of failure phrases —
+  one per failure mode: bad credentials, expired session, server error, stack
+  trace — each checked against the recording first, so wording your app
+  legitimately shows is never gated on.
+- **Substring, not Contains.** JMeter's "Contains" is a *regex*; page text with
+  `(`, `?` or `.` then matches something other than what was intended. These use
+  Substring (`test_type` 16, or 20 negated) — a literal compare.
+- **Named after the step**, so a failure in the JTL points at a request, and
+  carrying a custom failure message that says what it means in business terms.
+
+`<name>_assertions.json` and the HTML report list exactly what is asserted, so
+you can review it — and delete anything you disagree with — before running at
+load.
 
 ## Verified Learning Store
 Agent mode now remembers only evidence-backed repairs. A lesson is saved after a

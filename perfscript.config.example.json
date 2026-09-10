@@ -83,7 +83,14 @@
     "_allowJsr223_comment": "Default false. Leave JSR223/Groovy helpers stripped for Java-safe JMXs. Set true only when you deliberately need generated Groovy helpers and have a compatible JMeter/Java runtime.",
     "allowJsr223": false,
 
-    "_mineAssertions_comment": "Default false. Generic page-text assertions are opt-in because titles/headings drift and can make otherwise valid load scripts red. Business outcome probe and protected business checks still run by default.",
+    "_assertions_comment": "ON by default. Puts real Response Assertions in the shipped JMX so a load run in JMeter catches an auth wall or an error page served with a 200 — not just a non-2xx status. Content is only asserted where BOTH recordings agree and the login page does not carry it; every asserted step also rejects failure text the recording never contained. errorMarkers adds your own must-never-appear phrases.",
+    "assertions": {
+      "enabled": true,
+      "maxSamplers": 25,
+      "errorMarkers": []
+    },
+
+    "_mineAssertions_comment": "Default false, and leave it there. The OLD generic text miner, kept for back-compat only: it asserts whatever text it finds in ONE capture, overfits page titles, and turns working scripts red after a copy change. run.assertions above replaces it.",
     "mineAssertions": false,
 
     "_protectedCalls_comment": "Optional business-critical samplers matched by testname/path substring. Protected calls must execute and cannot be disabled by repair.",

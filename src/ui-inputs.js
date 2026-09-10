@@ -7,11 +7,41 @@ const { analyzeInputFiles } = require('./ingest');
 function buildInputModel(inputDir) {
     const fullFiles = listInputFiles(inputDir);
     const analysis = analyzeInputFiles(fullFiles);
+    const units = (analysis.units || []).map(unit => projectUnit(unit, analysis, inputDir));
     return {
-        files: fullFiles.map(file => projectFile(file)),
-        units: (analysis.units || []).map(unit => projectUnit(unit, analysis, inputDir)),
+        // Every file, with what it is paired to. The picker only ever listed
+        // grouped UNITS, so a folder of 21 files showed 13 entries and the
+        // recording XMLs were nowhere — which reads as "my files were not
+        // picked up" even though they were consumed into the units.
+        files: fullFiles.map(file => projectFile(file, analysis, fullFiles)),
+        units,
         issues: (analysis.issues || []).map(issue => projectIssue(issue, inputDir)),
     };
+}
+
+/**
+ * Which script is this recording attached to, or which recording does this
+ * script have? Derived from the units the grouper actually built, so the panel
+ * shows the real pairing rather than a second guess at it.
+ */
+function pairingFor(file, analysis) {
+    const key = pathKey(file);
+    for (const unit of analysis.units || []) {
+        if (unit.individual) continue;   // the same files, listed twice
+        const sidecars = unit.sidecars || {};
+        if (pathKey(unit.primary) === key) {
+            const rec = sidecars.primary || (unit.kind === 'jmx' ? unit.secondary : '');
+            return { role: 'script', pairedWith: rec ? path.basename(rec) : '', unit: unit.name };
+        }
+        if (pathKey(unit.secondary) === key) {
+            if (unit.kind === 'jmx') return { role: 'recording', pairedWith: path.basename(unit.primary), unit: unit.name };
+            return { role: 'script', pairedWith: sidecars.secondary ? path.basename(sidecars.secondary) : '', unit: unit.name };
+        }
+        if (pathKey(sidecars.primary) === key) return { role: 'recording', pairedWith: path.basename(unit.primary), unit: unit.name };
+        if (pathKey(sidecars.secondary) === key) return { role: 'recording', pairedWith: path.basename(unit.secondary || unit.primary), unit: unit.name };
+        if (pathKey(unit.golden) === key) return { role: 'golden', pairedWith: path.basename(unit.primary), unit: unit.name };
+    }
+    return { role: 'unused', pairedWith: '', unit: '' };
 }
 
 function listInputFiles(inputDir) {
@@ -50,12 +80,19 @@ function projectUnit(unit, analysis, rootDir) {
     };
 }
 
-function projectFile(file) {
+function projectFile(file, analysis, allFiles) {
+    const ext = path.extname(file).toLowerCase();
+    const pairing = analysis ? pairingFor(file, analysis) : { role: 'unused', pairedWith: '' };
     return {
         name: path.basename(file),
         path: file,
         size: safeStat(file).size,
         mtime: safeStat(file).mtimeMs,
+        type: ext === '.har' ? 'har' : ext === '.jmx' ? 'jmx'
+            : (ext === '.xml' || ext === '.jtl') ? 'recording' : 'other',
+        role: pairing.role,
+        pairedWith: pairing.pairedWith,
+        unit: pairing.unit,
     };
 }
 

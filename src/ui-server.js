@@ -268,6 +268,16 @@ async function readJsonBody(req) {
     return JSON.parse(body.toString() || '{}');
 }
 
+/**
+ * The name a recording must have to be bound to a script by the deterministic
+ * stem rule in ingest.findSidecarFor: `<script stem>.recording.xml` (or .jtl).
+ */
+function recordingNameFor(jmxName, recordingName) {
+    const stem = path.basename(jmxName).replace(/\.jmx$/i, '');
+    const ext = /\.jtl$/i.test(recordingName) ? '.jtl' : '.recording.xml';
+    return `${stem}${ext}`;
+}
+
 function safeUploadName(name) {
     const base = path.basename(name || '');
     // Reject path components, and require a known input extension (allowlist).
@@ -351,11 +361,39 @@ const server = http.createServer(async (req, res) => {
             return send(res, 200, { ok: true });
         }
         if (p === '/api/upload' && req.method === 'POST') {
-            const name = safeUploadName(url.searchParams.get('name'));
+            let name = safeUploadName(url.searchParams.get('name'));
             if (!name) return send(res, 400, { error: 'unsupported or unsafe file type' });
+            // "Upload the recording FOR this JMX": name the file after the
+            // script so the deterministic stem match binds them, instead of
+            // leaving the operator hoping the content fingerprint agrees.
+            const attachTo = safeUploadName(url.searchParams.get('attachTo'));
+            if (attachTo && /\.jmx$/i.test(attachTo) && /\.(xml|jtl)$/i.test(name)) {
+                name = recordingNameFor(attachTo, name);
+            }
             const body = await readBody(req);
             fs.writeFileSync(path.join(INPUT, name), body);
             return send(res, 200, { ok: true, name, size: body.length });
+        }
+        // Bind an XML/JTL already in the folder to a specific JMX. Renaming to
+        // "<script stem>.recording.xml" is what makes the pairing deterministic
+        // and, more to the point, VISIBLE — the operator can see which
+        // recording belongs to which script instead of trusting a heuristic.
+        if (p === '/api/attach-recording' && req.method === 'POST') {
+            const body = await readJsonBody(req);
+            const jmx = safeUploadName(body.jmx);
+            const recording = safeUploadName(body.recording);
+            if (!jmx || !/\.jmx$/i.test(jmx)) return send(res, 400, { error: 'attach needs a .jmx file name' });
+            if (!recording || !/\.(xml|jtl)$/i.test(recording)) return send(res, 400, { error: 'attach needs an .xml or .jtl recording' });
+            const from = path.join(INPUT, recording);
+            if (!fs.existsSync(from)) return send(res, 404, { error: `${recording} is no longer in the input folder` });
+            if (!fs.existsSync(path.join(INPUT, jmx))) return send(res, 404, { error: `${jmx} is no longer in the input folder` });
+            const target = recordingNameFor(jmx, recording);
+            const to = path.join(INPUT, target);
+            if (path.resolve(from) !== path.resolve(to)) {
+                if (fs.existsSync(to)) return send(res, 409, { error: `${target} already exists — detach or remove it first` });
+                fs.renameSync(from, to);
+            }
+            return send(res, 200, { ok: true, jmx, recording: target });
         }
         if (p === '/api/input' && req.method === 'DELETE') {
             const name = path.basename(url.searchParams.get('name') || '');

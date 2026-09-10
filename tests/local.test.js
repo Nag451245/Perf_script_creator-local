@@ -8219,3 +8219,97 @@ test('input picker: every JMX in the folder becomes a selectable unit', () => {
         assert.match(u.recording.label, /NO recording/i, '...and the picker says so');
     }
 });
+
+// ── The files panel: every file, and how to attach a recording ───────────
+test('files panel: lists every file in input, with what it is paired to', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const { buildInputModel } = require('../src/ui-inputs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'files_'));
+
+    const jmx = `<?xml version="1.0"?><jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /home" enabled="true">
+        <stringProp name="HTTPSampler.domain">shop.example.com</stringProp>
+        <stringProp name="HTTPSampler.path">/home</stringProp>
+        <stringProp name="HTTPSampler.method">GET</stringProp>
+      </HTTPSamplerProxy><hashTree/>
+    </hashTree></jmeterTestPlan>`;
+    const recording = `<?xml version="1.0"?><testResults version="1.2">
+      <httpSample t="10" s="true" lb="Step 01 - GET /home" rc="200">
+        <java.net.URL>https://shop.example.com/home</java.net.URL>
+        <responseData class="java.lang.String">&lt;html&gt;home&lt;/html&gt;</responseData>
+      </httpSample></testResults>`;
+    fs.writeFileSync(path.join(dir, 'Alpha.jmx'), jmx);
+    fs.writeFileSync(path.join(dir, 'Alpha.recording.xml'), recording);
+    fs.writeFileSync(path.join(dir, 'Notes.pdf'), 'not a recording');
+
+    const model = buildInputModel(dir);
+    // The panel is FILE-level: grouping files into units is why a folder of 21
+    // files showed 13 entries and no recording XMLs at all.
+    assert.equal(model.files.length, 3, 'every file is listed, not just the units');
+    const byName = Object.fromEntries(model.files.map(f => [f.name, f]));
+
+    assert.equal(byName['Alpha.jmx'].type, 'jmx');
+    assert.equal(byName['Alpha.jmx'].pairedWith, 'Alpha.recording.xml', 'the script names its recording');
+    assert.equal(byName['Alpha.recording.xml'].type, 'recording');
+    assert.equal(byName['Alpha.recording.xml'].pairedWith, 'Alpha.jmx', 'and the recording names its script');
+    assert.equal(byName['Notes.pdf'].type, 'other');
+});
+
+test('files panel: an unpaired JMX and a loose recording are both visible as such', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const { buildInputModel } = require('../src/ui-inputs');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'loose_'));
+
+    // A JMX whose recording is not here, and a recording of a DIFFERENT flow:
+    // nothing should pair, and the panel has to say so rather than stay silent.
+    fs.writeFileSync(path.join(dir, 'Lonely.jmx'), `<?xml version="1.0"?><jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /a" enabled="true">
+        <stringProp name="HTTPSampler.domain">a.example.com</stringProp>
+        <stringProp name="HTTPSampler.path">/a</stringProp>
+        <stringProp name="HTTPSampler.method">GET</stringProp>
+      </HTTPSamplerProxy><hashTree/></hashTree></jmeterTestPlan>`);
+    fs.writeFileSync(path.join(dir, 'Unrelated.xml'), `<?xml version="1.0"?><testResults version="1.2">
+      <httpSample t="10" s="true" lb="Step 01 - GET /zzz" rc="200">
+        <java.net.URL>https://other.example.org/zzz</java.net.URL>
+        <responseData class="java.lang.String">x</responseData>
+      </httpSample></testResults>`);
+
+    const model = buildInputModel(dir);
+    const byName = Object.fromEntries(model.files.map(f => [f.name, f]));
+    assert.equal(byName['Lonely.jmx'].pairedWith, '', 'the script has no recording');
+    assert.equal(byName['Unrelated.xml'].role, 'unused', 'the recording belongs to no script here');
+});
+
+test('attach recording: renames to the stem the pairing rule looks for', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attach_'));
+    // The rule ingest.findSidecarFor checks FIRST is "<script stem>.recording.xml",
+    // so binding a recording to a script means giving it that name. That also
+    // makes the pairing visible in the folder instead of implied by a heuristic.
+    const nameFor = (jmx, rec) => {
+        const stem = path.basename(jmx).replace(/\.jmx$/i, '');
+        return `${stem}${/\.jtl$/i.test(rec) ? '.jtl' : '.recording.xml'}`;
+    };
+    assert.equal(nameFor('Scheduled_Visits.jmx', 'Some Loose Capture.xml'), 'Scheduled_Visits.recording.xml');
+    assert.equal(nameFor('Scheduled_Visits.jmx', 'results.jtl'), 'Scheduled_Visits.jtl');
+
+    // And once renamed, the grouper really does pair them.
+    fs.writeFileSync(path.join(dir, 'Flow.jmx'), `<?xml version="1.0"?><jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 01 - GET /x" enabled="true">
+        <stringProp name="HTTPSampler.domain">x.example.com</stringProp>
+        <stringProp name="HTTPSampler.path">/x</stringProp>
+        <stringProp name="HTTPSampler.method">GET</stringProp>
+      </HTTPSamplerProxy><hashTree/></hashTree></jmeterTestPlan>`);
+    fs.writeFileSync(path.join(dir, 'Flow.recording.xml'), `<?xml version="1.0"?><testResults version="1.2">
+      <httpSample t="10" s="true" lb="Step 01 - GET /x" rc="200">
+        <java.net.URL>https://x.example.com/x</java.net.URL>
+        <responseData class="java.lang.String">ok</responseData>
+      </httpSample></testResults>`);
+    const { buildInputModel } = require('../src/ui-inputs');
+    const unit = buildInputModel(dir).units.find(u => u.name === 'Flow');
+    assert.equal(unit.recording.have, 1, 'the renamed recording is picked up');
+    assert.match(unit.recording.label, /recording attached/);
+});

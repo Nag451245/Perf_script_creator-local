@@ -197,6 +197,16 @@ button:disabled{opacity:.4;cursor:not-allowed}
         </div>
         <div id="pair-status" class="hint" style="margin-top:2px"></div>
         <div id="input-issues"></div>
+        <!-- Every FILE in input/, not just the grouped units. A folder of 21
+             files showed 13 dropdown entries and no recording XMLs at all,
+             which reads as "my files were not picked up". -->
+        <div class="field" style="margin-top:14px">
+          <label style="display:flex;justify-content:space-between;align-items:center">
+            <span>Files in <code>input\\</code> <span id="file-count" class="count">0</span></span>
+            <button id="files-toggle" type="button" class="btn-soft" style="padding:2px 10px;font-size:11px">show</button>
+          </label>
+          <div id="file-list" class="unit-files" style="display:none;max-height:260px;overflow:auto"></div>
+        </div>
       </div>
     </section>
 
@@ -368,6 +378,7 @@ function phaseOf(txt){
 async function refresh(){
  var s=await j('/api/state');lastState=s;
  renderUnits(s.inputUnits||[]);renderIssues(s.inputIssues||[]);renderOutputs(s.outputs||[]);
+ renderFiles(s.inputFiles||[]);
  q('#input-count').textContent=(s.inputUnits||[]).length;
  var busy=!!s.busy;
  q('#busy-pill').className='badge '+(busy?'run':'ready');q('#busy-pill').innerHTML='<span class="dot '+(busy?'':'live')+'"></span>'+(busy?'Running':'Ready');
@@ -399,6 +410,62 @@ function renderUnits(units){
  fillSelect(q('#rec1'),units,true,units.length?'Select a recording…':'No recordings — drop files above');
  fillSelect(q('#rec2'),units,true,'None — run Recording 1 alone');
  updateSelected();
+}
+var allInputFiles=[];
+function kb(n){n=Number(n)||0;return n>1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB';}
+/**
+ * The file panel. Shows what each file IS and what it is paired to, and gives
+ * every unpaired JMX an explicit "attach the recording" control — the thing
+ * that was only ever possible by dropping a file and hoping the fingerprint
+ * matched.
+ */
+function renderFiles(files){
+ allInputFiles=files||[];
+ q('#file-count').textContent=allInputFiles.length;
+ var loose=allInputFiles.filter(function(f){return f.type==='recording'&&f.role!=='recording'});
+ var rows=allInputFiles.map(function(f){
+  var paired=f.pairedWith
+   ? '<span style="color:var(--mut)">&rarr; '+esc(f.pairedWith)+'</span>'
+   : (f.type==='jmx'
+     ? '<span style="color:var(--warn)">no recording</span>'
+     : (f.type==='har'?'<span style="color:var(--mut)">responses included</span>'
+       :(f.type==='recording'?'<span style="color:var(--warn)">not attached to any script</span>'
+         :'<span style="color:var(--mut)">not a recording</span>')));
+  var attach='';
+  if(f.type==='jmx'&&!f.pairedWith){
+   attach='<div style="margin:4px 0 8px 0">'
+    +'<select data-attach-for="'+esc(f.name)+'" style="max-width:62%;font-size:11px">'
+    +'<option value="">Attach a recording…</option>'
+    +loose.map(function(x){return '<option value="'+esc(x.name)+'">'+esc(x.name)+' ('+kb(x.size)+')</option>'}).join('')
+    +'</select> '
+    +'<button type="button" class="btn-soft" data-attach-go="'+esc(f.name)+'" style="padding:2px 8px;font-size:11px">Attach</button> '
+    +'<button type="button" class="btn-soft" data-attach-upload="'+esc(f.name)+'" style="padding:2px 8px;font-size:11px">Upload XML…</button>'
+    +'</div>';
+  }
+  return '<div style="padding:3px 0;border-bottom:1px solid #1c222c">'
+   +'<b>'+esc(f.name)+'</b> <span style="color:var(--mut)">'+esc(f.type)+' · '+kb(f.size)+'</span><br>'+paired
+   +'</div>'+attach;
+ }).join('');
+ q('#file-list').innerHTML=rows||'<div class="empty">input\\ is empty.</div>';
+ [].forEach.call(q('#file-list').querySelectorAll('[data-attach-go]'),function(b){
+  b.onclick=function(){
+   var jmx=b.getAttribute('data-attach-go');
+   var sel=q('#file-list').querySelector('[data-attach-for="'+jmx.replace(/"/g,'\\"')+'"]');
+   if(!sel||!sel.value){alert('Pick the .xml / .jtl recorded with '+jmx+' first, or use Upload XML.');return}
+   attachRecording(jmx,sel.value);
+  };
+ });
+ [].forEach.call(q('#file-list').querySelectorAll('[data-attach-upload]'),function(b){
+  b.onclick=function(){attachTarget=b.getAttribute('data-attach-upload');q('#file').click()};
+ });
+}
+var attachTarget='';
+async function attachRecording(jmx,recording){
+ try{
+  await j('/api/attach-recording',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({jmx:jmx,recording:recording})});
+  refresh();
+ }catch(e){alert('Could not attach: '+e.message)}
 }
 function renderIssues(issues){
  q('#input-issues').innerHTML=(issues||[]).filter(function(i){return i.severity==='error'||i.severity==='warning'}).slice(0,8)
@@ -530,7 +597,18 @@ function startPolling(id,reset){currentRunId=id;startedAt=Date.now();var since=0
   if(startedAt)q('#elapsed').textContent=Math.floor((Date.now()-startedAt)/1000)+'s elapsed';
   if(d.done){clearInterval(poll);poll=null;currentRunId=null;setChatEnabled(false);q('#progress').className='progress'+(d.code===0?'':' err');q('#progress i').style.width='100%';q('#phase').textContent=d.code===0?'Finished':'Finished — exit '+d.code;refresh()}
  },700)}
-async function upload(files){for(var i=0;i<files.length;i++){var f=files[i];await fetch('/api/upload?name='+encodeURIComponent(f.name),{method:'POST',body:await f.arrayBuffer()})}refresh()}
+async function upload(files){
+ for(var i=0;i<files.length;i++){
+  var f=files[i];
+  // "Upload XML…" on a specific script names the file after that script, so
+  // the pairing is deterministic instead of dependent on a content match.
+  var q2='/api/upload?name='+encodeURIComponent(f.name)
+   +(attachTarget&&/\.(xml|jtl)$/i.test(f.name)?'&attachTo='+encodeURIComponent(attachTarget):'');
+  await fetch(q2,{method:'POST',body:await f.arrayBuffer()});
+ }
+ attachTarget='';
+ refresh();
+}
 q('#run-selected').onclick=function(){run(false).catch(function(e){alert(e.message)})};
 q('#force-run').onclick=function(){run(true).catch(function(e){alert(e.message)})};
 q('#rerun-last').onclick=function(){rerunLast().catch(function(e){alert(e.message)})};
@@ -545,7 +623,15 @@ q('#copy-log').onclick=function(){navigator.clipboard&&navigator.clipboard.write
 q('#clear-log').onclick=function(){logText='';q('#log').textContent=''};
 q('#raw-log').onchange=renderLog;
 q('#chat-send').onclick=function(){sendChat()};q('#chat-input').onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();sendChat()}};
-var drop=q('#drop'),file=q('#file');drop.onclick=function(){file.click()};file.onchange=function(){upload(file.files)};
+q('#files-toggle').onclick=function(){
+ var el=q('#file-list'),open=el.style.display!=='none';
+ el.style.display=open?'none':'block';q('#files-toggle').textContent=open?'show':'hide';
+};
+var drop=q('#drop'),file=q('#file');
+// Clicking the drop zone is a general upload; only the per-script "Upload XML…"
+// button sets an attach target.
+drop.onclick=function(){attachTarget='';file.click()};
+file.onchange=function(){upload(file.files);file.value=''};
 drop.ondragover=function(e){e.preventDefault();drop.classList.add('hot')};drop.ondragleave=function(){drop.classList.remove('hot')};drop.ondrop=function(e){e.preventDefault();drop.classList.remove('hot');upload(e.dataTransfer.files)};
 refresh();loadCfg();setInterval(function(){if(!poll)refresh()},4000);
 </script>

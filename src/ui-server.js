@@ -85,6 +85,9 @@ function outputSummary(name) {
     if (runSummary) {
         summary.verdict = runSummary.verdict || '';
         summary.iterations = runSummary.iterations;
+        summary.startedAt = runSummary.startedAt;
+        summary.finishedAt = runSummary.finishedAt;
+        summary.durationMs = runSummary.durationMs;
         if (runSummary.validated) {
             summary.kind = 'validated';
             summary.total = Number(runSummary.total) || 0;

@@ -8483,3 +8483,28 @@ test('pacing: the recorded think time is NOT baked into the shipped script', () 
     assert.notEqual(cfgExample.run.pacing && cfgExample.run.pacing.enabled, true,
         'the example config does not switch pacing on');
 });
+
+test('run list: a completed run reports samples, iterations and how long it took', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const { writeRunSummary, readRunSummary } = require('../src/run-summary');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'timing_'));
+
+    const started = new Date('2026-09-10T14:36:24.000Z');
+    const finished = new Date('2026-09-10T14:39:17.000Z');
+    writeRunSummary(dir, {
+        validated: true, verdict: 'needs attention',
+        passed: 61, total: 61, failed: 0, iterations: 2, maxIterations: 3,
+        startedAt: started.toISOString(), finishedAt: finished.toISOString(),
+        durationMs: finished - started,
+    });
+
+    const s = readRunSummary(dir);
+    assert.equal(s.passed, 61);
+    assert.equal(s.total, 61);
+    assert.equal(s.iterations, 2);
+    assert.equal(s.maxIterations, 3, 'so "2 of up to 3" can be shown, not a bare 2');
+    assert.equal(s.durationMs, 173000);
+    assert.equal(s.startedAt, '2026-09-10T14:36:24.000Z');
+    assert.equal(s.finishedAt, '2026-09-10T14:39:17.000Z');
+});

@@ -239,6 +239,9 @@ function startRunProgressHeartbeat(outDir, rec) {
 
 async function processUnit(unit) {
     const name = safeName(unit.name);
+    // Wall clock for THIS flow, so the run list can say when it ran and how
+    // long it took without the operator digging through log timestamps.
+    const unitStartedAt = Date.now();
     const outDir = path.join(OUTPUT, name);
     fs.mkdirSync(outDir, { recursive: true });
     const lines = [];
@@ -401,7 +404,7 @@ async function processUnit(unit) {
                 });
                 const itersRun = Number(out.result.iterationsRun) || 0;
                 rec(`DONE — verdict=${verdict} · ` +
-                    `${passed}/${reqs.length} requests passed · ${itersRun} of up to ${MAX_ITER} iteration(s) · see the HTML report`);
+                    `${passed}/${reqs.length} requests passed · ${itersRun} of up to ${MAX_ITER} iteration(s) · took ${Math.round((Date.now() - unitStartedAt) / 1000)}s · see the HTML report`);
                 // "Fix iterations = 3" but it ran once. That is not the budget
                 // being ignored — the loop stops as soon as it has no further
                 // fix it is allowed to apply. Saying so is the difference
@@ -417,6 +420,9 @@ async function processUnit(unit) {
                 // generated" for a run that had really validated.
                 runSummary.writeRunSummary(outDir, {
                     validated: true,
+                    startedAt: new Date(unitStartedAt).toISOString(),
+                    finishedAt: new Date().toISOString(),
+                    durationMs: Date.now() - unitStartedAt,
                     verdict,
                     passed,
                     total: reqs.length,
@@ -496,6 +502,9 @@ async function processUnit(unit) {
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
         runSummary.writeRunSummary(outDir, {
             validated: false,
+            startedAt: new Date(unitStartedAt).toISOString(),
+            finishedAt: new Date().toISOString(),
+            durationMs: Date.now() - unitStartedAt,
             verdict: runAttemptError ? 'not verified' : 'generated',
             samplers: gen.stats.samplers,
             correlations: gen.stats.correlations,

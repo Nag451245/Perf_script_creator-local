@@ -413,6 +413,19 @@ function renderUnits(units){
 }
 var allInputFiles=[];
 function kb(n){n=Number(n)||0;return n>1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB';}
+// Local wall-clock, because the question is always "when did this run on MY
+// machine", not what an ISO string in UTC says.
+function clockTime(iso){try{var d=new Date(iso);return isNaN(d)?'':d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});}catch(e){return ''}}
+function humanDuration(ms){
+ ms=Number(ms)||0;
+ // A run that claims to have taken more than a day is a bad timestamp, not a
+ // long run. Show nothing rather than something wrong.
+ if(ms<=0||ms>86400000)return '';
+ if(ms<1000)return ms+'ms';
+ var s=Math.round(ms/1000);if(s<60)return s+'s';
+ var m=Math.floor(s/60),r=s%60;if(m<60)return m+'m '+r+'s';
+ return Math.floor(m/60)+'h '+(m%60)+'m';
+}
 /**
  * The file panel. Shows what each file IS and what it is paired to, and gives
  * every unpaired JMX an explicit "attach the recording" control — the thing
@@ -493,11 +506,15 @@ function paintHistory(){
   // many fix iterations it took. "0 samples" told the operator nothing about a
   // run that had really validated.
   var iters=o.iterations?' · '+o.iterations+' iteration'+(o.iterations===1?'':'s'):'';
+  // When it ran and how long it took — the operator was reading these off log
+  // timestamps by hand.
+  var when=o.startedAt?' · '+clockTime(o.startedAt)+(o.finishedAt?'→'+clockTime(o.finishedAt):'')
+   +(humanDuration(o.durationMs)?' ('+humanDuration(o.durationMs)+')':''):'';
   var meta=o.kind==='validated'
-   ?((o.passed||0)+'/'+(o.total||((o.passed||0)+(o.failed||0)))+' requests passed'+iters)
-   :((o.samplers||0)+' samplers · not run');
+   ?((o.passed||0)+'/'+(o.total||((o.passed||0)+(o.failed||0)))+' requests passed'+iters+when)
+   :((o.samplers||0)+' samplers · not run'+when);
   var stats=o.kind==='validated'
-   ?'<span class="chip" style="color:var(--ok)">'+(o.passed||0)+' passed</span><span class="chip" style="color:'+((o.failed||0)?'var(--bad)':'var(--mut)')+'">'+(o.failed||0)+' failed</span><span class="chip">'+(o.total||0)+' app reqs</span>'+(o.iterations?'<span class="chip">'+o.iterations+' iteration'+(o.iterations===1?'':'s')+'</span>':'')
+   ?'<span class="chip" style="color:var(--ok)">'+(o.passed||0)+' passed</span><span class="chip" style="color:'+((o.failed||0)?'var(--bad)':'var(--mut)')+'">'+(o.failed||0)+' failed</span><span class="chip">'+(o.total||0)+' app reqs</span>'+(o.iterations?'<span class="chip">'+o.iterations+' iteration'+(o.iterations===1?'':'s')+'</span>':'')+(humanDuration(o.durationMs)?'<span class="chip">took '+humanDuration(o.durationMs)+'</span>':'')+(o.startedAt?'<span class="chip" style="color:var(--mut)">'+clockTime(o.startedAt)+' → '+clockTime(o.finishedAt)+'</span>':'')
    :'<span class="chip">'+(o.samplers||0)+' samplers</span><span class="chip" style="color:var(--accent)">'+(o.correlations||0)+' correlations</span><span class="chip" style="color:var(--mut)">generate only — not executed</span>';
   var act='';
   if(o.report)act+='<a class="action primary" target="_blank" href="/out/'+encodeURIComponent(o.name)+'/'+encodeURIComponent(o.report)+'">Open report</a>';

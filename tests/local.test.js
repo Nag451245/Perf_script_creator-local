@@ -8580,3 +8580,19 @@ test('false pass: wording the recording ALSO returned is not a failure', () => {
     ] } });
     assert.ok(!(noBaseline.failures || []).some(f => f.marker === 'Access is denied'));
 });
+
+test('stale launcher: the UI notices when it is older than the files on disk', () => {
+    // A run spawns index.js fresh, so the AGENT is always current — but the
+    // server keeps serving the ui-*.js it read at startup. That combination
+    // shows a correct 61/61 run as "0 samplers · generated", which is
+    // indistinguishable from the agent being broken.
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui-server.js'), 'utf8');
+    assert.match(src, /SOURCE_MTIMES_AT_BOOT/, 'boot-time source mtimes are captured');
+    assert.match(src, /staleServer: staleServerCheck\(\)/, 'and reported on every state poll');
+    // index.js changing alone must NOT nag: the next run re-reads it anyway.
+    assert.match(src, /changed\.filter\(f => f !== 'index\.js'\)/);
+
+    const page = fs.readFileSync(path.join(__dirname, '..', 'src', 'ui-page.js'), 'utf8');
+    assert.match(page, /id="stale-server"/, 'the page has somewhere to show it');
+    assert.match(page, /s\.staleServer&&s\.staleServer\.stale/, 'and shows it when the server says so');
+});

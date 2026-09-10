@@ -130,10 +130,47 @@ function outputSummary(name) {
     return summary;
 }
 
+/**
+ * IS THIS LAUNCHER RUNNING THE CODE THAT IS ON DISK?
+ *
+ * A run spawns `node index.js` fresh, so the AGENT always picks up the latest
+ * code — but the server loaded ui-server.js/ui-page.js once at startup and
+ * keeps serving whatever it read then. After an update the runs are correct
+ * and the SCREEN is wrong, which is indistinguishable from the agent being
+ * broken: a completed 61/61 run reads "0 samplers · generated" because the row
+ * logic that knows how to show it is only in the newer file. That has now cost
+ * several runs to diagnose, so the launcher checks itself.
+ */
+const WATCHED_SOURCES = ['src/ui-server.js', 'src/ui-page.js', 'src/ui-inputs.js', 'src/run-summary.js', 'index.js'];
+const SOURCE_MTIMES_AT_BOOT = new Map(WATCHED_SOURCES.map(rel => {
+    try { return [rel, fs.statSync(path.join(ROOT, rel)).mtimeMs]; } catch { return [rel, 0]; }
+}));
+
+function staleServerCheck() {
+    const changed = [];
+    for (const [rel, bootMtime] of SOURCE_MTIMES_AT_BOOT) {
+        try {
+            if (fs.statSync(path.join(ROOT, rel)).mtimeMs > bootMtime) changed.push(rel);
+        } catch { /* deleted mid-session: not our problem to report */ }
+    }
+    // index.js alone changing is harmless — the next run re-reads it. Only the
+    // files THIS process is still holding in memory make the screen lie.
+    const inMemory = changed.filter(f => f !== 'index.js');
+    if (!inMemory.length) return null;
+    return {
+        stale: true,
+        files: changed,
+        message: 'This launcher is running older code than the files on disk'
+            + ` (${inMemory.join(', ')} changed since it started). Runs are still correct — they start a fresh process —`
+            + ' but what you see here may be out of date. Close this console and run START_AGENT.cmd again.',
+    };
+}
+
 function buildState() {
     const input = buildInputModel(INPUT);
     const activeRun = activeRunId ? runs.get(activeRunId) : null;
     return {
+        staleServer: staleServerCheck(),
         input,
         inputUnits: input.units,
         inputFiles: input.files,

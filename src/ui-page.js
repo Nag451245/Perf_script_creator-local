@@ -175,6 +175,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
   </div>
 </div>
 
+<div id="stale-server" style="display:none;margin:12px 16px 0;padding:12px 14px;border-radius:10px;
+  border:1px solid #7a5a1e;background:rgba(243,182,75,.12);color:#ffdc9a;font-size:13px"></div>
+
 <div class="shell">
   <aside class="col">
     <section class="card">
@@ -377,6 +380,11 @@ function phaseOf(txt){
 }
 async function refresh(){
  var s=await j('/api/state');lastState=s;
+ // An updated app whose launcher was never restarted shows correct runs on a
+ // stale screen — the most confusing state this UI can be in.
+ var st=q('#stale-server');
+ if(s.staleServer&&s.staleServer.stale){st.style.display='block';st.textContent='⚠ '+s.staleServer.message;}
+ else{st.style.display='none';}
  renderUnits(s.inputUnits||[]);renderIssues(s.inputIssues||[]);renderOutputs(s.outputs||[]);
  renderFiles(s.inputFiles||[]);
  q('#input-count').textContent=(s.inputUnits||[]).length;

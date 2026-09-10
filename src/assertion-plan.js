@@ -1,38 +1,33 @@
 'use strict';
 /**
- * assertion-plan.js — put real Response Assertions in the shipped JMX, chosen
- * the way a performance engineer chooses them by hand.
+ * assertion-plan.js — OPT-IN Response Assertions for the shipped JMX.
  *
- * WHY THIS EXISTS. The agent already refuses to call a run green when the body
- * is wrong: the auth-wall check, the outcome probe and the invariants gate all
- * read response bodies. But NONE of that travels with the script. The operator
- * opens 00_RUN_THIS_SCRIPT.jmx in JMeter, scales it to 50 users, and every one
- * of those protections is gone — JMeter is back to judging HTTP status alone,
- * which is exactly how a login page served with a 200 becomes a green load
- * test. Assertions are how that knowledge gets baked into the artifact.
+ * OFF BY DEFAULT, and it earned that. The first version ran automatically and
+ * put the SAME six failure phrases under every business step — 25 identical
+ * "Assert no failure text" nodes in one plan. As feedback from the operator who
+ * had to open it: "the whole JMX contains same assertions and they are
+ * useless." That was right on both counts:
  *
- * WHAT A MANUAL ENGINEER ACTUALLY DOES — the rules encoded below:
+ *   - No information. An assertion that is identical on every step cannot tell
+ *     you which step broke, and "Invalid login" under step 20 of a search flow
+ *     is decoration, not verification.
+ *   - Real cost. 25 steps x 6 substring patterns is ~175 extra scans of
+ *     multi-hundred-KB response bodies per iteration, paid on every thread of
+ *     every load run.
  *
- *   1. Assert on business steps, not on every request. Nobody asserts on a
- *      .css, a font, or a telemetry beacon.
- *   2. Pick a marker that proves THIS step. A brand string in the header
- *      appears on the login page too, so asserting it proves nothing and hides
- *      the auth wall. The marker has to discriminate.
- *   3. Never assert on something that changes per user or per run — a date, a
- *      record id, a session token, a name. That is a red run tomorrow morning
- *      with nothing broken.
- *   4. Always add the negative: the response must NOT contain "Invalid login",
- *      a stack trace, or a session-expired notice. This is the cheapest and
- *      most valuable assertion there is, and it is the one generated scripts
- *      never have.
- *   5. After login, assert you are NOT back on the login page.
+ * A performance engineer writes a handful of assertions, not a hundred. So when
+ * this IS turned on (run.assertions.enabled = true):
  *
- * WHERE THE CONFIDENCE COMES FROM. Rule 3 is the hard one, and guessing at it
- * is why the old generic text miner was turned off by default: it asserted page
- * titles that drifted. We do not guess. With two recordings, anything IDENTICAL
- * across both for the same step is provably stable — that is what invariants.js
- * mines, and it is a stronger basis than a human eyeballing one capture. With a
- * single recording we assert far less and say so.
+ *   1. Content only where two recordings PROVE the marker is stable, the login
+ *      page does not also carry it (or it cannot catch an auth wall), and it is
+ *      not a per-run value. One recording proves nothing, so it asserts nothing.
+ *   2. Failure-text checks ONLY on the step that submits credentials, where
+ *      "Invalid login" actually means the step failed.
+ *   3. Never on a static asset, a telemetry host, an auto-submit bridge page, or
+ *      a recorded 3xx (which replays as a followed redirect, so the body JMeter
+ *      sees is the destination's).
+ *   4. Capped at 8 steps by default. If it needs more than that, the check
+ *      belongs in the agent's gates, not stamped across the plan.
  *
  * JMETER DETAIL THAT MATTERS. `Assertion.test_type` 2 is "Contains", and
  * Contains treats the pattern as a REGULAR EXPRESSION. Any real page text with
@@ -47,7 +42,7 @@ const invariantsModule = require('./invariants');
 const SUBSTRING = 16;
 const NOT = 4;
 
-const DEFAULT_MAX_SAMPLERS = 25;
+const DEFAULT_MAX_SAMPLERS = 8;
 const MAX_POSITIVE_PER_SAMPLER = 3;
 const MAX_NEGATIVE_PER_SAMPLER = 6;
 
@@ -134,6 +129,19 @@ function isAssertable(entry) {
     if (body.length < 16) return { ok: false, why: 'response body too small to prove anything' };
     if (AUTO_SUBMIT_RE.test(body)) return { ok: false, why: 'auto-submit bridge page — the replay lands past it' };
     return { ok: true };
+}
+
+/**
+ * Is this the request that submits credentials? That is the one step where
+ * "Invalid login" is a real check rather than decoration.
+ */
+function isCredentialSubmit(entry) {
+    const method = String((entry && entry.request && entry.request.method) || '').toUpperCase();
+    if (method !== 'POST') return false;
+    const post = (entry.request && entry.request.postData) || {};
+    const sent = `${post.text || ''} ${((post.params || []).map(p => p.name).join(' '))}`;
+    if (/(^|[&"'{,_-])(password|passwd|pwd|passcode|credential)/i.test(sent)) return true;
+    return /\/(?:login|signin|sign-in|authenticate|authentication|session)s?(?:\.|\/|\?|$)/i.test(pathOf(entry));
 }
 
 /** Bodies in this recording that ARE the login page. */
@@ -224,7 +232,14 @@ function planAssertions({
     cfg = {},
 } = {}) {
     const notes = [];
-    if (cfg.enabled === false) return { assertions: [], notes: ['assertions disabled by run.assertions.enabled=false'], dualRecording: false };
+    // OFF unless asked for. Shipped on by default, this pass put the same six
+    // failure phrases under all 25 business steps of a script — identical
+    // assertions that told a reviewer nothing, and ~175 extra substring scans
+    // over multi-hundred-KB bodies on every iteration, which is real time at
+    // load. Assertion coverage is the operator's call, not a default.
+    if (cfg.enabled !== true) {
+        return { assertions: [], notes: [], dualRecording: false, disabled: true };
+    }
 
     const maxSamplers = Number.isFinite(Number(cfg.maxSamplers)) ? Math.max(1, Number(cfg.maxSamplers)) : DEFAULT_MAX_SAMPLERS;
     const dualRecording = Array.isArray(secondaryEntries) && secondaryEntries.length > 0;
@@ -280,13 +295,21 @@ function planAssertions({
         }
 
         // ── negative: what must never appear ─────────────────────────────
-        const recordedBodies = twinBody ? [body, twinBody] : [body];
-        const negative = usableErrorMarkers(recordedBodies, cfg.errorMarkers || []);
-        // "You are not back on the login page" — the assertion a human writes
-        // first and generators never write at all.
-        if (!isLoginPage && loginTitle && !body.includes(loginTitle) &&
-            (!twinBody || !twinBody.includes(loginTitle))) {
-            negative.unshift(loginTitle);
+        // ONLY on the step that submits credentials. The first version put the
+        // same six phrases under every business step: 25 identical assertions
+        // that distinguished nothing, cost a scan of every response body, and
+        // were the reason this pass got switched off. "Invalid login" means
+        // something on the login POST and nothing at all on step 20.
+        const negative = [];
+        if (isCredentialSubmit(entry)) {
+            const recordedBodies = twinBody ? [body, twinBody] : [body];
+            negative.push(...usableErrorMarkers(recordedBodies, cfg.errorMarkers || []));
+            // "You did not land back on the login page" — only meaningful right
+            // after signing in.
+            if (!isLoginPage && loginTitle && !body.includes(loginTitle) &&
+                (!twinBody || !twinBody.includes(loginTitle))) {
+                negative.unshift(loginTitle);
+            }
         }
 
         if (!positive.length && !negative.length) continue;
@@ -398,5 +421,5 @@ module.exports = {
     planAssertions,
     injectAssertions,
     ERROR_MARKERS,
-    _internal: { isAssertable, isVolatile, usableErrorMarkers, markerToText, survivesLoginPage, assertionElement },
+    _internal: { isAssertable, isVolatile, usableErrorMarkers, markerToText, survivesLoginPage, assertionElement, isCredentialSubmit },
 };

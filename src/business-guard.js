@@ -213,8 +213,14 @@ function matchesAnyConfigured(s, patterns) {
 function primaryDomainOf(samplers = []) {
     const tally = new Map();
     for (const s of samplers) {
-        const d = String(s && s.domain || '').replace(/^\$\{|\}$/g, '').toLowerCase();
-        if (!d || THIRD_PARTY_NOISE.test(d)) continue;
+        const raw = String(s && s.domain || '');
+        // A generated plan parameterizes hosts, so most domains are
+        // ${DEVPERFAPP_SERVER}. Those are not domains and must not be voted on:
+        // counting them elected "devperfapp_server" as the registrable domain,
+        // which then matched nothing.
+        if (!raw || raw.includes('${')) continue;
+        const d = raw.toLowerCase();
+        if (THIRD_PARTY_NOISE.test(d) || !d.includes('.')) continue;
         const reg = registrableDomain(d);
         if (reg) tally.set(reg, (tally.get(reg) || 0) + 1);
     }

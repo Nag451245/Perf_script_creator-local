@@ -184,14 +184,13 @@ right-click the request list → **Save all as HAR with content**. Record it twi
   normal output folder stays readable because `successArchive.keepOriginals` is
   true by default.
 
-The script ships with **Response Assertions already in it**, so running it at
-load in JMeter catches a login page or an error page served with a 200 — not
-just a non-2xx status. Open the *Assertions* section of the report to see
-exactly what each step checks. Text is only asserted as "must contain" when both
-recordings returned it there, so a second recording buys you real content
-checks; with one recording you get failure-text checks only. Anything you
-disagree with can be deleted in JMeter, or switch the pass off with
-`run.assertions.enabled: false`.
+The script ships with **no text assertions** by default — the agent's own body
+checks (auth wall, outcome probe, invariants) run during Validate and are what
+catch a login page served with a 200. If you want a few assertions baked into
+the JMX itself, set `run.assertions.enabled: true`; it adds content checks only
+where two recordings prove a marker is stable, failure-text checks only on the
+login step, and caps the whole thing at 8 steps. See the README for why it is
+not a default.
 
 ---
 

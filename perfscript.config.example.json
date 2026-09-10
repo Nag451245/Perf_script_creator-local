@@ -83,10 +83,10 @@
     "_allowJsr223_comment": "Default false. Leave JSR223/Groovy helpers stripped for Java-safe JMXs. Set true only when you deliberately need generated Groovy helpers and have a compatible JMeter/Java runtime.",
     "allowJsr223": false,
 
-    "_assertions_comment": "ON by default. Puts real Response Assertions in the shipped JMX so a load run in JMeter catches an auth wall or an error page served with a 200 — not just a non-2xx status. Content is only asserted where BOTH recordings agree and the login page does not carry it; every asserted step also rejects failure text the recording never contained. errorMarkers adds your own must-never-appear phrases.",
+    "_assertions_comment": "OFF by default. When true, adds a few Response Assertions to the shipped JMX so a JMeter run catches an error page served with a 200. Content is asserted only where BOTH recordings agree and the login page does not carry it; failure-text checks go on the credential-submit step only. Capped at maxSamplers (default 8) — an earlier version stamped the same six phrases on every step, which told a reviewer nothing and cost a scan of every response body per iteration.",
     "assertions": {
-      "enabled": true,
-      "maxSamplers": 25,
+      "enabled": false,
+      "maxSamplers": 8,
       "errorMarkers": []
     },
 

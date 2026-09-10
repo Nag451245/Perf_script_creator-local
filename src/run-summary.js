@@ -152,4 +152,33 @@ function nextAction({ verdict = '', gate = null, blockers = [], continuation = n
     };
 }
 
-module.exports = { nextAction, describeChange, summarizeRun, appendHistory, loadHistory };
+/**
+ * The one small file the UI's run list reads: did it run, did it pass, how many
+ * requests, how many iterations.
+ *
+ * It exists because the list used to read `<flow>_report.json`, and the output
+ * tidy-up prunes that as a "JSON twin of report.html". Every organized folder
+ * therefore showed "0 samples · generated" for a run that had actually
+ * validated — the operator could not see pass/fail or iteration count anywhere
+ * but the log. This file is tiny, stays at the folder root, and is never
+ * pruned.
+ */
+const SUMMARY_FILE = 'run_summary.json';
+
+function writeRunSummary(outDir, summary) {
+    try {
+        fs.writeFileSync(path.join(outDir, SUMMARY_FILE), JSON.stringify({
+            writtenAt: new Date().toISOString(), ...summary,
+        }, null, 2));
+    } catch { /* the log still has it */ }
+}
+
+function readRunSummary(outDir) {
+    try { return JSON.parse(fs.readFileSync(path.join(outDir, SUMMARY_FILE), 'utf8')); }
+    catch { return null; }
+}
+
+module.exports = {
+    nextAction, describeChange, summarizeRun, appendHistory, loadHistory,
+    writeRunSummary, readRunSummary, SUMMARY_FILE,
+};

@@ -489,10 +489,16 @@ function paintHistory(){
   var i=start+pi;
   var vc=o.verdict==='GREEN'?'ok':(o.verdict==='needs attention'?'warn':'gen');
   var vlabel=o.verdict==='GREEN'?'GREEN':(o.verdict==='needs attention'?'ATTENTION':'generated');
-  var meta=o.kind==='validated'?((o.passed||0)+'/'+((o.passed||0)+(o.failed||0))+' passed'):((o.samplers||0)+' samplers');
+  // A run that executed says so in the collapsed row: passed of total, and how
+  // many fix iterations it took. "0 samples" told the operator nothing about a
+  // run that had really validated.
+  var iters=o.iterations?' · '+o.iterations+' iteration'+(o.iterations===1?'':'s'):'';
+  var meta=o.kind==='validated'
+   ?((o.passed||0)+'/'+(o.total||((o.passed||0)+(o.failed||0)))+' requests passed'+iters)
+   :((o.samplers||0)+' samplers · not run');
   var stats=o.kind==='validated'
-   ?'<span class="chip" style="color:var(--ok)">'+(o.passed||0)+' passed</span><span class="chip" style="color:'+((o.failed||0)?'var(--bad)':'var(--mut)')+'">'+(o.failed||0)+' failed</span><span class="chip">'+(o.total||0)+' app reqs</span>'
-   :'<span class="chip">'+(o.samplers||0)+' samplers</span><span class="chip" style="color:var(--accent)">'+(o.correlations||0)+' correlations</span>';
+   ?'<span class="chip" style="color:var(--ok)">'+(o.passed||0)+' passed</span><span class="chip" style="color:'+((o.failed||0)?'var(--bad)':'var(--mut)')+'">'+(o.failed||0)+' failed</span><span class="chip">'+(o.total||0)+' app reqs</span>'+(o.iterations?'<span class="chip">'+o.iterations+' iteration'+(o.iterations===1?'':'s')+'</span>':'')
+   :'<span class="chip">'+(o.samplers||0)+' samplers</span><span class="chip" style="color:var(--accent)">'+(o.correlations||0)+' correlations</span><span class="chip" style="color:var(--mut)">generate only — not executed</span>';
   var act='';
   if(o.report)act+='<a class="action primary" target="_blank" href="/out/'+encodeURIComponent(o.name)+'/'+encodeURIComponent(o.report)+'">Open report</a>';
   if(o.jmx)act+='<a class="action" href="/out/'+encodeURIComponent(o.name)+'/'+encodeURIComponent(o.jmx)+'">Download JMX</a>';

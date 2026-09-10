@@ -209,6 +209,10 @@ function pruneDiagnostics(outDir, level = 'summary') {
 function mustStayAtRoot(name, file) {
     if (file === '00_OPEN_THIS_FIRST.txt' || file === '00_OUTPUT_INDEX.txt') return true;
     if (file === 'output_manifest.json' || file === 'log.txt') return true;
+    // The run list reads this to show pass/fail and iteration count. Filing it
+    // away (or pruning it, which is what happened to <flow>_report.json) makes
+    // every completed run display as "0 samples · generated".
+    if (file === 'run_summary.json') return true;
     if (/^00_(RUN_THIS_SCRIPT|USE_THIS_.*)\.jmx$/i.test(file)) return true;
     // An aborted run parks its unverified regenerate beside the verified
     // deliverable, and the guide tells the operator to look for it there.

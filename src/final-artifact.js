@@ -287,7 +287,19 @@ function writeFinalJmxPointer({
     // The first thing anyone reads should answer "what do I do now?", not make
     // them interpret a status word. Action first, then why, then the details.
     const guidePath = path.join(outDir, '00_OPEN_THIS_FIRST.txt');
-    const action = keepPrevious
+    // A JMeter save from a stale buffer is the single most confusing thing that
+    // happens to this folder: the operator looks at the file, sees the PREVIOUS
+    // run's script, and concludes the agent is broken. Twice now. So when it is
+    // detected it becomes the HEADLINE, not a note further down.
+    const action = (stale && stale.external && stale.byJMeter)
+        ? {
+            headline: 'Close this file in JMeter WITHOUT saving, then reopen it.',
+            detail: `JMeter wrote over the previous version of ${finalName} after the agent produced it — `
+                + 'a save from a buffer that was opened before that run. The file has just been replaced with the current script, '
+                + 'but JMeter still holds the old one in memory: if you save from that window again it will put the old script back, '
+                + `and anything you look at in that window is the OLD plan. The agent's copy is also in scripts/${finalName} if you need to compare.`,
+        }
+        : keepPrevious
         ? {
             headline: 'This run stopped early — the script here is the last verified one.',
             detail: `The run could not finish verifying (${abortedRun}), so nothing was proven this time. `

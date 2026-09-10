@@ -77,7 +77,30 @@ function outputSummary(name) {
         kind: 'generated',
         mtime: fs.statSync(dir).mtimeMs,
     };
+    // The purpose-built summary first: <flow>_report.json is pruned by the
+    // output tidy-up as a twin of report.html, so relying on it alone made
+    // every organized folder read "0 samples · generated" for a run that had
+    // actually validated.
+    const runSummary = require('./run-summary').readRunSummary(dir);
+    if (runSummary) {
+        summary.verdict = runSummary.verdict || '';
+        summary.iterations = runSummary.iterations;
+        if (runSummary.validated) {
+            summary.kind = 'validated';
+            summary.total = Number(runSummary.total) || 0;
+            summary.passed = Number(runSummary.passed) || 0;
+            summary.failed = Number(runSummary.failed) || 0;
+            summary.businessVerified = !!runSummary.businessVerified;
+        } else {
+            summary.samplers = runSummary.samplers;
+            summary.correlations = runSummary.correlations;
+            summary.parameterized = runSummary.parameterized;
+        }
+    }
+
     const reportJson = files.find(f => /_report\.json$/i.test(f));
+    // The full report still wins when it is present — it carries the per-request
+    // detail the failed-sampler list needs.
     if (!reportJson) return summary;
     try {
         const json = JSON.parse(fs.readFileSync(path.join(dir, reportJson), 'utf8'));

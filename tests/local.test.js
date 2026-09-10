@@ -8374,3 +8374,63 @@ test('attach recording: renames to the stem the pairing rule looks for', () => {
     assert.equal(unit.recording.have, 1, 'the renamed recording is picked up');
     assert.match(unit.recording.label, /recording attached/);
 });
+
+// ── The run list must be able to say what happened ───────────────────────
+test('run summary: survives the output tidy-up that prunes report.json', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const { writeRunSummary, readRunSummary } = require('../src/run-summary');
+    const organizer = require('../src/output-organizer');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'runsum_'));
+
+    fs.writeFileSync(path.join(dir, '00_RUN_THIS_SCRIPT.jmx'), '<jmeterTestPlan/>');
+    fs.writeFileSync(path.join(dir, 'demo_report.html'), '<!doctype html>');
+    fs.writeFileSync(path.join(dir, 'demo_report.json'), JSON.stringify({ samples: [], success: false }));
+    writeRunSummary(dir, { validated: true, verdict: 'needs attention', passed: 31, total: 33, failed: 2, iterations: 1 });
+
+    organizer.organizeOutput({
+        outDir: dir, name: 'demo', verdict: 'needs attention',
+        finalJmxPath: path.join(dir, '00_RUN_THIS_SCRIPT.jmx'),
+        reportPath: path.join(dir, 'demo_report.html'),
+    });
+
+    // <flow>_report.json is deliberately pruned as a twin of report.html. The
+    // run list used to read ONLY that, so every organized folder displayed
+    // "0 samples · generated" for a run that had really validated.
+    assert.ok(!fs.existsSync(path.join(dir, 'demo_report.json')), 'the big twin is still tidied away');
+    const summary = readRunSummary(dir);
+    assert.ok(summary, 'but the small summary the run list reads survives');
+    assert.equal(summary.validated, true);
+    assert.equal(summary.passed, 31);
+    assert.equal(summary.total, 33);
+    assert.equal(summary.iterations, 1, 'how many fix iterations it took is part of the answer');
+    assert.equal(summary.verdict, 'needs attention');
+
+    assert.equal(readRunSummary(fs.mkdtempSync(path.join(os.tmpdir(), 'empty_'))), null);
+});
+
+test('stale editor: a JMeter overwrite becomes the headline, not a footnote', () => {
+    const fs = require('fs');
+    const outDir = tmp();
+    const src = path.join(outDir, 'gen.jmx');
+
+    // Run 1 ships a script.
+    fs.writeFileSync(src, '<jmeterTestPlan><hashTree/></jmeterTestPlan>');
+    writeFinalJmxPointer({ outDir, name: 'flow', finalJmxPath: src, verdict: 'GREEN', validated: true });
+
+    // JMeter saves over it from a buffer opened before that run. Its serializer
+    // writes postBodyRaw for EVERY sampler, which is the tell.
+    const jmeterSaved = '<jmeterTestPlan><hashTree>' +
+        '<HTTPSamplerProxy testname="a"><boolProp name="HTTPSampler.postBodyRaw">true</boolProp></HTTPSamplerProxy>' +
+        '</hashTree></jmeterTestPlan>';
+    fs.writeFileSync(path.join(outDir, '00_RUN_THIS_SCRIPT.jmx'), jmeterSaved);
+
+    // Run 2 must lead with it: the operator looking at that window is reading
+    // the PREVIOUS run's script and will otherwise conclude the agent is broken.
+    fs.writeFileSync(src, '<jmeterTestPlan><hashTree/></jmeterTestPlan>');
+    const res = writeFinalJmxPointer({ outDir, name: 'flow', finalJmxPath: src, verdict: 'GREEN', validated: true });
+    assert.match(res.action.headline, /Close this file in JMeter WITHOUT saving/i);
+    const guide = fs.readFileSync(res.guidePath, 'utf8');
+    assert.match(guide.split('\n')[0], /CLOSE THIS FILE IN JMETER/i, 'first line of the guide, not a note further down');
+    assert.doesNotMatch(guide.split('\n')[0], /READY TO RUN/i);
+});

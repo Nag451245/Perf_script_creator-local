@@ -400,7 +400,20 @@ async function processUnit(unit) {
                     labelMapPath: path.join(outDir, `${name}_label_map.json`),
                 });
                 rec(`DONE — verdict=${verdict} · ` +
-                    `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see report.json`);
+                    `${passed}/${reqs.length} requests passed · ${out.result.iterationsRun} iteration(s) · see the HTML report`);
+                // The small file the run list reads. <flow>_report.json used to
+                // be that file, but the output tidy-up prunes it as a twin of
+                // report.html — so every organized folder showed "0 samples ·
+                // generated" for a run that had really validated.
+                runSummary.writeRunSummary(outDir, {
+                    validated: true,
+                    verdict,
+                    passed,
+                    total: reqs.length,
+                    failed: reqs.length - passed,
+                    iterations: Number(out.result.iterationsRun) || 1,
+                    businessVerified: !!(out.businessVerification && out.businessVerification.ok),
+                });
                 // Lead with the decision, not the status word: the operator's
                 // next question after "needs attention" was always "so do I run
                 // it or not?".
@@ -470,6 +483,14 @@ async function processUnit(unit) {
             `${gen.stats.parameterized} parameterized field(s)${gen.csvFile ? ` → ${gen.csvFile}` : ''}, ` +
             `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ` +
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
+        runSummary.writeRunSummary(outDir, {
+            validated: false,
+            verdict: runAttemptError ? 'not verified' : 'generated',
+            samplers: gen.stats.samplers,
+            correlations: gen.stats.correlations,
+            parameterized: gen.stats.parameterized,
+            abortedRun: runAttemptError || '',
+        });
         rec(`WHAT TO DO — ${finalMarker.action.headline}`);
         if (finalMarker.keptPrevious) {
             rec(`run aborted — kept the last VERIFIED ${path.basename(finalMarker.finalCopyPath)}; this run's unverified regenerate is parked as ${path.basename(finalMarker.writtenPath)}`);

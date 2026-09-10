@@ -518,8 +518,9 @@ function paintHistory(){
   // timestamps by hand.
   var when=o.startedAt?' · '+clockTime(o.startedAt)+(o.finishedAt?'→'+clockTime(o.finishedAt):'')
    +(humanDuration(o.durationMs)?' ('+humanDuration(o.durationMs)+')':''):'';
+  var fp=Number(o.falsePasses)||0;
   var meta=o.kind==='validated'
-   ?((o.passed||0)+'/'+(o.total||((o.passed||0)+(o.failed||0)))+' requests passed'+iters+when)
+   ?((o.passed||0)+'/'+(o.total||((o.passed||0)+(o.failed||0)))+' answered OK'+(fp?' · '+fp+' FAILED their body check':'')+iters+when)
    :((o.samplers||0)+' samplers · not run'+when);
   var stats=o.kind==='validated'
    ?'<span class="chip" style="color:var(--ok)">'+(o.passed||0)+' passed</span><span class="chip" style="color:'+((o.failed||0)?'var(--bad)':'var(--mut)')+'">'+(o.failed||0)+' failed</span><span class="chip">'+(o.total||0)+' app reqs</span>'+(o.iterations?'<span class="chip">'+o.iterations+' iteration'+(o.iterations===1?'':'s')+'</span>':'')+(humanDuration(o.durationMs)?'<span class="chip">took '+humanDuration(o.durationMs)+'</span>':'')+(o.startedAt?'<span class="chip" style="color:var(--mut)">'+clockTime(o.startedAt)+' → '+clockTime(o.finishedAt)+'</span>':'')

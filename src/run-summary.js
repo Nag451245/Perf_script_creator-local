@@ -100,14 +100,51 @@ function describeChange(previous, current) {
  * The one line that replaces the verdict word: what should the operator do
  * with this script, right now? Ordered by what blocks hardest.
  */
+/**
+ * How many samplers answered with a success STATUS but failed their job? These
+ * are the ones that make a run read "61/61 passed" while the script is broken.
+ */
+function falsePassCount(gate) {
+    if (!gate || !Array.isArray(gate.failures)) return 0;
+    const labels = new Set();
+    for (const f of gate.failures) {
+        if (f.category === 'auth_wall') {
+            for (const w of f.walls || []) if (w.passed) labels.add(String(w.sampler || ''));
+        }
+        if (f.category === 'business_error_in_body' || f.category === 'business_marker_missing') {
+            const items = Array.isArray(f.details) && f.details.length ? f.details : [f];
+            for (const d of items) labels.add(String(d.sampler || d.label || ''));
+        }
+    }
+    labels.delete('');
+    return labels.size;
+}
+
+/** The server's own words for why, when the gate captured them. */
+function statedReason(gate) {
+    if (!gate || !Array.isArray(gate.failures)) return '';
+    for (const f of gate.failures) {
+        if (f.category !== 'business_error_in_body') continue;
+        const items = Array.isArray(f.details) && f.details.length ? f.details : [f];
+        const marker = items.map(d => d.marker).find(Boolean);
+        if (marker) return String(marker);
+    }
+    return '';
+}
+
 function nextAction({ verdict = '', gate = null, blockers = [], continuation = null, validated = false } = {}) {
     const categories = gate && Array.isArray(gate.failures) ? gate.failures.map(f => f.category) : [];
     const has = (c) => categories.includes(c);
+    const falsePasses = falsePassCount(gate);
+    const reason = statedReason(gate);
 
     if (has('auth_wall')) {
         return {
             headline: 'Do not run this yet — nobody is logged in.',
-            detail: 'Requests are coming back as the login page with an HTTP 200, so every "pass" after login is measuring the login screen. Fix the sign-in first; see "What a human needs to provide" in the report.',
+            detail: `Requests are coming back as the login page with an HTTP 200, so every "pass" after login is measuring the login screen`
+                + `${falsePasses ? `; ${falsePasses} sampler(s) counted as PASSING while doing nothing` : ''}.`
+                + `${reason ? ` The server's own words: "${reason}".` : ''}`
+                + ' Fix the sign-in first; see "What a human needs to provide" in the report.',
         };
     }
     if (blockers && blockers.length) {
@@ -130,8 +167,12 @@ function nextAction({ verdict = '', gate = null, blockers = [], continuation = n
     }
     if (has('business_marker_missing') || has('business_error_in_body')) {
         return {
-            headline: 'Run it, but check the flagged steps first.',
-            detail: 'Some steps returned a success code without doing their job — the response was missing content both recordings agree on. See "Details" in the report.',
+            headline: falsePasses
+                ? `Do not trust this run — ${falsePasses} step(s) reported success without doing their job.`
+                : 'Run it, but check the flagged steps first.',
+            detail: `JMeter counted these as passing because the status line said 200, but the response body says the step failed`
+                + `${reason ? ` — the server said "${reason}"` : ''}.`
+                + ' See "Passed in JMeter, but the body says otherwise" at the top of the report.',
         };
     }
     if (categories.length) {
@@ -179,6 +220,6 @@ function readRunSummary(outDir) {
 }
 
 module.exports = {
-    nextAction, describeChange, summarizeRun, appendHistory, loadHistory,
+    nextAction, falsePassCount, statedReason, describeChange, summarizeRun, appendHistory, loadHistory,
     writeRunSummary, readRunSummary, SUMMARY_FILE,
 };

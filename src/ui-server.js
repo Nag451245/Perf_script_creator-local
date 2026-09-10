@@ -94,6 +94,7 @@ function outputSummary(name) {
             summary.passed = Number(runSummary.passed) || 0;
             summary.failed = Number(runSummary.failed) || 0;
             summary.businessVerified = !!runSummary.businessVerified;
+            summary.falsePasses = Number(runSummary.falsePasses) || 0;
         } else {
             summary.samplers = runSummary.samplers;
             summary.correlations = runSummary.correlations;

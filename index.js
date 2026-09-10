@@ -403,8 +403,12 @@ async function processUnit(unit) {
                     labelMapPath: path.join(outDir, `${name}_label_map.json`),
                 });
                 const itersRun = Number(out.result.iterationsRun) || 0;
+                // "61/61 requests passed" is what an operator reads as success.
+                // When the gate proved some of those never did their job, that
+                // number on its own is a lie of omission.
+                const falsePasses = runSummary.falsePassCount(out.finalGate || null);
                 rec(`DONE — verdict=${verdict} · ` +
-                    `${passed}/${reqs.length} requests passed · ${itersRun} of up to ${MAX_ITER} iteration(s) · took ${Math.round((Date.now() - unitStartedAt) / 1000)}s · see the HTML report`);
+                    `${passed}/${reqs.length} requests answered OK${falsePasses ? ` · ${falsePasses} of them FAILED their body check (not a real pass)` : ''} · ${itersRun} of up to ${MAX_ITER} iteration(s) · took ${Math.round((Date.now() - unitStartedAt) / 1000)}s · see the HTML report`);
                 // "Fix iterations = 3" but it ran once. That is not the budget
                 // being ignored — the loop stops as soon as it has no further
                 // fix it is allowed to apply. Saying so is the difference
@@ -427,6 +431,7 @@ async function processUnit(unit) {
                     passed,
                     total: reqs.length,
                     failed: reqs.length - passed,
+                    falsePasses,
                     iterations: itersRun,
                     maxIterations: MAX_ITER,
                     businessVerified: !!(out.businessVerification && out.businessVerification.ok),

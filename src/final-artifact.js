@@ -291,7 +291,18 @@ function writeFinalJmxPointer({
     // happens to this folder: the operator looks at the file, sees the PREVIOUS
     // run's script, and concludes the agent is broken. Twice now. So when it is
     // detected it becomes the HEADLINE, not a note further down.
-    const action = (stale && stale.external && stale.byJMeter)
+    // WHAT THE RUN FOUND OUTRANKS HOUSEKEEPING. A JMeter stale-save is a real
+    // problem, but it was made the headline unconditionally — so a run that had
+    // just proven the login was rejected with INVALID_CREDENTIALS, and that ten
+    // steps never did their job, opened with "close this file in JMeter". The
+    // file note still gets said further down; it does not get to go first.
+    const gateCategories = (greenGate && Array.isArray(greenGate.failures))
+        ? greenGate.failures.map(f => f.category) : [];
+    const runFoundSomethingWorse = gateCategories.includes('auth_wall')
+        || gateCategories.includes('business_error_in_body')
+        || gateCategories.includes('business_marker_missing');
+
+    const action = (stale && stale.external && stale.byJMeter && !runFoundSomethingWorse)
         ? {
             headline: 'Close this file in JMeter WITHOUT saving, then reopen it.',
             detail: `JMeter wrote over the previous version of ${finalName} after the agent produced it — `

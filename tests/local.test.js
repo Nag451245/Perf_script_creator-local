@@ -8596,3 +8596,75 @@ test('stale launcher: the UI notices when it is older than the files on disk', (
     assert.match(page, /id="stale-server"/, 'the page has somewhere to show it');
     assert.match(page, /s\.staleServer&&s\.staleServer\.stale/, 'and shows it when the server says so');
 });
+
+// ── "61/61 passed" must never be the story when the gate proved otherwise ──
+test('false pass reporting: the headline counts what worked, not what answered', () => {
+    const rs = require('../src/run-summary');
+    // Shape taken from a real gate verdict: the login was rejected with
+    // INVALID_CREDENTIALS, four samplers served the login page and still
+    // "passed", and ten steps failed a body check — while the run reported
+    // "61/61 requests passed", which the operator read as success.
+    const gate = {
+        ok: false,
+        categories: ['auth_wall', 'business_error_in_body'],
+        failures: [
+            { category: 'auth_wall', sampler: 'SC01_T02_/u/login/identifier-007',
+                walls: [
+                    { sampler: 'SC01_T02_/u/login/identifier-007', passed: true },
+                    { sampler: 'SC01_T02_/user/iam/authorize-019', passed: true },
+                ] },
+            { category: 'business_error_in_body', marker: 'INVALID_CREDENTIALS',
+                details: [
+                    { sampler: 'SC01_T02_/u/login/identifier-007', marker: 'INVALID_CREDENTIALS' },
+                    { sampler: 'SC01_T04_/EMRAnalytics/rdPage.aspx-054', marker: 'Missing rdSecureKey parameter' },
+                    { sampler: 'SC01_T08_/EMRAnalytics/rdPage.aspx-066', marker: 'Missing rdSecureKey parameter' },
+                ] },
+        ],
+    };
+
+    // Four distinct samplers: identifier-007 appears in BOTH categories and
+    // must be counted once, not twice.
+    assert.equal(rs.falsePassCount(gate), 4);
+    assert.equal(rs.statedReason(gate), 'INVALID_CREDENTIALS', "the server's own words, not a guess");
+
+    const action = rs.nextAction({ verdict: 'needs attention', gate, validated: true });
+    assert.match(action.headline, /Do not run this yet/i);
+    assert.match(action.detail, /4 sampler\(s\) counted as PASSING/);
+    assert.match(action.detail, /INVALID_CREDENTIALS/);
+
+    // Body failures WITHOUT an auth wall must still refuse to say "run it".
+    const bodyOnly = rs.nextAction({
+        verdict: 'needs attention', validated: true,
+        gate: { failures: [gate.failures[1]] },
+    });
+    assert.match(bodyOnly.headline, /Do not trust this run/i);
+    assert.match(bodyOnly.headline, /3 step\(s\) reported success without doing their job/);
+
+    assert.equal(rs.falsePassCount(null), 0);
+    assert.equal(rs.falsePassCount({ failures: [] }), 0);
+});
+
+test('false pass reporting: a JMeter stale save never outranks what the run found', () => {
+    const fs = require('fs');
+    const outDir = tmp();
+    const src = path.join(outDir, 'gen.jmx');
+    fs.writeFileSync(src, '<jmeterTestPlan><hashTree/></jmeterTestPlan>');
+    writeFinalJmxPointer({ outDir, name: 'flow', finalJmxPath: src, verdict: 'GREEN', validated: true });
+
+    // JMeter overwrites the file (its serializer writes postBodyRaw everywhere).
+    fs.writeFileSync(path.join(outDir, '00_RUN_THIS_SCRIPT.jmx'),
+        '<jmeterTestPlan><hashTree><HTTPSamplerProxy testname="a">' +
+        '<boolProp name="HTTPSampler.postBodyRaw">true</boolProp></HTTPSamplerProxy></hashTree></jmeterTestPlan>');
+
+    fs.writeFileSync(src, '<jmeterTestPlan><hashTree/></jmeterTestPlan>');
+    const res = writeFinalJmxPointer({
+        outDir, name: 'flow', finalJmxPath: src, verdict: 'needs attention', validated: true,
+        greenGate: { failures: [{ category: 'auth_wall', walls: [{ sampler: 'Step 07', passed: true }] }] },
+    });
+    // The file note is real, but "nobody is logged in" is what the operator
+    // needs first — the previous build opened with the housekeeping instead.
+    assert.match(res.action.headline, /nobody is logged in/i);
+    const guide = fs.readFileSync(res.guidePath, 'utf8');
+    assert.doesNotMatch(guide.split('\n')[0], /CLOSE THIS FILE IN JMETER/i);
+    assert.match(guide, /JMeter rewrote the previous version/, 'but it is still said, further down');
+});

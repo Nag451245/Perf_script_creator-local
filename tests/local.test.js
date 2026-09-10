@@ -8470,3 +8470,16 @@ test('size assertion: "non-empty download" must not mean "size >= 0"', () => {
     assert.equal(repairTautologicalSizeAssertions(deliberate).repaired, 0);
     assert.equal(repairTautologicalSizeAssertions('<jmeterTestPlan/>').repaired, 0);
 });
+
+test('pacing: the recorded think time is NOT baked into the shipped script', () => {
+    // The gaps between recorded requests are how long the person doing the
+    // recording took to read the page. That is not a property of the
+    // application, and baking it in made every run sit through minutes of
+    // sleep. Think time belongs to the load model the operator chooses.
+    const { injectGaussianTimers } = require('../src/transforms');
+    assert.equal(typeof injectGaussianTimers, 'function', 'still available for run.pacing.enabled');
+
+    const cfgExample = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'perfscript.config.example.json'), 'utf8'));
+    assert.notEqual(cfgExample.run.pacing && cfgExample.run.pacing.enabled, true,
+        'the example config does not switch pacing on');
+});

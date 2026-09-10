@@ -105,6 +105,9 @@
     "_llmFlowNotes_comment": "Flow-specific guidance appended to the AI escalation prompt (which endpoints are plumbing for THIS app, etc). Keep app names/paths here, not in code.",
     "llmFlowNotes": [],
 
+    "_pacing_comment": "OFF by default. The gaps between recorded requests are how long the PERSON recording took to read and click — not a property of the app — and baking them in made every run sit through minutes of sleep. Think time belongs to the load model you choose in JMeter. Set enabled=true only if you specifically want the recorded gaps reproduced.",
+    "pacing": { "enabled": false },
+
     "_scenario_comment": "Business objective -> load model (Little's Law). Give transactionsPerHour OR concurrentUsers; the designer derives threads, ramp, pacing (Precise Throughput Timer) and CSV pool size, with the math in <flow>_scenario.md. Explicit loadProfile below still wins.",
     "scenario": {
       "transactionsPerHour": 500,

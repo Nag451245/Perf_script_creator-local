@@ -196,35 +196,40 @@ to set things without command-line flags:
 
 Secrets can equivalently come from the environment (see `.env.example`).
 
-## Assertions (opt-in)
-By default the shipped JMX carries no text assertions. It did briefly, on by
-default, and that was a mistake: the pass stamped the same six failure phrases
-under every business step — 25 identical `Assert no failure text` nodes in one
-plan. That tells a reviewer nothing about which step broke, and it costs ~175
-substring scans of multi-hundred-KB response bodies on every iteration of every
-thread. Coverage is the operator's call, not a default.
+## Assertions
+The shipped JMX carries a handful of Response Assertions — typically 5-10 on a
+60-sampler plan, not one per step. Two kinds:
 
-Turn it on with `run.assertions.enabled: true` and it stays deliberately small:
+- **"Must contain"** on a business step, using markers BOTH recordings of the
+  flow returned there. On a real WebPT flow that produces things like
+  `"events" + "cal_names" + "cal_users"` on `POST /scheduler/index/data`, and
+  `"content" + "transactionId"` on `POST /service/authenticate.json`. A marker
+  is used only if both captures carried it, the login page does NOT carry it
+  (or it could not catch an auth wall), and it is not a value that changes per
+  user or run. **A single recording proves none of this, so a single-recording
+  run gets no content assertions at all.**
+- **"Must not contain"** failure text — but only on the request that submits
+  credentials, where "Invalid login" actually means the step failed. An earlier
+  version put the same six phrases under every business step; that told a
+  reviewer nothing and cost ~175 substring scans of large response bodies per
+  iteration.
 
-- **Content only where two recordings PROVE it.** A marker is asserted only if
-  both captures of the flow returned it for that step, the login page does not
-  also carry it (or it could not catch an auth wall), and it is not a value that
-  changes per user or run. A single recording proves nothing, so it asserts no
-  content at all.
-- **Failure text on the credential-submit step only.** "Invalid login" is a real
-  check on the login POST and decoration everywhere else.
-- **Never** on a static asset, a telemetry host, an auto-submit bridge page, or a
-  recorded 3xx (which replays as a followed redirect, so the body JMeter sees is
-  the destination's).
-- **Capped at 8 steps** (`run.assertions.maxSamplers`). If a flow seems to need
-  more, the check belongs in the agent's gates, not stamped across the plan.
-- Substring, not Contains — JMeter's "Contains" is a regex, so page text with
-  `(`, `?` or `.` matches something other than intended.
-
-`<name>_assertions.json` and the HTML report list exactly what was added.
+Capped at 8 steps (`run.assertions.maxSamplers`), Substring not Contains
+(JMeter's "Contains" is a regex, so page text with `(` or `.` matches the
+wrong thing), and named after the sampler so a JTL failure points at a step.
+`<name>_assertions.json` and the HTML report list exactly what was added; turn
+the whole pass off with `run.assertions.enabled: false`.
 
 The agent's own body checks — auth wall, outcome probe, invariants gate — run on
-every validate regardless, and are not affected by this switch.
+every validate regardless of this setting.
+
+## Think time / pacing
+**Not added.** The gaps between recorded requests are how long the person doing
+the recording took to read the page and click; that is not a property of the
+application. Baking them in made every run — including the agent's own
+validation — sit through minutes of sleep for no benefit. Think time belongs to
+the load model you choose when you decide the workload: add it in JMeter, or set
+`run.pacing.enabled: true` if you specifically want the recorded gaps back.
 
 ## Verified Learning Store
 Agent mode now remembers only evidence-backed repairs. A lesson is saved after a

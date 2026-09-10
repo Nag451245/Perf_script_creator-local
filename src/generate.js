@@ -1308,11 +1308,20 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             `asserted ${probe.isVariable ? 'the runtime ' + probe.text : 'the submitted value'} in that response — a run that creates nothing can no longer be GREEN`);
     }
 
-    const pacingInj = injectGaussianTimers(xml, flat, pages);
+    // NO PACING TIMERS. The recorded inter-request gaps are how long the person
+    // making the recording took to read the page and click — they are not a
+    // property of the application, and baking them in made every run sit
+    // through minutes of sleep (9 timers x ~4.3s per iteration on a real flow).
+    // Think time belongs to the LOAD MODEL, which the operator sets when they
+    // decide the workload: add it in JMeter, or turn this back on with
+    // run.pacing.enabled if you want the recorded gaps reproduced.
+    const pacingInj = (runCfg.pacing && runCfg.pacing.enabled === true)
+        ? injectGaussianTimers(xml, flat, pages)
+        : { xml, injected: 0 };
     xml = pacingInj.xml;
     if (pacingInj.injected) note('pacing',
         `${pacingInj.injected} transaction(s) had measurable inter-request gaps`,
-        `derived mean+stdev from recording timings`,
+        `derived mean+stdev from recording timings (run.pacing.enabled=true)`,
         `added GaussianRandomTimer per transaction`);
 
     // Optional load profile (users / ramp-up / hold / loops). Honored at

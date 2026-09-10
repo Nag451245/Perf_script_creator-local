@@ -112,6 +112,7 @@ const runProgress = require('./src/run-progress');
 const outputOrganizer = require('./src/output-organizer');
 const runSummary = require('./src/run-summary');
 const { runConfigForFlow } = require('./src/run-config');
+const assertionPlanner = require('./src/assertion-plan');
 const { selectUnits } = require('./src/ui-inputs');
 
 const AGENT_OPTS = resolveAgentOptions(args, CONFIG);
@@ -350,6 +351,21 @@ async function processUnit(unit) {
     if (DO_RUN) {
         let progressTimer = null;
         try {
+            // CHECK THE CREDENTIALS BEFORE SPENDING A RUN ON THEM.
+            // A flow that submits a password needs a real one. When
+            // run.credentials is empty the data synthesizer invents a username
+            // from the FLOW NAME ("Performance_STG_0047" / "password1!"), the
+            // server answers INVALID_CREDENTIALS, and the whole run is spent
+            // diagnosing downstream symptoms of a login that was never going to
+            // work. Say it up front, where it costs nothing.
+            const credCfg = (runCfgForThisRun(name).credentials) || {};
+            const submitsCredentials = entries.some(e => assertionPlanner._internal.isCredentialSubmit(e));
+            if (submitsCredentials && !String(credCfg.username || '').trim()) {
+                rec('CREDENTIALS NOT SET — this flow submits a password, but run.credentials.username is empty in '
+                    + 'perfscript.config.json, so the login will use data invented from the flow name and the server will '
+                    + 'reject it. Set the username and password in Settings (or the config file) before reading anything '
+                    + 'into the failures below.');
+            }
             rec(`running bounded feedback loop (max ${MAX_ITER})…`);
             // Say plainly whether an LLM is in this run. "agent mode" alone was
             // read as "AI ran"; without --ai nothing leaves the machine and the

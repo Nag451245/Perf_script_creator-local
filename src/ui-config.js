@@ -46,10 +46,19 @@ function writeConfigFromUiObject(config = {}, body = {}) {
     const c = clone(config);
     c.run = c.run || {};
     c.agent = c.agent || {};
-    if (typeof body.targetBaseUrl === 'string') c.run.targetBaseUrlOverride = body.targetBaseUrl.trim();
+    // AN EMPTY FIELD MEANS "I DID NOT TOUCH THIS", NOT "DELETE IT".
+    // The page posts every field on every save, so saving an unrelated setting
+    // from a form that had not finished loading silently wiped the target URL
+    // and the username. The password was already protected this way; the other
+    // two were not, and a run then logs in with synthesized data and gets
+    // INVALID_CREDENTIALS with no hint that the config was emptied. Clearing a
+    // value deliberately means editing perfscript.config.json.
+    if (typeof body.targetBaseUrl === 'string' && body.targetBaseUrl.trim() !== '') {
+        c.run.targetBaseUrlOverride = body.targetBaseUrl.trim();
+    }
     if (typeof body.username === 'string' || typeof body.password === 'string') {
         c.run.credentials = c.run.credentials || {};
-        if (typeof body.username === 'string') c.run.credentials.username = body.username;
+        if (typeof body.username === 'string' && body.username.trim() !== '') c.run.credentials.username = body.username;
         if (typeof body.password === 'string' && body.password !== '') c.run.credentials.password = body.password;
     }
     const lp = body.loadProfile || {};

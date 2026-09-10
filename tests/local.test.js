@@ -8668,3 +8668,61 @@ test('false pass reporting: a JMeter stale save never outranks what the run foun
     assert.doesNotMatch(guide.split('\n')[0], /CLOSE THIS FILE IN JMETER/i);
     assert.match(guide, /JMeter rewrote the previous version/, 'but it is still said, further down');
 });
+
+// ── Settings must not silently wipe what they did not send ──────────────
+test('settings save: an empty field means "unchanged", not "delete it"', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const uiConfig = require('../src/ui-config');
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cfg_')), 'perfscript.config.json');
+
+    fs.writeFileSync(file, JSON.stringify({
+        run: {
+            targetBaseUrlOverride: 'https://stage.example.com',
+            credentials: { username: 'RealUser', password: 'RealPassword1!' },
+        },
+    }, null, 2));
+
+    // The page posts EVERY field on every save. Saving an unrelated setting
+    // from a form that had not finished loading used to blank the target URL
+    // and the username — after which the run logs in with data synthesized from
+    // the flow name and the server answers INVALID_CREDENTIALS, with nothing
+    // pointing at the config as the cause.
+    uiConfig.writeConfigFromUiPath(file, { targetBaseUrl: '', username: '', password: '', testObjective: 'soak' });
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(after.run.targetBaseUrlOverride, 'https://stage.example.com', 'target URL survives');
+    assert.equal(after.run.credentials.username, 'RealUser', 'username survives');
+    assert.equal(after.run.credentials.password, 'RealPassword1!', 'password survives (it always did)');
+    assert.equal(after.run.testObjective, 'soak', 'the field they DID fill in is saved');
+
+    // A real value still overwrites.
+    uiConfig.writeConfigFromUiPath(file, { username: 'NewUser', targetBaseUrl: 'https://other.example.com' });
+    const changed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(changed.run.credentials.username, 'NewUser');
+    assert.equal(changed.run.targetBaseUrlOverride, 'https://other.example.com');
+});
+
+test('preflight: a login flow with no configured credentials is called out before the run', () => {
+    // The data synthesizer invents a username from the FLOW NAME when none is
+    // configured, so the login is guaranteed to fail. Detecting the
+    // credential-submit step is what lets the agent say so up front instead of
+    // spending a run diagnosing downstream symptoms.
+    const { isCredentialSubmit } = require('../src/assertion-plan')._internal;
+    const login = {
+        request: { method: 'POST', url: 'https://app.test/u/login/password', headers: [],
+            postData: { text: 'username=x&password=y' } },
+        response: { status: 200, content: { mimeType: 'text/html', text: 'ok' } },
+    };
+    const byPath = {
+        request: { method: 'POST', url: 'https://app.test/service/authenticate.json', headers: [], postData: { text: '{}' } },
+        response: { status: 200, content: { mimeType: 'application/json', text: '{}' } },
+    };
+    const notLogin = {
+        request: { method: 'GET', url: 'https://app.test/dashboard', headers: [] },
+        response: { status: 200, content: { mimeType: 'text/html', text: 'ok' } },
+    };
+    assert.equal(isCredentialSubmit(login), true, 'a password in the body');
+    assert.equal(isCredentialSubmit(byPath), true, 'or an authenticate path');
+    assert.equal(isCredentialSubmit(notLogin), false);
+});

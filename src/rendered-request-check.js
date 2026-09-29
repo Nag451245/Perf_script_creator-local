@@ -27,7 +27,6 @@ const fs = require('fs');
 const path = require('path');
 const { knownDefinedVars } = require('./extractors');
 
-const SENDABLE_PROP = /<stringProp\s+name="(HTTPSampler\.path|Argument\.value|Header\.value)">([^<]*)<\/stringProp>/g;
 const VAR_REF = /\$\{([^}]+)\}/g;
 
 /**
@@ -82,31 +81,20 @@ function checkRenderedRequests({ xml = '', outDir = '' } = {}) {
     }
 
     // ── Class 1: undefined variables in what an ENABLED sampler will SEND ─
-    // Only enabled samplers transmit — a literal ${var} inside a DISABLED
-    // plumbing sampler (e.g. a folded /oauth/token carrying ${access_token})
-    // is never sent, so it is not a defect and must not block. A sampler's
-    // send-fields (path, Argument.value inside it; Header.value in its
-    // hashTree) all appear AFTER its open tag and before the NEXT sampler's,
-    // so each send-field is attributed to the nearest preceding sampler.
-    const samplerTags = [];
-    for (const m of matchAll(xml, /<HTTPSamplerProxy\b([^>]*)>/g)) {
-        samplerTags.push({ index: m.index, disabled: /enabled="false"/.test(m[1] || '') });
-    }
-    const nearestSamplerDisabled = (pos) => {
-        let disabled = false;
-        for (const t of samplerTags) { if (t.index > pos) break; disabled = t.disabled; }
-        return disabled;
-    };
+    // Raw bodies legitimately use CDATA, and values can include XML entities.
+    // Scan each sampler's XML range rather than matching only plain text props;
+    // this sees URL/path, arguments (including raw bodies), and header values
+    // without changing the serialized JMX.
     const undefinedRefs = new Map(); // varName -> sample of where it's used
-    for (const m of matchAll(xml, SENDABLE_PROP)) {
-        if (nearestSamplerDisabled(m.index)) continue;
-        const text = m[2];
+    for (const sampler of enabledSamplerBlocks(xml)) {
+        for (const text of samplerSendFields(sampler.xml)) {
         for (const ref of matchAll(text, VAR_REF)) {
             const raw = ref[1].trim();
             if (isFunctionOrExpr(raw)) continue;         // ${__UUID}, ${__time(...)} etc.
             const name = raw.split(/[.,|]/)[0].trim();    // ${var,default} / ${var}
             if (!name || defined.has(name)) continue;
             if (!undefinedRefs.has(name)) undefinedRefs.set(name, snippet(text));
+        }
         }
     }
     for (const [name, where] of undefinedRefs) {
@@ -120,6 +108,38 @@ function checkRenderedRequests({ xml = '', outDir = '' } = {}) {
     }
 
     return { ok: findings.length === 0, findings, definedVars: [...defined] };
+}
+
+function enabledSamplerBlocks(xml) {
+    const blocks = [];
+    const re = /<HTTPSamplerProxy\b([^>]*)>/g;
+    let match;
+    while ((match = re.exec(xml)) !== null) {
+        const close = xml.indexOf('</HTTPSamplerProxy>', re.lastIndex);
+        if (close < 0) continue;
+        if (!/\benabled="false"/i.test(match[1] || '')) {
+            blocks.push({ xml: xml.slice(match.index, close + '</HTTPSamplerProxy>'.length) });
+        }
+        re.lastIndex = close + '</HTTPSamplerProxy>'.length;
+    }
+    return blocks;
+}
+
+function samplerSendFields(block) {
+    const values = [];
+    const re = /<stringProp\s+name="(?:HTTPSampler\.path|Argument\.value|Header\.value)"[^>]*>([\s\S]*?)<\/stringProp>/g;
+    for (const m of matchAll(block, re)) values.push(decodeXmlText(m[1]));
+    return values;
+}
+
+function decodeXmlText(value) {
+    return String(value || '')
+        .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
 }
 
 /** JMeter-faithful CSV line split. quoted=true → RFC-4180; else naive split. */
@@ -178,4 +198,4 @@ function* matchAll(str, re) {
     let m; while ((m = r.exec(str)) !== null) yield m;
 }
 
-module.exports = { checkRenderedRequests, _internal: { parseCsvLine, isFunctionOrExpr } };
+module.exports = { checkRenderedRequests, _internal: { parseCsvLine, isFunctionOrExpr, enabledSamplerBlocks, samplerSendFields, decodeXmlText } };

@@ -44,9 +44,21 @@ function evaluateFinalGreenGate({
     requireAssertions = false,
     softFailurePatterns = [],
     invariants = null,
+    runtimeProof = null,
 } = {}) {
     const failures = [];
     const warnings = [];
+    const proof = runtimeProof || (evidence && evidence.runtimeProof) || null;
+    if (proof && proof.status !== 'VERIFIED') {
+        const divergence = proof.firstDivergence || {};
+        failures.push({
+            category: 'correlation_runtime_proof',
+            reason: proof.status === 'FAILED'
+                ? `Runtime correlation proof failed: ${divergence.kind || 'unknown divergence'}.`
+                : `Runtime correlation proof is UNVERIFIED: ${divergence.kind || 'runtime evidence is missing'}.`,
+            details: proof,
+        });
+    }
 
     // Body-truth invariants: markers both recordings agree on must still be in
     // each passing sampler's LIVE body. A 200 whose step-content vanished

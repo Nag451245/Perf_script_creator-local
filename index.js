@@ -114,6 +114,8 @@ const runSummary = require('./src/run-summary');
 const { runConfigForFlow } = require('./src/run-config');
 const assertionPlanner = require('./src/assertion-plan');
 const { selectUnits } = require('./src/ui-inputs');
+const { deriveVerificationStatus } = require('./src/verification-status');
+const { summarizeFirstCorrelationDivergence } = require('./src/operator-diagnostics');
 
 const AGENT_OPTS = resolveAgentOptions(args, CONFIG);
 const DO_RUN = AGENT_OPTS.doRun;
@@ -393,13 +395,22 @@ async function processUnit(unit) {
                 const reqs = (out.result.samples || []).filter(s => !s.isTransaction);
                 const passed = reqs.filter(s => s.success).length;
                 const verdict = out.result.success ? 'GREEN' : 'needs attention';
+                const runtimeProof = out.result.runtimeProof || null;
+                const verificationStatus = deriveVerificationStatus({
+                    validationAttempted: true,
+                    finalGreenGate: out.finalGate || out.result.finalGreenGate || null,
+                    businessVerification: out.businessVerification || null,
+                    runtimeProof,
+                    correlationEvidence: out.stats && out.stats.correlationEvidence,
+                });
+                const firstCorrelationDivergence = summarizeFirstCorrelationDivergence(runtimeProof && runtimeProof.firstDivergence);
                 // Compare against the PREVIOUS run of this same flow before we
                 // record this one — "why is this different today" should be
                 // answered by the agent, not by digging through old folders.
                 const previousRuns = runSummary.loadHistory(outDir);
                 const thisRun = runSummary.summarizeRun({
                     result: out.result, gate: out.finalGate || null,
-                    disabledCount: (out.stats && out.stats.disabled) || 0, verdict,
+                    disabledCount: (out.stats && out.stats.disabled) || 0, verdict, verificationStatus,
                 });
                 const changeSummary = runSummary.describeChange(previousRuns[previousRuns.length - 1], thisRun);
                 runSummary.appendHistory(outDir, thisRun);
@@ -425,6 +436,7 @@ async function processUnit(unit) {
                 const falsePasses = runSummary.falsePassCount(out.finalGate || null);
                 rec(`DONE — verdict=${verdict} · ` +
                     `${passed}/${reqs.length} requests answered OK${falsePasses ? ` · ${falsePasses} of them FAILED their body check (not a real pass)` : ''} · ${itersRun} of up to ${MAX_ITER} iteration(s) · took ${Math.round((Date.now() - unitStartedAt) / 1000)}s · see the HTML report`);
+                rec(`VERIFICATION STATUS — ${verificationStatus} · runtime proof ${runtimeProof && runtimeProof.status || 'not run'}${firstCorrelationDivergence ? ` · first correlation divergence: ${firstCorrelationDivergence.kind} (${firstCorrelationDivergence.variable})` : ''}`);
                 // "Fix iterations = 3" but it ran once. That is not the budget
                 // being ignored — the loop stops as soon as it has no further
                 // fix it is allowed to apply. Saying so is the difference
@@ -451,6 +463,9 @@ async function processUnit(unit) {
                     iterations: itersRun,
                     maxIterations: MAX_ITER,
                     businessVerified: !!(out.businessVerification && out.businessVerification.ok),
+                    verificationStatus,
+                    runtimeProofStatus: runtimeProof && runtimeProof.status || 'not run',
+                    firstCorrelationDivergence,
                 });
                 // Lead with the decision, not the status word: the operator's
                 // next question after "needs attention" was always "so do I run
@@ -474,6 +489,8 @@ async function processUnit(unit) {
                     businessVerification: out.businessVerification || null,
                     disableDecisions: out.disableDecisions || null,
                     failureForensics: out.failureForensics || null,
+                    verificationStatus,
+                    runtimeProof,
                 });
                 rec(`open ${name}_report.html for a summary`);
                 fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));
@@ -487,7 +504,7 @@ async function processUnit(unit) {
                     currentJtlPath: path.join(outDir, 'final.jtl'),
                 });
                 if (out.result.success) archiveGreenRun({ outDir, name, rec });
-                return { success: !!out.result.success, verdict };
+                return { success: !!out.result.success, verdict, verificationStatus };
             }
         } catch (e) {
             runAttemptError = e.message;
@@ -501,6 +518,7 @@ async function processUnit(unit) {
     // Generate-only path.
     try {
         const gen = generate(entries, pages, outDir, name, genOpts);
+        const verificationStatus = deriveVerificationStatus({ validationAttempted: false });
         fs.writeFileSync(path.join(outDir, `${name}_report.json`), JSON.stringify(gen.stats, null, 2));
         const finalMarker = writeFinalJmxPointer({
             outDir,
@@ -521,6 +539,7 @@ async function processUnit(unit) {
             `${gen.stats.parameterized} parameterized field(s)${gen.csvFile ? ` → ${gen.csvFile}` : ''}, ` +
             `${gen.stats.clientSideGhosts} client-side value(s) regenerated, ` +
             `${gen.stats.pollingLoops} polling loop(s), ${gen.stats.orphans} orphan(s)`);
+        rec(`VERIFICATION STATUS — ${verificationStatus} · correlation evidence ${gen.stats.correlationEvidence}${gen.stats.correlationEvidence !== 'AVAILABLE' ? ' — response-side pairing is incomplete; this script is not VERIFIED' : ''}`);
         runSummary.writeRunSummary(outDir, {
             validated: false,
             startedAt: new Date(unitStartedAt).toISOString(),
@@ -531,6 +550,8 @@ async function processUnit(unit) {
             correlations: gen.stats.correlations,
             parameterized: gen.stats.parameterized,
             abortedRun: runAttemptError || '',
+            verificationStatus: runAttemptError ? 'UNVERIFIED' : verificationStatus,
+            correlationEvidence: gen.stats.correlationEvidence,
         });
         rec(`WHAT TO DO — ${finalMarker.action.headline}`);
         if (finalMarker.keptPrevious) {
@@ -548,6 +569,8 @@ async function processUnit(unit) {
             dualHar: notes.dualHar || null,
             loadProfile: gen.loadProfile || null,
             reasoning: gen.reasoning || [],
+            verificationStatus: runAttemptError ? 'UNVERIFIED' : verificationStatus,
+            runtimeProof: null,
         });
         outputOrganizer.organizeOutput({
             diagnostics: (CONFIG.run||{}).diagnostics,
@@ -558,7 +581,7 @@ async function processUnit(unit) {
             reportPath,
         });
         rec(`open ${name}_report.html for a summary`);
-        return { success: !runAttemptError, verdict };
+        return { success: !runAttemptError, verdict, verificationStatus: runAttemptError ? 'UNVERIFIED' : verificationStatus };
     } catch (e) {
         rec(`GENERATE FAILED: ${e.message}`);
         fs.writeFileSync(path.join(outDir, 'log.txt'), lines.join('\n'));

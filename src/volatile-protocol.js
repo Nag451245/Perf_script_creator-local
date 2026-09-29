@@ -22,29 +22,108 @@ const BUSINESS_NAME_RE = /^(user(name)?|email|password|passwd|pwd|login|account|
 const PROTOCOL_NAME_HINT_RE = /state|nonce|code|csrf|xsrf|relay|saml|execution|session|challenge|verifier|transaction|txn|flow|conversation|tab|ctx|context|request|auth|sid|rid|trace/i;
 const AUTH_CONTEXT_RE = /\/authorize\b|\/oauth\b|\/token\b|\/callback\b|\/saml\b|\/sso\b|\/login\b|\/resume\b|openid|response_type=code|client_id=|redirect_uri=|code_challenge|code_verifier|samlrequest|samlresponse|relaystate/i;
 
-function filterVolatileProtocolCorrelations(corrs, entries) {
+function filterVolatileProtocolCorrelations(corrs, entries, ledger = null) {
     const observed = observeVolatileProtocolFields(entries);
     const observedNames = new Set(observed.map(f => f.name));
     const observedValues = new Set(observed.map(f => f.value).filter(Boolean));
     const hasAuthContext = observed.length > 0 || entriesHaveAuthProtocolContext(entries);
     const kept = [];
     const removed = [];
+    const diagnostics = [];
 
     for (const c of corrs || []) {
         const name = normalizeName(c.variableName || c.name || c.var || c.refName);
         const value = String(c.value == null ? '' : c.value);
-        if (hasAuthContext && (
+        const producer = recordedServerProducer(entries, value, c, ledger);
+        const volatile = hasAuthContext && (
             observedNames.has(name) ||
             observedValues.has(value) ||
             isVolatileProtocolField(name, value)
-        )) {
+        );
+        if (volatile && !producer) {
             removed.push(c);
+            diagnostics.push({ name, decision: 'dropped', reason: 'volatile protocol field has no recorded server producer' });
         } else {
             kept.push(c);
+            diagnostics.push({
+                name,
+                decision: 'kept',
+                reason: producer
+                    ? `recorded server producer at entry ${producer.entryIndex}; correlation takes precedence over protocol naming`
+                    : 'not a volatile protocol field in auth context',
+                producerEntryIndex: producer && producer.entryIndex,
+            });
         }
     }
 
-    return { kept, removed, observedNames: [...observedNames].sort(), observed };
+    return { kept, removed, diagnostics, observedNames: [...observedNames].sort(), observed };
+}
+
+function recordedServerProducer(entries, value, correlation, ledger) {
+    const ledgerEntry = ledger && (ledger.entries || []).find(item =>
+        String(item.value) === value && item.role === 'server-issued-correlation');
+    const linked = ledgerEntry && (ledgerEntry.consumerLinks || [])
+        .filter(link => Number.isInteger(link.producerIndex) && Number.isInteger(link.consumerIndex))
+        .sort((a, b) => a.consumerIndex - b.consumerIndex || b.producerIndex - a.producerIndex)
+        .find(link => link.producerIndex < link.consumerIndex && responseContainsValue(entries[link.producerIndex], value));
+    if (linked) return { entryIndex: linked.producerIndex };
+
+    const consumerIndex = Number(correlation && (correlation.targetRequestIndex ?? correlation.consumerEntryIndex));
+    const firstConsumer = Number.isInteger(consumerIndex) && consumerIndex >= 0
+        ? consumerIndex
+        : (entries || []).findIndex(entry => requestContainsValue(entry, value));
+    const explicitIndex = Number(correlation && (correlation.producerEntryIndex ?? correlation.sourceRequestIndex));
+    if (Number.isInteger(explicitIndex) && explicitIndex >= 0 &&
+        (firstConsumer < 0 || explicitIndex < firstConsumer) &&
+        responseContainsValue(entries[explicitIndex], value)) {
+        return { entryIndex: explicitIndex };
+    }
+    if (ledgerEntry && ledgerEntry.producerIndexes && ledgerEntry.producerIndexes.length) {
+        const indexes = ledgerEntry.producerIndexes.filter(index =>
+            (firstConsumer < 0 || index < firstConsumer) && responseContainsValue(entries[index], value));
+        if (indexes.length) return { entryIndex: indexes[indexes.length - 1] };
+    }
+    const horizon = firstConsumer < 0 ? (entries || []).length : firstConsumer;
+    for (let index = horizon - 1; index >= 0; index--) {
+        if (responseContainsValue(entries[index], value)) return { entryIndex: index };
+    }
+    return null;
+}
+
+function requestContainsValue(entry, value) {
+    const request = entry && entry.request || {};
+    try {
+        if ([...new URL(String(request.url || '')).searchParams.values()].some(item => item === value)) return true;
+    } catch { /* URL may be incomplete in recordings */ }
+    if ((request.queryString || []).some(pair => decodeMaybe(pair.value) === value)) return true;
+    const postData = request.postData || {};
+    if ((postData.params || []).some(pair => decodeMaybe(pair.value) === value)) return true;
+    if (bodyContainsValue(postData.text, value)) return true;
+    return (request.headers || []).some(header => String(header.value || '').includes(value));
+}
+
+function responseContainsValue(entry, value) {
+    const response = entry && entry.response || {};
+    return String(response.content && response.content.text || '').includes(value) ||
+        (response.headers || []).some(header => String(header.value || '').includes(value));
+}
+
+function bodyContainsValue(body, value) {
+    const text = String(body || '').trim();
+    if (!text) return false;
+    if (text.startsWith('{') || text.startsWith('[')) {
+        try { return jsonContainsValue(JSON.parse(text), value); } catch { /* form parsing below */ }
+    }
+    return text.split('&').some(segment => {
+        const index = segment.indexOf('=');
+        return index > 0 && decodeMaybe(segment.slice(index + 1)) === value;
+    });
+}
+
+function jsonContainsValue(node, value) {
+    if (node == null) return false;
+    if (typeof node !== 'object') return String(node) === value;
+    return Object.values(node).some(item => jsonContainsValue(item, value));
 }
 
 function observeVolatileProtocolFields(entries) {
@@ -185,5 +264,8 @@ module.exports = {
         isVolatileProtocolField,
         looksSingleUseValue,
         entryHasAuthProtocolContext,
+        recordedServerProducer,
+        requestContainsValue,
+        responseContainsValue,
     },
 };

@@ -95,7 +95,9 @@ function knownDefinedVars(xml, extraNames = []) {
 function planExtractor(varName, candidateValues, entries, consumerOrder) {
     if (!Array.isArray(entries) || !entries.length) return null;
     const horizon = Math.min(consumerOrder, entries.length);
-    for (let i = 0; i < horizon; i++) {
+    // The nearest valid producer is the only safe choice when a request is
+    // retried or a bootstrap endpoint appears more than once.
+    for (let i = horizon - 1; i >= 0; i--) {
         const e = entries[i];
         const resp = e.response || {};
         const body = (resp.content && resp.content.text) || '';
@@ -132,7 +134,32 @@ function planExtractor(varName, candidateValues, entries, consumerOrder) {
             // 3) Response header / Set-Cookie source.
             for (const h of headers) {
                 const hv = String(h.value || '');
-                if (!hv.includes(value)) continue;
+                const locationQueryParam = /^location$/i.test(h.name || '') ? locationQueryParamForValue(hv, value) : null;
+                if (!hv.includes(value) && !locationQueryParam) continue;
+                if (locationQueryParam) {
+                    const queryParam = locationQueryParam;
+                    if (queryParam) {
+                        const expr = `(?:[?&])${escRegex(queryParam)}=([^&\\r\\n]+)`;
+                        const verified = verifyRegexPlan({
+                            varName,
+                            expr,
+                            useHeaders: true,
+                            body,
+                            headers,
+                            expectedValue: value,
+                            decodeCapture: true,
+                        });
+                        if (verified.ok) {
+                            return makeRegexExtractor(varName, expr, '$1$', true, i, label, 'location-query', verified.value, {
+                                origin: 'location-query',
+                                headerName: 'Location',
+                                queryParam,
+                                source: { kind: 'response-header', name: 'Location' },
+                                capture: { kind: 'query-param', name: queryParam, value },
+                            });
+                        }
+                    }
+                }
                 const isSetCookie = /^set-cookie$/i.test(h.name || '');
                 if (isSetCookie) {
                     // Cookie Manager handles cookies automatically; only emit
@@ -177,6 +204,16 @@ function cookieNameForValue(headerValue, expectedValue) {
         const m = part.trim().match(/^([\w.-]+)=([^;]*)/);
         if (m && m[2] === value) return m[1];
     }
+    return null;
+}
+
+function locationQueryParamForValue(location, expectedValue) {
+    try {
+        const parsed = new URL(String(location), 'https://location.invalid');
+        for (const [name, value] of parsed.searchParams) {
+            if (value === String(expectedValue)) return name;
+        }
+    } catch { /* invalid Location cannot produce a safe query extractor */ }
     return null;
 }
 
@@ -267,7 +304,7 @@ function makeJsonExtractor(varName, jsonPath, sourceOrder, sourceLabel) {
     return { type: 'json', sourceOrder, sourceLabel, block };
 }
 
-function makeRegexExtractor(varName, expr, template, useHeaders, sourceOrder, sourceLabel, originLabel, extractedValue = undefined) {
+function makeRegexExtractor(varName, expr, template, useHeaders, sourceOrder, sourceLabel, originLabel, extractedValue = undefined, metadata = {}) {
     const fieldToCheck = useHeaders ? 'true' : 'false';
     const block = `
             <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="Extract ${escXmlAttr(varName)} (${escXmlAttr(originLabel)})" enabled="true">
@@ -279,10 +316,10 @@ function makeRegexExtractor(varName, expr, template, useHeaders, sourceOrder, so
               <stringProp name="RegexExtractor.default">NOT_FOUND_${escXmlAttr(varName)}</stringProp>
             </RegexExtractor>
             <hashTree/>`;
-    return { type: 'regex', sourceOrder, sourceLabel, block, extractedValue };
+    return { type: 'regex', sourceOrder, sourceLabel, block, extractedValue, ...metadata };
 }
 
-function verifyRegexPlan({ expr, useHeaders, body, headers, expectedValue }) {
+function verifyRegexPlan({ expr, useHeaders, body, headers, expectedValue, decodeCapture = false }) {
     if (!expr || expectedValue == null) return { ok: false, reason: 'missing_input' };
     let rx;
     try {
@@ -296,10 +333,15 @@ function verifyRegexPlan({ expr, useHeaders, body, headers, expectedValue }) {
     const match = haystack.match(rx);
     if (!match) return { ok: false, reason: 'no_match' };
     if (match.length < 2) return { ok: false, reason: 'no_capture' };
-    if (match[1] !== String(expectedValue)) {
-        return { ok: false, reason: 'wrong_value', value: match[1] };
+    const captured = decodeCapture ? decodeQueryValue(match[1]) : match[1];
+    if (captured !== String(expectedValue)) {
+        return { ok: false, reason: 'wrong_value', value: captured };
     }
-    return { ok: true, value: match[1] };
+    return { ok: true, value: captured };
+}
+
+function decodeQueryValue(value) {
+    try { return decodeURIComponent(String(value).replace(/\+/g, ' ')); } catch { return String(value); }
 }
 
 function compileJMeterRegexForLocalProof(expr) {
@@ -363,5 +405,5 @@ module.exports = {
     knownDefinedVars,
     planExtractor,
     injectAfterSampler,
-    _internal: { escXmlAttr, escRegex, indexSamplers, findJsonPath, buildBodyRegex, verifyRegexPlan, cookieNameForValue, compileJMeterRegexForLocalProof },
+    _internal: { escXmlAttr, escRegex, indexSamplers, findJsonPath, buildBodyRegex, verifyRegexPlan, cookieNameForValue, locationQueryParamForValue, decodeQueryValue, compileJMeterRegexForLocalProof },
 };

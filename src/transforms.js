@@ -23,6 +23,7 @@ const path = require('path');
 const E = require('./engine');
 const { clientSideSnippetFor } = E.clientSide;
 const { extractStableTextCandidates } = E.assertionMiner;
+const { injectAfterSampler } = require('./extractors');
 
 const SAMPLER_CLOSE_TAG = '</HTTPSamplerProxy>';
 
@@ -813,6 +814,7 @@ function disableSamplersByPattern(xml, patterns, opts = {}) {
 function correlateFormHiddenInputs(xml, flatEntries, opts = {}) {
     const entries = flatEntries || [];
     const maxVars = Number.isFinite(Number(opts.maxVars)) ? Math.max(1, Number(opts.maxVars)) : 15;
+    const allowedPairs = opts.allowedPairs instanceof Set ? opts.allowedPairs : null;
     if (!xml || entries.length === 0) return { xml, wired: [], skippedByCap: [] };
 
     // 1. Producers: hidden inputs with substantial values in HTML responses.
@@ -828,6 +830,7 @@ function correlateFormHiddenInputs(xml, flatEntries, opts = {}) {
             if (!name || !value || value.length < 8) continue;
             if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(name)) continue;
             const key = `${name} ${value}`;
+            if (allowedPairs && !allowedPairs.has(key)) continue;
             if (seenPair.has(key)) continue;
             seenPair.add(key);
             candidates.push({ entryIndex: i, input: name, value });
@@ -842,17 +845,17 @@ function correlateFormHiddenInputs(xml, flatEntries, opts = {}) {
     //    the most-consumed maxVars (run.formCorrelation.maxVars to raise) and
     //    report what the cap skipped so a human can widen it deliberately.
     const withConsumers = candidates.map(c => {
-        let consumers = 0;
+        const consumerIndexes = [];
         for (let j = c.entryIndex + 1; j < entries.length; j++) {
             const req = entries[j]?.request || {};
             if ((req.url || '').includes(c.value) ||
                 (req.postData?.text || '').includes(c.value) ||
                 (req.postData?.params || []).some(p => String(p.value || '').includes(c.value)) ||
                 (req.headers || []).some(h => String(h.value || '').includes(c.value))) {
-                consumers++;
+                consumerIndexes.push(j);
             }
         }
-        return { ...c, consumers };
+        return { ...c, consumers: consumerIndexes.length, consumerIndexes };
     }).filter(c => c.consumers > 0).sort((a, b) => b.consumers - a.consumers);
     const consumed = withConsumers.slice(0, maxVars);
     const skippedByCap = withConsumers.slice(maxVars).map(c => ({ input: c.input, consumers: c.consumers }));
@@ -889,7 +892,7 @@ function correlateFormHiddenInputs(xml, flatEntries, opts = {}) {
               <boolProp name="HtmlExtractor.default_empty_value">false</boolProp>
             </HtmlExtractor>
             <hashTree/>`;
-        const injected = require('./extractors').injectAfterSampler(out, prodOrder, block);
+        const injected = injectAfterSampler(out, prodOrder, block);
         if (injected === out) continue;
         out = injected;
 
@@ -919,6 +922,9 @@ function correlateFormHiddenInputs(xml, flatEntries, opts = {}) {
             input: c.input,
             producerSampler: samplers[prodOrder].name,
             substitutions,
+            producerEntryIndex: c.entryIndex,
+            consumerIndexes: c.consumerIndexes,
+            recordedValue: c.value,
         });
     }
     return { xml: out, wired, skippedByCap };
@@ -951,12 +957,47 @@ function variableAlreadyDefined(xml, varName) {
 
 function stripGuiListenersForRun(xml, jtlPath) {
     let disabled = 0;
-    const out = xml.replace(/<ResultCollector\b([^>]*?)enabled="true"([^>]*)>/g, (_m, a, b) => {
+    let changed = false;
+    const out = String(xml || '').replace(/<ResultCollector\b([^>]*)>/g, (tag, attrs) => {
+        if (/testname="JTL \(perfscript-local\)"/i.test(attrs)) {
+            const enabled = tag.replace(/\benabled="false"/i, 'enabled="true"');
+            changed ||= enabled !== tag;
+            return enabled;
+        }
+        if (!/\benabled="true"/i.test(attrs)) return tag;
         disabled++;
-        return `<ResultCollector${a}enabled="false"${b}>`;
+        changed = true;
+        return tag.replace(/\benabled="true"/i, 'enabled="false"');
     });
-    const writer = `
-      <ResultCollector guiclass="SimpleDataWriter" testclass="ResultCollector" testname="JTL (perfscript-local)" enabled="true">
+    const writer = evidenceJtlWriter(jtlPath);
+    const existing = /<ResultCollector\b(?=[^>]*\btestname="JTL \(perfscript-local\)")[^>]*(?:\/>|>[\s\S]*?<\/ResultCollector>)/i;
+    if (existing.test(out)) {
+        const repaired = out.replace(existing, writer);
+        changed ||= repaired !== out;
+        return {
+            xml: repaired.trimEnd(), disabled, changed, writerAdded: false,
+            reason: changed ? 'repaired' : 'already_present', writerJtlPath: jtlPath,
+        };
+    }
+    const writerWithTree = `\n      ${writer}\n      <hashTree/>`;
+    const plan = /<TestPlan\b[^>]*?(?:\/>|>[\s\S]*?<\/TestPlan>)/i.exec(out);
+    if (!plan) return insertWriterInRootHashTree(out, writerWithTree, disabled, jtlPath, changed);
+    const treeOpen = /^\s*<hashTree\b[^>]*>/i.exec(out.slice(plan.index + plan[0].length));
+    if (!treeOpen) return { xml: out.trimEnd(), disabled, changed, writerAdded: false, reason: 'test_plan_hash_tree_not_found', writerJtlPath: jtlPath };
+    const treeStart = plan.index + plan[0].length + treeOpen[0].search(/<hashTree\b/i);
+    if (/\/\s*>$/.test(treeOpen[0])) {
+        const treeEnd = treeStart + treeOpen[0].slice(treeOpen[0].search(/<hashTree\b/i)).length;
+        const writerInsert = `${out.slice(0, treeStart)}<hashTree>${writerWithTree}\n</hashTree>${out.slice(treeEnd)}`.trimEnd();
+        return { xml: writerInsert, disabled, changed: true, writerAdded: true, reason: 'inserted', writerJtlPath: jtlPath };
+    }
+    const closeIndex = balancedHashTreeClose(out, treeStart);
+    if (closeIndex < 0) return { xml: out.trimEnd(), disabled, changed, writerAdded: false, reason: 'test_plan_hash_tree_not_found', writerJtlPath: jtlPath };
+    const writerInsert = `${out.slice(0, closeIndex)}${writerWithTree}\n${out.slice(closeIndex)}`.trimEnd();
+    return { xml: writerInsert, disabled, changed: true, writerAdded: true, reason: 'inserted', writerJtlPath: jtlPath };
+}
+
+function evidenceJtlWriter(jtlPath) {
+    return `<ResultCollector guiclass="SimpleDataWriter" testclass="ResultCollector" testname="JTL (perfscript-local)" enabled="true">
         <boolProp name="ResultCollector.error_logging">false</boolProp>
         <objProp>
           <name>saveConfig</name>
@@ -964,23 +1005,43 @@ function stripGuiListenersForRun(xml, jtlPath) {
             <time>true</time><latency>true</latency><timestamp>true</timestamp><success>true</success>
             <label>true</label><code>true</code><message>true</message><threadName>true</threadName>
             <dataType>true</dataType><encoding>false</encoding><assertions>true</assertions>
-            <subresults>true</subresults><responseData>false</responseData><samplerData>false</samplerData>
-            <xml>true</xml><fieldNames>true</fieldNames><responseHeaders>false</responseHeaders>
-            <requestHeaders>false</requestHeaders><responseDataOnError>false</responseDataOnError>
+            <subresults>true</subresults><responseData>false</responseData><samplerData>true</samplerData>
+            <xml>true</xml><fieldNames>true</fieldNames><responseHeaders>true</responseHeaders>
+            <requestHeaders>true</requestHeaders><responseDataOnError>false</responseDataOnError>
             <saveAssertionResultsFailureMessage>true</saveAssertionResultsFailureMessage>
             <assertionsResultsToSave>0</assertionsResultsToSave><bytes>true</bytes><sentBytes>true</sentBytes>
             <url>true</url><threadCounts>true</threadCounts><idleTime>true</idleTime><connectTime>true</connectTime>
           </value>
         </objProp>
         <stringProp name="filename">${escXmlAttr(jtlPath)}</stringProp>
-      </ResultCollector>
-      <hashTree/>`;
-    // Place inside the TestPlan's top-level hashTree (last child).
-    const idx = out.lastIndexOf('</hashTree>\n  </hashTree>');
-    const writerInsert = idx > 0
-        ? out.substring(0, idx) + writer + '\n        ' + out.substring(idx)
-        : out + writer;
-    return { xml: writerInsert, disabled, writerJtlPath: jtlPath };
+      </ResultCollector>`;
+}
+
+function insertWriterInRootHashTree(xml, writer, disabled, jtlPath, changed = false) {
+    const rootOpen = /<jmeterTestPlan\b[^>]*>/i.exec(xml);
+    if (!rootOpen) return { xml: xml.trimEnd(), disabled, changed, writerAdded: false, reason: 'root_hash_tree_not_found', writerJtlPath: jtlPath };
+    const treeOpen = /^\s*<hashTree\b[^>]*>/i.exec(xml.slice(rootOpen.index + rootOpen[0].length));
+    if (!treeOpen) return { xml: xml.trimEnd(), disabled, changed, writerAdded: false, reason: 'root_hash_tree_not_found', writerJtlPath: jtlPath };
+    const treeStart = rootOpen.index + rootOpen[0].length + treeOpen[0].search(/<hashTree\b/i);
+    const closeIndex = balancedHashTreeClose(xml, treeStart);
+    if (closeIndex < 0) return { xml: xml.trimEnd(), disabled, changed, writerAdded: false, reason: 'root_hash_tree_not_found', writerJtlPath: jtlPath };
+    return {
+        xml: `${xml.slice(0, closeIndex)}${writer}\n${xml.slice(closeIndex)}`.trimEnd(),
+        disabled, changed: true, writerAdded: true, reason: 'inserted', writerJtlPath: jtlPath,
+    };
+}
+
+function balancedHashTreeClose(xml, start) {
+    const tokens = /<\/?hashTree\b[^>]*>/gi;
+    tokens.lastIndex = start;
+    let depth = 0;
+    let token;
+    while ((token = tokens.exec(xml)) !== null) {
+        if (/^<hashTree\b[^>]*\/>$/i.test(token[0])) continue;
+        depth += /^<hashTree\b/i.test(token[0]) ? 1 : -1;
+        if (depth === 0) return token.index;
+    }
+    return -1;
 }
 
 /**

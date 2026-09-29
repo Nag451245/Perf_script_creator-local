@@ -19,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { summarizeFirstCorrelationDivergence } = require('./operator-diagnostics');
 
 const HISTORY_FILE = 'run_history.json';
 const MAX_HISTORY = 10;
@@ -59,13 +60,14 @@ function appendHistory(outDir, entry) {
 }
 
 /** The numbers worth comparing between two runs of the same flow. */
-function summarizeRun({ result = {}, gate = null, disabledCount = 0, verdict = '' } = {}) {
+function summarizeRun({ result = {}, gate = null, disabledCount = 0, verdict = '', verificationStatus = '' } = {}) {
     const samples = (result.samples || []).filter(s => s && !s.isTransaction);
     return {
         verdict,
         requests: samples.length,
         passed: samples.filter(s => s.success !== false).length,
         disabled: Number(disabledCount) || 0,
+        verificationStatus,
         gates: gate && Array.isArray(gate.failures) ? gate.failures.map(f => f.category) : [],
     };
 }
@@ -208,8 +210,14 @@ const SUMMARY_FILE = 'run_summary.json';
 
 function writeRunSummary(outDir, summary) {
     try {
+        const safeSummary = {
+            ...summary,
+            ...(summary && summary.firstCorrelationDivergence
+                ? { firstCorrelationDivergence: summarizeFirstCorrelationDivergence(summary.firstCorrelationDivergence) }
+                : {}),
+        };
         fs.writeFileSync(path.join(outDir, SUMMARY_FILE), JSON.stringify({
-            writtenAt: new Date().toISOString(), ...summary,
+            writtenAt: new Date().toISOString(), ...safeSummary,
         }, null, 2));
     } catch { /* the log still has it */ }
 }

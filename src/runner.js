@@ -38,11 +38,12 @@ const knowledgeBase = require('./knowledge-base');
 const diagnosisModule = require('./diagnosis');
 const experimentsModule = require('./experiments');
 const nonLoadBearingFold = require('./nonloadbearing-fold');
-const { redactForExternal } = require('./scrubber');
+const { redactForExternal, sanitizeRunEvidenceForExternal } = require('./scrubber');
 const blockersModule = require('./blockers');
 const replanner = require('./replanner');
 const seniorPeAnalysis = require('./senior-pe-analysis');
 const failureForensics = require('./failure-forensics');
+const correlationRuntimeProof = require('./correlation-runtime-proof');
 const { runFeedbackLoop } = require(path.join(ENGINE_ROOT, 'src/execution/feedbackLoop'));
 const autoPatcher = require(path.join(ENGINE_ROOT, 'src/execution/autoPatcher'));
 const aiService = require(path.join(ENGINE_ROOT, 'src/services/ai-service'));
@@ -58,7 +59,7 @@ const aiService = require(path.join(ENGINE_ROOT, 'src/services/ai-service'));
 // (see `runValidate` below). Kept backwards-compatible: still writes the
 // suggestions file; callers that ignore the return value (tests, older code)
 // keep working.
-async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLog, flowNotes = [], blueprintEvidence = null }) {
+async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLog, flowNotes = [], blueprintEvidence = null, evidence = null }) {
     const failures = collectLlmFailures(result);
     if (!failures.length) return [];
     if (!process.env.OPENAI_API_KEY && !aiService.isEnabled()) {
@@ -67,7 +68,7 @@ async function escalateToLlm({ result, jmxPath, correlations, outDir, name, onLo
     }
     try {
         const jmxContent = fs.readFileSync(jmxPath, 'utf8');
-        const prompt = buildGeminiFixPrompt({ failures, jmxContent, correlations, flowNotes, blueprintEvidence });
+        const prompt = buildGeminiFixPrompt({ failures, jmxContent, correlations, flowNotes, blueprintEvidence, evidence });
         // Say it out loud. Everything else in this product runs locally, so the
         // one step that ships recording content to a third party should not be
         // something the operator has to infer from a mode name.
@@ -237,7 +238,7 @@ function normalizeGeminiFixes(out) {
     return [];
 }
 
-function buildGeminiFixPrompt({ failures, jmxContent, correlations = [], flowNotes = [], blueprintEvidence = null }) {
+function buildGeminiFixPrompt({ failures, jmxContent, correlations = [], flowNotes = [], blueprintEvidence = null, evidence = null }) {
     const prioritizedFailures = prioritizeLlmFailures(failures || []);
     const failureSummary = prioritizedFailures.failures.map((f, i) => ({
         sampler: f.samplerName,
@@ -270,6 +271,7 @@ function buildGeminiFixPrompt({ failures, jmxContent, correlations = [], flowNot
         snippets: redactForExternal(snippets),
         correlations: redactForExternal(corrSummary),
         blueprint: blueprintEvidence ? redactForExternal(blueprintEvidence) : null,
+        runEvidence: evidence ? sanitizeRunEvidenceForExternal(evidence) : null,
     };
 
     const systemInstruction = `You are a senior performance engineer specializing in JMeter correlation, OAuth/OIDC/SAML replay, GraphQL/API validation, and load-test script hardening.
@@ -329,6 +331,9 @@ Hard rules:
 
 ${safe.blueprint ? `## BLUEPRINT EVIDENCE
 ${JSON.stringify(safe.blueprint, null, 2)}
+
+` : ''}${safe.runEvidence ? `## RUN EVIDENCE
+${JSON.stringify(safe.runEvidence, null, 2)}
 
 ` : ''}## FAILURES
 ${JSON.stringify(safe.failures, null, 2)}
@@ -1221,7 +1226,7 @@ function bodyCaptureProperties(runCfg = {}) {
         'perfscript.thinkTime': '0',
         'perfscript.thinkTimeRange': '0',
         'jmeter.save.saveservice.output_format': 'xml',
-        'jmeter.save.saveservice.samplerData': 'false',
+        'jmeter.save.saveservice.samplerData': 'true',
         'jmeter.save.saveservice.responseHeaders': 'true',
         'jmeter.save.saveservice.requestHeaders': 'true',
         // Cookies are the evidence auth failures are MADE of — which session
@@ -1229,7 +1234,6 @@ function bodyCaptureProperties(runCfg = {}) {
         // that a step got the login page but never why, and a whole class of
         // diagnosis stops at "the session is not established" with no next
         // step. They are small, and JMeter writes them as their own element.
-        'jmeter.save.saveservice.cookies': 'true',
         'jmeter.save.saveservice.url': 'true',
         'jmeter.save.saveservice.response_data': mode === 'full' ? 'true' : 'false',
         'jmeter.save.saveservice.response_data.on_error': mode === 'off' ? 'false' : 'true',
@@ -1369,6 +1373,9 @@ function attachFailureForensics({ result = {}, entries = [], evidence = null, ou
         entries,
         samples: result.samples || [],
         evidence,
+        runtimeProof: result.runtimeProof || (result.runtimeProofRootCause ? { firstDivergence: result.runtimeProofRootCause } : null)
+            || (result.replayPrefixDivergence ? { firstDivergence: result.replayPrefixDivergence } : null)
+            || (evidence && evidence.runtimeProof) || null,
     });
     result.failureForensics = analysis;
     if (blueprintCtx && blueprintCtx.validation) blueprintCtx.validation.failureForensics = analysis;
@@ -1669,6 +1676,8 @@ async function tryVerifiedCorrelationRepairRound({
         insecure: !!config.fastReplayInsecure,
         timeoutMs: config.timeoutMs,
         onLog,
+        correlationLedger: gen.correlationLedger,
+        targetHostMap: config.fastReplayTargetHostMap,
     });
     fs.writeFileSync(
         path.join(outDir, `${name}_correlation_fast_repair.json`),
@@ -1738,7 +1747,7 @@ async function tryVerifiedCorrelationRepairRound({
     };
 }
 
-async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, onLog, agentCfg, learningCfg, guard, flowNotes = [], blueprintEvidence = null, blueprintCtx = null }) {
+async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, onLog, agentCfg, learningCfg, guard, flowNotes = [], blueprintEvidence = null, blueprintCtx = null, evidence = null }) {
     const agent = normalizeAgentCfg(agentCfg);
     if (!agent.enabled) {
         onLog('agent mode disabled — keeping deterministic JMX as final');
@@ -1813,6 +1822,7 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
         const fixes = await escalateToLlm({
             result: finalResult, jmxPath: finalJmxPath,
             correlations: gen.correlations, outDir, name, onLog, flowNotes, blueprintEvidence,
+            evidence,
         });
         if (!fixes || !fixes.length) break;
 
@@ -1836,6 +1846,8 @@ async function runLlmPatchRounds({ result, jmxPath, config, gen, outDir, name, o
                 insecure: !!config.fastReplayInsecure,
                 timeoutMs: config.timeoutMs,
                 onLog,
+                correlationLedger: gen.correlationLedger,
+                targetHostMap: config.fastReplayTargetHostMap,
             });
             fastRepairRounds.push({ round, ...fastRepair });
             fs.writeFileSync(
@@ -2016,6 +2028,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         // corporate interception proxy — while fast-replay.js documented the
         // opposite. Carry the real setting instead of assuming.
         fastReplayInsecure: !!(enrichedRunCfg.fastReplay && enrichedRunCfg.fastReplay.insecure),
+        fastReplayTargetHostMap: fastReplayTargetHostMap(enrichedRunCfg),
         maxIterations,
         disableOnly: true, // already correlated; the loop only disables un-replayables
         timeoutMs: 4 * 60 * 1000,
@@ -2052,9 +2065,11 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     try {
         const originalJmx = fs.readFileSync(gen.jmxPath, 'utf8');
         const swap = stripGuiListenersForRun(originalJmx, stableJtl);
-        if (swap.disabled > 0) {
+        if (swap.changed) {
             fs.writeFileSync(gen.jmxPath, swap.xml);
-            onLog(`stripped ${swap.disabled} GUI listener(s); wired SimpleDataWriter -> final.jtl`);
+            onLog(`stripped ${swap.disabled} GUI listener(s); ${swap.writerAdded ? 'wired' : 'repaired'} SimpleDataWriter -> final.jtl`);
+        } else if (swap.reason !== 'already_present') {
+            onLog(`listener writer not added: ${swap.reason}`);
         }
     } catch (e) { onLog(`listener strip skipped: ${e.message}`); }
     try {
@@ -2493,15 +2508,34 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     if (!finalResult.success && !envFailure.environment) {
         if (agent.enabled && targetBaseUrl) {
             try {
+                const earlyJmx = finalJmxPath && fs.existsSync(finalJmxPath) ? fs.readFileSync(finalJmxPath, 'utf8') : '';
+                const earlyRuntimeProof = correlationRuntimeProof.buildCorrelationRuntimeProof({
+                    entries: gen.flat, runEvidence: currentEvidence, correlations: gen.correlations, appliedLinks: gen.appliedCorrelationLinks,
+                    ledger: gen.correlationLedger, jmx: earlyJmx,
+                    protectedIndexes: protectedEntryIndexes(strictGuard, gen.flat),
+                });
                 const failingResponses = await responseEvidence.collectFailingResponseEvidence({
                     entries: gen.flat,
                     failures: collectLlmFailures(finalResult),
                     targetBaseUrl,
                     insecure: !!(enrichedRunCfg.fastReplay && enrichedRunCfg.fastReplay.insecure),
                     timeoutMs: enrichedRunCfg.fastReplay && enrichedRunCfg.fastReplay.timeoutMs,
+                    correlationLedger: gen.correlationLedger,
+                    runEvidence: currentEvidence,
+                    runtimeProof: earlyRuntimeProof,
+                    targetHostMap: enrichedRunCfg.fastReplay && enrichedRunCfg.fastReplay.targetHostMap,
                 });
                 if (failingResponses.length) {
                     blueprintCtx.validation.failingResponses = failingResponses;
+                    const earliestPrefixDivergence = failingResponses
+                        .map(item => item.firstDivergence)
+                        .filter(Boolean)
+                        .sort((a, b) => Number(a.index) - Number(b.index))[0];
+                    if (earliestPrefixDivergence) {
+                        finalResult.replayPrefixDivergence = toReplayPrefixDivergence(earliestPrefixDivergence);
+                        attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
+                        refreshBlueprintFirstFailure(blueprintCtx, finalResult);
+                    }
                     blueprintEvidence = { ...summarizeBlueprintEvidence(blueprintCtx), failingResponses };
                     onLog(`blueprint evidence: captured ${failingResponses.length} failing response body excerpt(s)`);
                 }
@@ -2513,7 +2547,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         if (steering.active) steering.say('Deterministic repair is exhausted — starting AI escalation. Guidance sent now reaches the model.');
         const flowNotes = Array.isArray(enrichedRunCfg.llmFlowNotes) ? enrichedRunCfg.llmFlowNotes : [];
         const llm = await runLlmPatchRounds({
-            result: finalResult, jmxPath: finalJmxPath, config, gen, outDir, name, onLog, agentCfg: agent, learningCfg: learning, guard: strictGuard, flowNotes, blueprintEvidence, blueprintCtx,
+            result: finalResult, jmxPath: finalJmxPath, config, gen, outDir, name, onLog, agentCfg: agent, learningCfg: learning, guard: strictGuard, flowNotes, blueprintEvidence, blueprintCtx, evidence: currentEvidence,
         });
         finalJmxPath = llm.jmxPath;
         finalJmxPathRef.value = finalJmxPath;
@@ -2574,7 +2608,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
                 const gen2 = generate(entries, pages, replanDir, name, { ...genOpts, runCfg: replanCfg });
                 try {
                     const swap = stripGuiListenersForRun(fs.readFileSync(gen2.jmxPath, 'utf8'), stableJtl);
-                    if (swap.disabled > 0) fs.writeFileSync(gen2.jmxPath, swap.xml);
+                    if (swap.changed) fs.writeFileSync(gen2.jmxPath, swap.xml);
                 } catch { /* keep unstripped */ }
                 applyJavaSafeGuard({ jmxPath: gen2.jmxPath, outDir: replanDir, name, label: `replan_${attempt}`, enabled: agent.javaSafeMode, onLog });
                 try { fs.rmSync(stableJtl, { force: true }); } catch { /* locked */ }
@@ -2771,6 +2805,37 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         const gr = (currentEvidence && currentEvidence.rows || []).filter(r => !r.isTransaction);
         onLog(`green gate input: ${gr.length} evidence row(s) · ${gr.filter(r => String(r.observedBody || '')).length} with bodies · ${gr.filter(r => String(r.observedBody || '') && String(r.recordedBody || '')).length} comparable`);
     }
+    // Correlation planning is not proof: require the shipped JMX extractor,
+    // the live producer response, and the actual rendered consumer request.
+    // A body-less JTL therefore remains explicitly UNVERIFIED rather than
+    // silently promoting a status-only run to green.
+    try {
+        const finalJmx = finalJmxPath && fs.existsSync(finalJmxPath) ? fs.readFileSync(finalJmxPath, 'utf8') : '';
+        const runtimeProof = correlationRuntimeProof.buildCorrelationRuntimeProof({
+            entries: gen.flat,
+            runEvidence: currentEvidence,
+            correlations: gen.correlations,
+            appliedLinks: gen.appliedCorrelationLinks,
+            ledger: gen.correlationLedger,
+            jmx: finalJmx,
+            protectedIndexes: protectedEntryIndexes(strictGuard, gen.flat),
+        });
+        finalResult.runtimeProof = runtimeProof;
+        if (currentEvidence) currentEvidence.runtimeProof = runtimeProof;
+        if (runtimeProof.status !== 'VERIFIED' && runtimeProof.firstDivergence) {
+            finalResult.runtimeProofRootCause = {
+                category: 'upstream_correlation_runtime_failure',
+                ...runtimeProof.firstDivergence,
+            };
+        }
+        onLog(`runtime correlation proof: ${runtimeProof.status} (${runtimeProof.counts.verified} verified, ${runtimeProof.counts.failed} failed, ${runtimeProof.counts.unverified} unverified)`);
+    } catch (e) {
+        finalResult.runtimeProof = { status: 'UNVERIFIED', links: [], firstDivergence: { kind: 'runtime_proof_error', reason: e.message }, counts: { verified: 0, failed: 0, unverified: 0, total: 0 } };
+        if (currentEvidence) currentEvidence.runtimeProof = finalResult.runtimeProof;
+    }
+    if (currentEvidence) {
+        attachFailureForensics({ result: finalResult, entries: gen.flat, evidence: currentEvidence, outDir, name, blueprintCtx, onLog });
+    }
     const finalGate = finalGreenGate.evaluateFinalGreenGate({
         result: finalResult,
         baselineDiff,
@@ -2781,6 +2846,7 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
         requireAssertions: enrichedRunCfg.requireAssertions === true,
         softFailurePatterns: enrichedRunCfg.softFailurePatterns || [],
         invariants: gen.businessInvariants || null,
+        runtimeProof: finalResult.runtimeProof,
     });
     finalResult.finalGreenGate = finalGate;
     fs.writeFileSync(path.join(outDir, `${name}_final_green_gate.json`), JSON.stringify(finalGate, null, 2));
@@ -2906,6 +2972,30 @@ async function runValidate({ entries, pages, outDir, name, runCfg = {}, maxItera
     };
 }
 
+function protectedEntryIndexes(guard = {}, entries = []) {
+    const names = new Set((guard.protectedSamplers || []).map(item => String(item.name || '').trim()));
+    return (entries || []).flatMap((entry, index) => {
+        const label = String(entry && entry._samplerLabel || '');
+        return names.has(label) ? [index] : [];
+    });
+}
+
+function fastReplayTargetHostMap(runCfg = {}) {
+    const map = runCfg && runCfg.fastReplay && runCfg.fastReplay.targetHostMap;
+    return map && typeof map === 'object' && !Array.isArray(map) ? map : null;
+}
+
+function toReplayPrefixDivergence(divergence = {}) {
+    const prerequisiteIndex = divergence.prerequisiteIndex ?? divergence.index;
+    return {
+        ...divergence,
+        prerequisiteIndex,
+        producerIndex: divergence.producerIndex ?? prerequisiteIndex,
+        consumerIndex: divergence.consumerIndex,
+        reason: divergence.reason || divergence.kind,
+    };
+}
+
 module.exports = {
     runValidate,
     deriveBaseUrl,
@@ -2920,6 +3010,8 @@ module.exports = {
         runSemanticTriage,
         watchForStallOrCap,
         runLogShowsEndOfTest,
+        fastReplayTargetHostMap,
+        toReplayPrefixDivergence,
         latestIterationDirFor,
         normalizeAgentCfg,
         normalizeLearningCfg,

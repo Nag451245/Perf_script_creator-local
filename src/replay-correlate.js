@@ -135,7 +135,7 @@ const PLUMBING = [
     'domainreliability', 'safebrowsing', 'passwordsleakcheck', '.dynatrace.', 'gvt2.com',
 ];
 
-async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = true, timeoutMs, skipPatterns = PLUMBING, onLog = () => {} }) {
+async function correlateAndReplay({ entries, runEvidence = null, targetBaseUrl = null, insecure = true, timeoutMs, skipPatterns = PLUMBING, onLog = () => {} }) {
     const { links, orphans } = buildLinks(entries);
     onLog(`pre-pass: ${links.length} producer→consumer link(s), ${orphans.length} orphan value(s) (client-gen/synth candidates)`);
 
@@ -152,6 +152,7 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
     const samples = [];
     const failures = [];
     const appliedSet = new Set();
+    const consumerProof = [];
 
     // Latest-wins model: a value can surface in ANY live response (incl. a
     // FOLLOWED redirect — the auth `code` lands in /iam/callback). At consume
@@ -201,6 +202,7 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
                 if (bodyS && bodyS.includes(lk.value)) bodyS = bodyS.split(lk.value).join(ref);
                 for (const h of clone.request.headers || []) if (h.value && h.value.includes(lk.value)) h.value = h.value.split(lk.value).join(ref);
                 appliedSet.add(lk.varName);
+                consumerProof.push({ index: i, variable: lk.varName, transmitted: live, fresh: live !== lk.value });
             }
             clone.request.url = urlS;
             if (clone.request.postData) clone.request.postData.text = bodyS;
@@ -245,7 +247,46 @@ async function correlateAndReplay({ entries, targetBaseUrl = null, insecure = tr
         failures,
         samples,
         reachedEnd: failures.length === 0,
+        ...(runEvidence ? { runtimeProof: replayRuntimeProof({ runEvidence, entries, consumerProof }) } : {}),
     };
+}
+
+function replayRuntimeProof({ runEvidence, entries, consumerProof }) {
+    const rejected = [];
+    const seen = new Set();
+    const push = (value, reason) => {
+        const key = `${reason}\n${value}`;
+        if (!seen.has(key)) { seen.add(key); rejected.push({ value, reason }); }
+    };
+    for (const row of runEvidence.rows || []) {
+        const rendered = row.renderedRequest || {};
+        const values = renderedValues(rendered);
+        const recorded = entries[row.entryIndex] || {};
+        const stale = requestValues(recorded);
+        for (const value of values) {
+            if (value === '') push(value, 'empty');
+            else if (/(?:_NOTFOUND\b|\bNOT_FOUND_)/i.test(value)) push(value, 'not_found');
+            else if (/\$\{[^}]+\}/.test(value)) push(value, 'unresolved_variable');
+            else if (stale.includes(value)) push(value, 'stale_recorded');
+        }
+    }
+    return { rejected, consumers: consumerProof };
+}
+
+function renderedValues(rendered = {}) {
+    const values = [];
+    const url = String(rendered.url || '');
+    try {
+        const parsed = new URL(url);
+        for (const [, value] of parsed.searchParams) values.push(value);
+    } catch { /* malformed evidence stays non-fatal */ }
+    const body = String(rendered.body || '');
+    for (const segment of body.split('&')) {
+        const equals = segment.indexOf('=');
+        if (equals >= 0) values.push(decodeURIComponent(segment.slice(equals + 1).replace(/\+/g, ' ')));
+    }
+    for (const header of rendered.headers || []) values.push(String(header && header.value || ''));
+    return values;
 }
 
 module.exports = { correlateAndReplay, buildLinks, _internal: { isDynamic, requestValues, boundaryOf, extractByBoundary, shouldOverrideRedirectHost } };

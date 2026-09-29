@@ -22,13 +22,18 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const assert = require('node:assert/strict');
 
 const ROOT = path.join(__dirname, '..');
 const CORPUS = path.join(ROOT, 'eval-corpus');
 const { groupInputs, loadUnit } = require('../src/ingest');
 const { generate } = require('../src/generate');
+const recordingEvidence = require('../src/recording-evidence-adapter');
+const { planReplayDependencies } = require('../src/replay-dependencies');
+const { buildCorrelationRuntimeProof } = require('../src/correlation-runtime-proof');
 
 async function main() {
+    runDeterministicFixtureAssertions();
     if (!fs.existsSync(CORPUS)) {
         console.log('No eval-corpus/ directory — nothing to evaluate.');
         return 0;
@@ -77,6 +82,45 @@ async function main() {
 
     console.log(failures ? `\nEVAL FAILED — ${failures}/${flows.length} flow(s) regressed.` : `\nEVAL PASSED — ${flows.length} flow(s).`);
     return failures ? 1 : 0;
+}
+
+// These are deliberately local and JMeter-free. They defend the input/proof
+// contracts that cannot be made reliable by a live external-engine gate:
+// methodless proxy XML, nested redirect samples, auth prerequisites, and a
+// consumer that still renders a recorded (stale) token.
+function runDeterministicFixtureAssertions() {
+    const request = (url, method = 'GET') => ({
+        request: { method, url, headers: [], queryString: [] },
+        response: { status: 0, headers: [], content: { text: '' } },
+    });
+    const methodlessXml = `<?xml version="1.0"?><testResults><httpSample rc="200" rm="OK"><java.net.URL>https://app.test/login</java.net.URL><responseData class="java.lang.String">login-body</responseData></httpSample></testResults>`;
+    const paired = recordingEvidence.parseAndPair([request('https://app.test/login')], methodlessXml, 'methodless.xml');
+    assert.equal(paired.coverage.paired, 1, 'methodless XML pairs by URL');
+    assert.equal(paired.entries[0].response.content.text, 'login-body');
+
+    const nestedRedirectXml = `<?xml version="1.0"?><testResults><httpSample rc="200" rm="OK"><java.net.URL>https://app.test/start</java.net.URL><httpSample rc="302" rm="Found"><java.net.URL>https://app.test/callback</java.net.URL><httpSample rc="200" rm="OK"><java.net.URL>https://app.test/complete</java.net.URL><responseData class="java.lang.String">callback-body</responseData></httpSample></httpSample></httpSample></testResults>`;
+    const nested = recordingEvidence.parseAndPair([request('https://app.test/start')], nestedRedirectXml, 'redirect.xml');
+    assert.equal(nested.coverage.paired, 1, 'nested redirect child is available for pairing');
+    assert.equal(nested.entries[0]._recordingEvidence.redirects[0].url, 'https://app.test/callback');
+
+    const authPlan = planReplayDependencies({
+        entries: [request('https://app.test/login', 'POST'), request('https://app.test/orders', 'POST')],
+        targetIndexes: [1],
+    });
+    assert.ok(authPlan.indexes.includes(0), 'auth dependency precedes protected mutation');
+
+    const staleProof = buildCorrelationRuntimeProof({
+        entries: [request('https://app.test/login'), request('https://app.test/orders', 'POST')],
+        correlations: [{ variableName: 'token', value: 'recorded-token', producerEntryIndex: 0, targetRequestIndex: 1 }],
+        runEvidence: { rows: [
+            { entryIndex: 0, success: true, observedBody: '{"token":"fresh-token"}', renderedRequest: { body: '' } },
+            { entryIndex: 1, success: true, observedBody: '{}', renderedRequest: { body: 'token=recorded-token' } },
+        ] },
+        jmx: '<jmeterTestPlan/>',
+        protectedIndexes: [1],
+    });
+    assert.notEqual(staleProof.status, 'VERIFIED', 'stale-token consumer cannot be runtime verified');
+    console.log('Synthetic fixture assertions passed: methodless sidecar, nested redirect, auth dependency, stale-token proof.');
 }
 
 function compareStats(expected, actual) {

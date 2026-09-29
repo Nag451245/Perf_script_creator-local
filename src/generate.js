@@ -28,6 +28,7 @@ const { synthesizeCsv } = E.dataSynth;
 const { detectClientSideDynamic } = E.clientSide;
 const { knownDefinedVars, planExtractor, injectAfterSampler } = require('./extractors');
 const { correlateBodyDynamics } = require('./auto-correlate');
+const { buildCorrelationLedger } = require('./correlation-ledger');
 const { propagateGraphqlCsrfTokens } = require('./graphql-auth-repair');
 const { rewriteHost } = require('./host-rewrite');
 const { sanitizeJavaUnsafeJmx } = require('./java-safe');
@@ -679,10 +680,167 @@ function observedVolatileAuthProtocolNames(entries) {
     return volatileProtocol.observedVolatileProtocolNames(entries);
 }
 
+function filterCorrelationsByLedger(correlations, ledger) {
+    const kept = [];
+    const removed = [];
+    for (const correlation of correlations || []) {
+        const name = String(correlation.variableName || correlation.name || '');
+        const value = String(correlation.value == null ? '' : correlation.value);
+        const item = (ledger && ledger.entries || []).find(entry =>
+            String(entry.name) === name && String(entry.value) === value);
+        if (!item || item.role !== 'server-issued-correlation') {
+            removed.push({ correlation, role: item ? item.role : 'unresolved', reason: 'ledger does not prove a server-issued source' });
+            continue;
+        }
+        const target = Number(correlation.targetRequestIndex);
+        const link = (item.consumerLinks || []).find(candidate => candidate.consumerIndex === target)
+            || item.consumerLinks && item.consumerLinks[0];
+        if (!link) {
+            removed.push({ correlation, role: item.role, reason: 'ledger has no producer-before-consumer link' });
+            continue;
+        }
+        kept.push({ ...correlation, sourceRequestIndex: link.producerIndex, producerEntryIndex: link.producerIndex });
+    }
+    return { kept, removed };
+}
+
+function verifiedHiddenFormPairs(entries, ledger) {
+    const pairs = new Set();
+    for (const item of (ledger && ledger.entries) || []) {
+        if (item.role !== 'server-issued-correlation' || !(item.consumerLinks || []).length) continue;
+        for (const index of item.producerIndexes || []) {
+            const body = String(entries[index] && entries[index].response && entries[index].response.content && entries[index].response.content.text || '');
+            if (!/<form\b/i.test(body)) continue;
+            for (const tag of body.match(/<input\b[^>]*>/gi) || []) {
+                if (!/type\s*=\s*["']?hidden/i.test(tag)) continue;
+                const name = (tag.match(/\bname\s*=\s*["']([^"']+)["']/i) || [])[1];
+                const value = (tag.match(/\bvalue\s*=\s*["']([^"']*)["']/i) || [])[1];
+                if (name === item.name && value === item.value) pairs.add(`${name}\0${value}`);
+            }
+        }
+    }
+    return pairs;
+}
+
+function mergeAppliedCorrelationLinks({ formCorrelations = [], bodyPlans = [], ledger = null } = {}) {
+    const links = [];
+    for (const form of formCorrelations || []) {
+        const ledgerItem = (ledger && ledger.entries || []).find(item =>
+            item.role === 'server-issued-correlation' && item.name === form.input && item.value === form.recordedValue);
+        if (!ledgerItem) continue;
+        for (const consumerIndex of form.consumerIndexes || []) {
+            const sink = (ledgerItem.sinks || []).find(item => item.entryIndex === consumerIndex && item.location === `form:${form.input}`);
+            links.push({
+                variableName: form.var,
+                value: form.recordedValue,
+                producerEntryIndex: form.producerEntryIndex,
+                targetRequestIndex: consumerIndex,
+                sinkLocation: sink && sink.location || `form:${form.input}`,
+                sinkName: sink && sink.name || form.input,
+                sinkEncoding: sink && sink.encoding || 'plain',
+                role: ledgerItem.role,
+            });
+        }
+    }
+    for (const plan of bodyPlans || []) {
+        const item = (ledger && ledger.entries || []).find(entry =>
+            entry.role === 'server-issued-correlation' && entry.name === plan.name && entry.value === plan.value);
+        for (const link of item && item.consumerLinks || []) {
+            if (Number.isInteger(plan.producerEntryIndex) && link.producerIndex !== plan.producerEntryIndex) continue;
+            if (Number.isInteger(plan.consumerEntryIndex) && link.consumerIndex !== plan.consumerEntryIndex) continue;
+            links.push({
+                variableName: plan.var || plan.name,
+                value: item.value,
+                producerEntryIndex: link.producerIndex,
+                targetRequestIndex: link.consumerIndex,
+                sinkLocation: link.location || (item.sinks || []).find(sink => sink.entryIndex === link.consumerIndex)?.location || '',
+                sinkName: link.name || (item.sinks || []).find(sink => sink.entryIndex === link.consumerIndex)?.name || '',
+                sinkEncoding: link.encoding || (item.sinks || []).find(sink => sink.entryIndex === link.consumerIndex)?.encoding || 'plain',
+                role: item.role,
+            });
+        }
+    }
+    const seen = new Set();
+    return links
+        .filter(link => {
+            const key = `${link.variableName}\0${link.value}\0${link.producerEntryIndex}\0${link.targetRequestIndex}\0${link.sinkLocation}\0${link.sinkName}\0${link.sinkEncoding}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        })
+        .sort((a, b) => a.producerEntryIndex - b.producerEntryIndex || a.targetRequestIndex - b.targetRequestIndex || a.variableName.localeCompare(b.variableName));
+}
+
+function summarizeResponseEvidence(entries) {
+    const list = Array.isArray(entries) ? entries : [];
+    const hasCapturedStatus = (entry) => {
+        const status = Number(entry && entry.response && entry.response.status);
+        return Number.isInteger(status) && status >= 100 && status <= 599;
+    };
+    const hasBody = (entry) => String(entry && entry.response && entry.response.content && entry.response.content.text || '') !== '';
+    const hasHeaders = (entry) => Array.isArray(entry && entry.response && entry.response.headers) && entry.response.headers.length > 0;
+    const withStatus = list.filter(hasCapturedStatus).length;
+    const withBody = list.filter(hasBody).length;
+    const withHeaders = list.filter(hasHeaders).length;
+    const withCapturedEvidence = list.filter(entry => hasCapturedStatus(entry) && (hasBody(entry) || hasHeaders(entry))).length;
+    const pct = (count) => list.length ? Math.round((count / list.length) * 100) : 0;
+    return {
+        total: list.length,
+        withStatus,
+        withBody,
+        withHeaders,
+        withCapturedEvidence,
+        statusPct: pct(withStatus),
+        bodyPct: pct(withBody),
+        headersPct: pct(withHeaders),
+        correlationBlind: list.length > 0 && withCapturedEvidence === 0,
+    };
+}
+
+function summarizePairingEvidence(hints = {}) {
+    const values = [hints.pairing, hints.jmxJtl, hints.jmx1JtlPairing, hints.jmx2JtlPairing].filter(Boolean);
+    const missing = values.filter(value => String(value.status || '').toUpperCase() === 'MISSING').length
+        + Number(Boolean(hints.jmxJtlError || hints.jmx1SidecarError || hints.jmx2SidecarError || hints.sidecarMissing));
+    const paired = values.reduce((sum, value) => sum + Number(value.paired || 0), 0);
+    const total = values.reduce((sum, value) => sum + Number(value.total || 0), 0);
+    const unmatched = values.reduce((sum, value) => sum + Number(value.unmatched || 0), 0);
+    const ambiguous = values.reduce((sum, value) => sum + Number(value.ambiguous || 0), 0);
+    const partial = values.some(value => String(value.status || '').toUpperCase() === 'PARTIAL'
+        || Number(value.unmatched || 0) > 0 || Number(value.ambiguous || 0) > 0 || value.lowCoverage);
+    return {
+        notes: values.length,
+        paired,
+        total,
+        unmatched,
+        ambiguous,
+        missing,
+        status: missing ? (paired > 0 ? 'PARTIAL' : 'MISSING') : (partial ? 'PARTIAL' : 'AVAILABLE'),
+    };
+}
+
+function summarizeCorrelationEvidence(responseEvidence, pairingCoverage) {
+    const responseStatus = !responseEvidence.total || responseEvidence.withCapturedEvidence === 0
+        ? 'MISSING'
+        : (responseEvidence.withCapturedEvidence === responseEvidence.total ? 'AVAILABLE' : 'PARTIAL');
+    if (pairingCoverage.status === 'MISSING') return 'MISSING';
+    if (pairingCoverage.status === 'PARTIAL' || responseStatus === 'PARTIAL') return 'PARTIAL';
+    return responseStatus;
+}
+
+function summarizeEngineLimitRisk(entries, hints = {}) {
+    const jmx = hints.jmx || {};
+    const jtl = hints.jtl || {};
+    return {
+        entryCapReached: (Array.isArray(entries) && entries.length >= 500) || Number(jmx.entries || hints.entries || 0) >= 500,
+        rawCorrelationCapReached: Number(jtl.rawCorrelations || hints.rawCorrelations || 0) >= 100,
+    };
+}
+
 function generate(entriesRaw, pages, outDir, name, opts = {}) {
     const { dataRows = 10, dualHarHints = {} } = opts;
     let runCfg = opts.runCfg || {};
     fs.mkdirSync(outDir, { recursive: true });
+    const killedProducers = [];
     const reasoning = [];
     const note = (phase, hypothesis, evidence, action) =>
         reasoning.push({ phase, hypothesis, evidence, action, at: new Date().toISOString() });
@@ -741,6 +899,29 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         flat.push(e);
     });
 
+    const responseEvidence = summarizeResponseEvidence(flat);
+    const pairingCoverage = summarizePairingEvidence(dualHarHints);
+    const correlationEvidence = summarizeCorrelationEvidence(responseEvidence, pairingCoverage);
+    const engineLimitRisk = summarizeEngineLimitRisk(entriesRaw, dualHarHints);
+    if (engineLimitRisk.entryCapReached) {
+        note('engine-limit-risk',
+            'historical external-engine 500-entry processing ceiling reached',
+            `${entriesRaw.length} input entries; generation continues without truncating this local flow`,
+            'treat external-engine coverage as potentially incomplete and inspect response/pairing evidence before relying on the correlation count');
+    }
+    if (engineLimitRisk.rawCorrelationCapReached) {
+        note('engine-limit-risk',
+            'historical external-engine 100-raw-correlation processing ceiling reached',
+            `raw correlation evidence is at or beyond 100; generation continues without changing correlation behavior`,
+            'treat external-engine correlation coverage as potentially incomplete and inspect the ledger plus unresolved sinks');
+    }
+    if (correlationEvidence !== 'AVAILABLE') {
+        note('correlation-evidence',
+            `response-side pairing evidence is ${correlationEvidence}`,
+            'generation remains allowed, but missing or partial response evidence cannot prove complete correlation coverage',
+            'attach complete JMX recording.xml/JTL sidecars and validate with a final green gate before marking the script VERIFIED');
+    }
+
     // CORRELATION-BLIND CHECK. Correlation reads values OUT of responses; if
     // the recording carries none (a JMX whose sidecar never paired), every
     // dynamic token ships as the recorded literal and the script cannot work.
@@ -765,8 +946,42 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
 
     // 2. Correlate + relevance gate.
     const rawCorrs = new CorrelationEngine().detectCorrelations(flat);
-    let { kept: corrs } = filterForGeneration(rawCorrs);
-    const oauthStatic = filterBareOauthStateNonceCorrelations(corrs, flat);
+    const correlationLedger = buildCorrelationLedger({
+        primaryEntries: flat,
+        secondaryEntries: opts.secondaryEntries || [],
+        candidates: rawCorrs.map(correlation => ({
+            name: correlation.variableName || correlation.name,
+            value: correlation.value,
+        })),
+    });
+    const formPairKeys = verifiedHiddenFormPairs(flat, correlationLedger);
+    if (correlationLedger.unresolvedSinks.length) {
+        note('correlation-ledger',
+            `${correlationLedger.unresolvedSinks.length} request value(s) remain unresolved`,
+            correlationLedger.unresolvedSinks.map(item => `${item.name} at entries ${item.sinkIndexes.join(', ')}`).join('; '),
+            'do not invent an extractor; record the precise missing producer or generation algorithm');
+    }
+    const ledgerFiltered = filterCorrelationsByLedger(rawCorrs, correlationLedger);
+    if (ledgerFiltered.removed.length) {
+        note('correlation-ledger',
+            `${ledgerFiltered.removed.length} engine correlation(s) excluded by value role`,
+            ledgerFiltered.removed.map(item => `${item.correlation.variableName || item.correlation.name}: ${item.role}`).join('; '),
+            'only exact server-issued producer-to-consumer links reach extractor planning');
+    }
+    let { kept: corrs } = filterForGeneration(ledgerFiltered.kept);
+    if (formPairKeys.size) {
+        const before = corrs.length;
+        corrs = corrs.filter(correlation => !formPairKeys.has(
+            `${correlation.variableName || correlation.name || ''}\0${correlation.value == null ? '' : correlation.value}`
+        ));
+        if (corrs.length !== before) {
+            note('form-correlation-plan',
+                `${before - corrs.length} ledger-proven hidden form value(s) reserved for native form correlation`,
+                'the producer is an HTML form response and the ledger proves a later request sink',
+                'deferred generic extractor rendering so correlateFormHiddenInputs owns the native CSS extractor exactly once');
+        }
+    }
+    const oauthStatic = volatileProtocol.filterVolatileProtocolCorrelations(corrs, flat, correlationLedger);
     corrs = oauthStatic.kept;
     const volatileNames = new Set([
         ...oauthStatic.removed.map(c => String(c.variableName || c.name || '').toLowerCase()),
@@ -776,8 +991,21 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         `${volatileNames.size} volatile OAuth/protocol field name(s) identified: ${[...volatileNames].join(', ')}`,
         `state/nonce/code-style values in auth protocol context are single-use or client-minted protocol plumbing`,
         `left them out of correlation planning so deterministic repair and AI do not fight stale protocol values`);
+    if (oauthStatic.diagnostics.length) {
+        note('volatile-protocol',
+            `${oauthStatic.removed.length} volatile correlation(s) dropped; ${oauthStatic.kept.length} kept`,
+            oauthStatic.diagnostics.map(item => `${item.name}: ${item.decision}`).join('; '),
+            'server-produced protocol values remain eligible for correlation; request-only client-minted values stay filtered');
+    }
     uniquifyVariableNames(corrs); // disambiguate name collisions (state x7, nonce x3, id x9)
     placementFixer.fix(corrs, flat);
+    // Placement validation may use path heuristics, but it must never replace
+    // the ledger's proven occurrence when duplicate endpoints exist.
+    for (const correlation of corrs) {
+        if (Number.isInteger(correlation.producerEntryIndex)) {
+            correlation.sourceRequestIndex = correlation.producerEntryIndex;
+        }
+    }
 
     // 3. Group into PE-readable business transactions while preserving request
     // order and Step NN alignment through the label map.
@@ -1211,6 +1439,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // pass so that pass cannot rewrite the CSS extractors emitted here.
     const formCorr = correlateFormHiddenInputs(xml, flat, {
         maxVars: runCfg.formCorrelation && runCfg.formCorrelation.maxVars,
+        allowedPairs: formPairKeys,
     });
     if (formCorr.skippedByCap && formCorr.skippedByCap.length) {
         note('form-correlation',
@@ -1414,7 +1643,6 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         // still wins, but this cannot stay quiet.
         try {
             const idxByName = new Map(indexSamplersForGenerate(xml).map(s => [s.name, s.order]));
-            const killedProducers = [];
             for (const nm of dis.hits || []) {
                 const i = idxByName.get(nm);
                 if (i == null || !flat[i]) continue;
@@ -1427,14 +1655,14 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
                 if (cookies.length || produced.length) {
                     killedProducers.push({
                         name: nm,
-                        evidence: [cookies.length ? `sets ${cookies.slice(0, 3).join(',')}` : '',
-                            produced.length ? `produces ${produced.slice(0, 2).map(v => v.slice(0, 14) + '…').join(',')}` : ''].filter(Boolean).join('; '),
+                        reason: [cookies.length ? 'sets session/auth cookie material' : '',
+                            produced.length ? 'produces a value consumed downstream' : ''].filter(Boolean).join('; '),
                     });
                 }
             }
             if (killedProducers.length) note('disable-calls-session-risk',
                 `OPERATOR DISABLE KILLS A PROVEN PRODUCER — ${killedProducers.length} sampler(s) whose recorded output the flow depends on are force-disabled`,
-                killedProducers.map(k => `${k.name} (${k.evidence})`).join(' | '),
+                killedProducers.map(k => `${k.name} (${k.reason})`).join(' | '),
                 `run.disableCalls is GLOBAL: a disable tuned for one flow poisons every flow. If this run walls at login pages, remove these entries or scope them per flow.`);
         } catch { /* advisory only — never blocks generation */ }
         if (dis.skippedProtected && dis.skippedProtected.length) note('disable-calls-conflict',
@@ -1820,12 +2048,14 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
 
     // wiring, and var names never clobber the engine's. Dual recordings only.
     let bodyCorrelated = 0;
+    let bodyCorrelationPlans = [];
     if (opts.secondaryEntries && opts.secondaryEntries.length) {
         try {
             const bc = correlateBodyDynamics(xml, entriesRaw, opts.secondaryEntries);
             if (bc.applied.length) {
                 xml = bc.xml;
                 bodyCorrelated = bc.applied.length;
+                bodyCorrelationPlans = bc.applied;
                 note('body-correlation',
                     `${bc.applied.length} body/session dynamic(s) the engine left literal`,
                     `variance vs the 2nd recording; each extractor verified against its recorded producer`,
@@ -1965,9 +2195,14 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         }));
     }
 
+    const appliedCorrelationLinks = mergeAppliedCorrelationLinks({
+        formCorrelations: formCorr.wired,
+        bodyPlans: bodyCorrelationPlans,
+        ledger: correlationLedger,
+    });
     return {
-        jmxPath, flat, csvFile, candidates, ghosts, polling, correlations: corrs,
-        plannedExtractors, reasoning, dualHarHints, loadProfile: loadProfileApplied, seniorPeDebrief,
+        jmxPath, flat, csvFile, candidates, ghosts, polling, correlations: corrs, appliedCorrelationLinks,
+        plannedExtractors, reasoning, dualHarHints, loadProfile: loadProfileApplied, seniorPeDebrief, correlationLedger,
         domainProfile: seniorPeDebrief.domainProfile || null,
         goldenDisables, goldenApplied,
         lineage: lineagePlans.map(l => ({ name: l.name, aliases: l.aliases, value: l.value, source: l.plan.sourceLabel })),
@@ -1986,7 +2221,7 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         peNaming: peNaming.labelMapForArtifact(peModel),
         stats: {
             ingested: entriesRaw.length, kept: flat.length,
-            correlations: corrs.length, parameterized: params.length,
+            correlations: corrs.length + formCorr.wired.length, parameterized: params.length,
             clientSideGhosts: ghosts.length, pollingLoops: polling.length,
             samplers: vr.totalSamplers, extractors: vr.totalExtractors, orphans: vr.orphanReferences.length,
             nativeExtractorsPlanned: plannedExtractors.length,
@@ -2005,6 +2240,19 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
             missingUploadFiles: uploadPlan.missing.length,
             nativeManagersApplied: nativeManagers.applied.length,
             bodyCorrelations: bodyCorrelated,
+            volatileCorrelationsDropped: oauthStatic.removed.length,
+            volatileCorrelationsKeptByProducer: oauthStatic.diagnostics.filter(item => item.decision === 'kept' && item.producerEntryIndex != null).length,
+            ledgerRoleCounts: correlationLedger.roleCounts,
+            unresolvedSinks: correlationLedger.unresolvedSinks.length,
+            responseEvidence,
+            correlationEvidence,
+            pairingCoverage,
+            formCorrelationCapSkipped: (formCorr.skippedByCap || []).length,
+            killedProducers: {
+                count: killedProducers.length,
+                details: killedProducers.map(item => ({ name: item.name, reason: item.reason })),
+            },
+            engineLimitRisk,
             graphqlCsrfHeaderRepairs: gqlCsrf.substitutions,
             formCorrelations: formCorr.wired.length,
             gate0Findings: gate0.findings.length,
@@ -2089,4 +2337,4 @@ function lookupValueForVar(flat, varName, params) {
     return '';
 }
 
-module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterParameterCandidates, detectAndRevertParameterCorruption, detectRecordedNoiseBeacons, detectPolling, repeatProducesDownstreamValue, cloneExtractorsToRepeats } };
+module.exports = { generate, _internal: { repairStaticOauthConstants, filterBareOauthStateNonceCorrelations, filterCorrelationsByLedger, filterParameterCandidates, detectAndRevertParameterCorruption, detectRecordedNoiseBeacons, detectPolling, repeatProducesDownstreamValue, cloneExtractorsToRepeats } };

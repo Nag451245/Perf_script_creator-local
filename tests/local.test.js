@@ -30,11 +30,11 @@ const { runConfigForFlow } = require('../src/run-config');
 const businessGuard = require('../src/business-guard');
 const { escalateToLlm, _internal: runnerInternal } = require('../src/runner');
 const learningStore = require('../src/learning-store');
-const { groupInputs, analyzeInputFiles, writeIntakeArtifacts } = require('../src/ingest');
+const { groupInputs, loadUnit, analyzeInputFiles, writeIntakeArtifacts } = require('../src/ingest');
 const goldenDiff = require('../src/golden-diff');
 const { knownDefinedVars, planExtractor, _internal: extractorsInternal } = require('../src/extractors');
 const { wrapPollingInWhileController, injectGhostSynthesizers, injectAssertionsFromMined, injectGaussianTimers, applyLoadProfile, stripGuiListenersForRun, rewireClientMintedOauthVars, repairAuth0LoginStateExtractors, correlateFormHiddenInputs } = require('../src/transforms');
-const { scrubRecordingXml } = require('../src/scrubber');
+const { scrubRecordingXml, sanitizeRunEvidenceForExternal } = require('../src/scrubber');
 const { rewriteHost } = require('../src/host-rewrite');
 const { diffRunAgainstRecording, summarizeJtlFast, _internal: verifierInternal } = require('../src/verifier');
 const { replayAll, _internal: replayInternal } = require('../src/fast-replay');
@@ -63,6 +63,7 @@ const domainKnowledge = require('../src/domain-knowledge');
 const uploadFiles = require('../src/upload-files');
 const runProgress = require('../src/run-progress');
 const runEvidence = require('../src/run-evidence');
+const recordingEvidence = require('../src/recording-evidence-adapter');
 const samplerDecision = require('../src/sampler-decision');
 const peNaming = require('../src/pe-naming');
 const outputOrganizer = require('../src/output-organizer');
@@ -70,6 +71,8 @@ const postRunAdjudicator = require('../src/post-run-adjudicator');
 const uiInputs = require('../src/ui-inputs');
 const uiProcessControl = require('../src/ui-process-control');
 const { checkRenderedRequests } = require('../src/rendered-request-check');
+const correlationLedger = require('../src/correlation-ledger');
+const replayDependencies = require('../src/replay-dependencies');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'psl-test-')); }
 function listenLocal(server) {
@@ -5439,7 +5442,7 @@ test('Gaussian timers: derives mean+stdev from per-page HAR gaps', () => {
 });
 
 test('listener strip: disables GUI listeners + appends SimpleDataWriter', () => {
-    const fakeXml = `<ResultCollector guiclass="ViewResultsFullVisualizer" enabled="true"></ResultCollector><ResultCollector guiclass="StatVisualizer" enabled="true"></ResultCollector>\n    </hashTree>\n  </hashTree>`;
+    const fakeXml = `<jmeterTestPlan><hashTree><ResultCollector guiclass="ViewResultsFullVisualizer" enabled="true"></ResultCollector><hashTree/><ResultCollector guiclass="StatVisualizer" enabled="true"></ResultCollector><hashTree/></hashTree></jmeterTestPlan>`;
     const out = stripGuiListenersForRun(fakeXml, 'C:/tmp/final.jtl');
     assert.strictEqual(out.disabled, 2);
     assert.match(out.xml, /SimpleDataWriter/);
@@ -5601,7 +5604,7 @@ test('verifier fast JTL summary preserves landed URL when redirect children are 
     ]);
 });
 
-test('baseline diff compares responseData from folded redirect children', () => {
+test('baseline diff does not treat folded redirect child responseData as parent evidence', () => {
     const out = tmp();
     const iter = path.join(out, 'iteration_1');
     fs.mkdirSync(iter, { recursive: true });
@@ -5627,7 +5630,7 @@ test('baseline diff compares responseData from folded redirect children', () => 
     const diff = diffRunAgainstRecording({ outDir: out, flatEntries, thresholdPct: 10 });
 
     assert.strictEqual(diff.samplesCompared, 1);
-    assert.ok(diff.drift.some(d => d.index === 0 && d.issues.some(i => i.kind === 'lengthDriftPct')));
+    assert.ok(!diff.drift.some(d => d.index === 0 && d.issues.some(i => i.kind === 'lengthDriftPct')));
 });
 
 test('baseline diff: tiny-body percentage swings are NOT flagged (adaptive absolute floor)', () => {
@@ -5690,7 +5693,7 @@ test('baseline diff uses explicit current JTL instead of stale iteration folders
     assert.strictEqual(diff.rootCause, null);
 });
 
-test('run evidence: aligns recording with JTL and preserves observed body and final URL', () => {
+test('run evidence: preserves parent-only body evidence and final URL', () => {
     const dir = tmp();
     const jtl = path.join(dir, 'results.jtl');
     fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
@@ -5715,7 +5718,7 @@ test('run evidence: aligns recording with JTL and preserves observed body and fi
     assert.strictEqual(evidence.rows[0].entryIndex, 0);
     assert.strictEqual(evidence.rows[0].recordedUrl, 'https://app.test/dashboard.php');
     assert.strictEqual(evidence.rows[0].finalUrl, 'https://auth.test/login');
-    assert.match(evidence.rows[0].observedBody, /Login/);
+    assert.strictEqual(evidence.rows[0].observedBody, '');
     assert.match(evidence.rows[0].recordedBody, /Dashboard/);
 });
 
@@ -6478,6 +6481,23 @@ test('form correlation cap: most-consumed inputs win, the rest are reported not 
     assert.strictEqual(out.wired[0].input, 'field_0', 'most-consumed field wired first');
     assert.strictEqual(out.skippedByCap.length, 4);
     assert.ok(out.skippedByCap.every(s => s.consumers >= 1));
+});
+
+test('form correlation: server-produced login state stays a single native form extractor', () => {
+    const fixture = JSON.parse(fs.readFileSync(
+        path.join(__dirname, '..', 'eval-corpus', 'synthetic-create-task', 'recording.har'),
+        'utf8',
+    ));
+    const { entries, pages } = parse(fixture);
+    const out = tmp();
+    const generated = generate(entries, pages, out, 'synthetic-create-task');
+    const jmx = fs.readFileSync(generated.jmxPath, 'utf8');
+
+    assert.equal(generated.stats.formCorrelations, 1);
+    assert.equal(generated.stats.correlations, 1, 'native form extractor counts as a correlation');
+    assert.match(jmx, /testname="Extract state \(form hidden input\)"/);
+    assert.doesNotMatch(jmx, /<stringProp name="variableNames">[^<]*\bstate\b/);
+    assert.equal((jmx.match(/HtmlExtractor\.refname">state</g) || []).length, 1);
 });
 
 test('polling while: when terminator is provided, it overrides the counter condition', () => {
@@ -7370,7 +7390,7 @@ test('ingest: pairs Rec1.jmx<->R1.xml by content when methods are unknowable and
     fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test('ingest: a JMX with no response side is an ERROR, not a warning (correlation is impossible)', () => {
+test('ingest: a JMX with no response side is a warning (correlation evidence is degraded)', () => {
     const os = require('os');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pf_nosidecar_'));
     fs.writeFileSync(path.join(dir, 'lonely.jmx'), `<jmeterTestPlan><hashTree>
@@ -7380,7 +7400,7 @@ test('ingest: a JMX with no response side is an ERROR, not a warning (correlatio
     const a = analyzeInputFiles([path.join(dir, "lonely.jmx")]);
     const issue = a.issues.find(i => i.code === 'jmx_missing_sidecar');
     assert.ok(issue, 'must be reported');
-    assert.strictEqual(issue.severity, 'error');
+    assert.strictEqual(issue.severity, 'warning');
     assert.match(issue.message, /nothing to correlate FROM/);
     fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -8430,6 +8450,156 @@ test('run summary: survives the output tidy-up that prunes report.json', () => {
     assert.equal(readRunSummary(fs.mkdtempSync(path.join(os.tmpdir(), 'empty_'))), null);
 });
 
+test('pre-verification diagnostics: generation reports response, ledger, cap, producer, and engine-limit evidence without secret values', () => {
+    const { entries, pages } = parse(har([
+        entry('GET', 'https://app.test/form', {
+            body: '<form><input type="hidden" name="state" value="TOP_SECRET_STATE_123456"/><input type="hidden" name="relay" value="SECOND_VALUE_123456"/></form>',
+        }),
+        entry('POST', 'https://app.test/submit', {
+            reqHeaders: [{ name: 'x-token', value: 'TOP_SECRET_STATE_123456' }],
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: 'state=TOP_SECRET_STATE_123456&relay=SECOND_VALUE_123456' },
+            body: '',
+        }),
+    ]));
+    entries[1].response.content.text = '';
+    const out = tmp();
+    const gen = generate(entries, pages, out, 'diagnostics', {
+        dualHarHints: { jmx: { entries: 500 }, jtl: { rawCorrelations: 100 }, pairing: { status: 'PARTIAL' } },
+        runCfg: { formCorrelation: { maxVars: 1 }, disableCalls: ['Step 01 - GET /form'] },
+    });
+
+    assert.deepStrictEqual(gen.stats.responseEvidence, {
+        total: 2, withStatus: 2, withBody: 1, withHeaders: 2, withCapturedEvidence: 2,
+        statusPct: 100, bodyPct: 50, headersPct: 100, correlationBlind: false,
+    });
+    assert.equal(gen.stats.correlationEvidence, 'PARTIAL');
+    assert.equal(gen.stats.formCorrelationCapSkipped, 1, 'inferred server-issued relay value is reported when the form cap skips it');
+    assert.ok(gen.stats.killedProducers.count >= 1);
+    assert.ok(gen.stats.engineLimitRisk.entryCapReached);
+    assert.ok(gen.stats.engineLimitRisk.rawCorrelationCapReached);
+    assert.ok(gen.reasoning.some(note => /500-entry/i.test(note.hypothesis)));
+    assert.ok(gen.reasoning.some(note => /100-raw-correlation/i.test(note.hypothesis)));
+    assert.doesNotMatch(JSON.stringify(gen.stats.killedProducers), /TOP_SECRET_STATE/);
+});
+
+test('verification status: generated and incomplete validation never claim VERIFIED', () => {
+    const { deriveVerificationStatus } = require('../src/verification-status');
+    assert.equal(deriveVerificationStatus({}), 'GENERATED');
+    assert.equal(deriveVerificationStatus({ validationAttempted: true, finalGreenGate: { ok: false } }), 'UNVERIFIED');
+    assert.equal(deriveVerificationStatus({
+        validationAttempted: true,
+        finalGreenGate: { ok: true },
+        businessVerification: { ok: true },
+        runtimeProof: { status: 'UNVERIFIED' },
+    }), 'UNVERIFIED');
+    assert.equal(deriveVerificationStatus({
+        validationAttempted: true,
+        finalGreenGate: { ok: true },
+        businessVerification: { ok: true },
+        runtimeProof: { status: 'VERIFIED' },
+        correlationEvidence: 'AVAILABLE',
+    }), 'VERIFIED');
+    assert.equal(deriveVerificationStatus({
+        validationAttempted: true,
+        finalGreenGate: { ok: true },
+        businessVerification: { ok: true },
+        runtimeProof: { status: 'VERIFIED' },
+    }), 'UNVERIFIED', 'omitted correlation evidence cannot be VERIFIED');
+    for (const correlationEvidence of ['MISSING', 'PARTIAL']) {
+        assert.equal(deriveVerificationStatus({
+            validationAttempted: true,
+            finalGreenGate: { ok: true },
+            businessVerification: { ok: true },
+            runtimeProof: { status: 'VERIFIED' },
+            correlationEvidence,
+        }), 'UNVERIFIED', `${correlationEvidence} evidence cannot be VERIFIED`);
+    }
+});
+
+test('correlation evidence: status zero and missing or one-sided sidecars cannot claim coverage', () => {
+    const { entries, pages } = parse(har([entry('GET', 'https://app.test/login')]));
+    entries[0].response.status = 0;
+    entries[0].response.content.text = '';
+    entries[0].response.headers = [];
+
+    const missing = generate(entries, pages, tmp(), 'missing-sidecar', {
+        dualHarHints: { jmxJtl: { status: 'MISSING', paired: 0, total: 1 } },
+    });
+    assert.equal(missing.stats.responseEvidence.withStatus, 0);
+    assert.equal(missing.stats.responseEvidence.withCapturedEvidence, 0);
+    assert.equal(missing.stats.correlationEvidence, 'MISSING');
+
+    const partial = generate(entries, pages, tmp(), 'partial-sidecar', {
+        dualHarHints: {
+            jmx1JtlPairing: { paired: 1, total: 1 },
+            jmx2JtlPairing: { status: 'MISSING', paired: 0, total: 1 },
+        },
+    });
+    assert.equal(partial.stats.correlationEvidence, 'PARTIAL');
+});
+
+test('correlation evidence: complete HAR and header-only redirects remain available', () => {
+    const { entries, pages } = parse(har([entry('GET', 'https://app.test/redirect', { status: 302 })]));
+    entries[0].response.content.text = '';
+    entries[0].response.headers = [{ name: 'Location', value: '/next' }];
+    const generated = generate(entries, pages, tmp(), 'redirect-evidence');
+    assert.equal(generated.stats.responseEvidence.withCapturedEvidence, 1);
+    assert.equal(generated.stats.correlationEvidence, 'AVAILABLE');
+});
+
+test('operator surfaces: report and summary show status plus a redacted first divergence', () => {
+    const out = tmp();
+    const divergence = {
+        kind: 'protected_business_consumer_failed',
+        producerIndex: 0,
+        consumerIndex: 1,
+        reason: 'token TOP_SECRET_STATE_123456 was rejected',
+        link: { variable: 'authorization' },
+    };
+    const report = fs.readFileSync(writeHtmlReport(out, 'verify', {
+        verdict: 'needs attention',
+        verificationStatus: 'UNVERIFIED',
+        runtimeProof: { status: 'FAILED', firstDivergence: divergence },
+        stats: {},
+    }), 'utf8');
+    assert.match(report, /Verification status/);
+    assert.match(report, /UNVERIFIED/);
+    assert.match(report, /protected_business_consumer_failed/);
+    assert.doesNotMatch(report, /TOP_SECRET_STATE/);
+
+    const { writeRunSummary, readRunSummary } = require('../src/run-summary');
+    writeRunSummary(out, { verificationStatus: 'UNVERIFIED', runtimeProofStatus: 'FAILED', firstCorrelationDivergence: divergence });
+    const summary = readRunSummary(out);
+    assert.equal(summary.verificationStatus, 'UNVERIFIED');
+    assert.equal(summary.firstCorrelationDivergence.variable, 'authorization');
+    assert.doesNotMatch(JSON.stringify(summary), /TOP_SECRET_STATE/);
+});
+
+test('HTML report: correlation evidence panel shows safe coverage diagnostics', () => {
+    const out = tmp();
+    const report = fs.readFileSync(writeHtmlReport(out, 'evidence', {
+        verdict: 'needs attention',
+        stats: {
+            correlationEvidence: 'PARTIAL',
+            responseEvidence: { total: 4, withStatus: 3, withBody: 2, withHeaders: 4, withCapturedEvidence: 3 },
+            ledgerRoleCounts: { 'server-issued-correlation': 2 },
+            unresolvedSinks: 1,
+            pairingCoverage: { paired: 3, total: 4, unmatched: 1 },
+            formCorrelationCapSkipped: 2,
+            killedProducers: { count: 1, details: [{ name: 'GET /login', reason: 'produces a value consumed downstream' }] },
+            engineLimitRisk: { entryCapReached: true, rawCorrelationCapReached: true },
+        },
+        runtimeProof: { status: 'FAILED', firstDivergence: { kind: 'stale_token', link: { variable: 'token' }, reason: 'TOP_SECRET_TOKEN rejected' } },
+    }), 'utf8');
+    assert.match(report, /Correlation Evidence/);
+    assert.match(report, /PARTIAL/);
+    assert.match(report, /3\/4/);
+    assert.match(report, /server-issued-correlation/);
+    assert.match(report, /500-entry/);
+    assert.match(report, /100-correlation/);
+    assert.doesNotMatch(report, /TOP_SECRET_TOKEN/);
+});
+
 test('stale editor: a JMeter overwrite becomes the headline, not a footnote', () => {
     const fs = require('fs');
     const outDir = tmp();
@@ -8725,4 +8895,1762 @@ test('preflight: a login flow with no configured credentials is called out befor
     assert.equal(isCredentialSubmit(login), true, 'a password in the body');
     assert.equal(isCredentialSubmit(byPath), true, 'or an authenticate path');
     assert.equal(isCredentialSubmit(notLogin), false);
+});
+
+// ── Task 1 RED regressions: recording evidence and replay proof ─────────
+// Category 1 — deterministic methodless sidecar pairing.
+test('Task 1 regression: methodless recording sidecar pairs POST login by deterministic URL occurrence', async () => {
+    const dir = tmp();
+    const jmx = path.join(dir, 'login.jmx');
+    const sidecar = path.join(dir, 'login.recording.xml');
+    fs.writeFileSync(jmx, jmxXml([
+        { method: 'POST', domain: 'app.test', path: '/login' },
+        { method: 'POST', domain: 'app.test', path: '/login' },
+    ]));
+    fs.writeFileSync(sidecar, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="/login" rc="302" rm="Found" s="true"><java.net.URL>https://app.test/login</java.net.URL></httpSample>
+  <httpSample lb="/login" rc="200" rm="OK" s="true"><java.net.URL>https://app.test/login</java.net.URL></httpSample>
+</testResults>`);
+
+    const loaded = await loadUnit({ kind: 'jmx', primary: jmx, secondary: sidecar });
+    assert.strictEqual(loaded.notes.jmxJtl.paired, 2);
+    assert.strictEqual(loaded.notes.jmxJtl.unmatched, 0, 'all POST responses must pair; an unpaired response is evidence loss');
+    assert.deepStrictEqual(loaded.entries.map(item => item.response.status), [302, 200]);
+});
+
+// Category 2 — redirect child evidence must survive flattening.
+test('Task 1 regression: nested redirect sub-results preserve Location and Set-Cookie evidence', () => {
+    const jtl = path.join(tmp(), 'redirects.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /start" rc="200" s="true">
+    <httpSample lb="Step 01 - GET /start-0" rc="302" s="true">
+      <responseHeader>HTTP/1.1 302 Found
+Location: https://idp.test/login?state=redirect-state
+Set-Cookie: AUTH=redirect-cookie; Path=/</responseHeader>
+      <java.net.URL>https://app.test/start</java.net.URL>
+    </httpSample>
+    <httpSample lb="Step 01 - GET /start-1" rc="200" s="true">
+      <java.net.URL>https://idp.test/login</java.net.URL>
+    </httpSample>
+  </httpSample>
+</testResults>`);
+    const samples = runEvidence.buildRunEvidence({
+        entries: [entry('GET', 'https://app.test/start')],
+        jtlPath: jtl,
+    }).samples;
+
+    assert.deepStrictEqual(samples[0].redirects, [{
+        status: 302,
+        url: 'https://app.test/start',
+        location: 'https://idp.test/login?state=redirect-state',
+        setCookies: ['AUTH=redirect-cookie; Path=/'],
+        responseBody: '',
+        responseHeaders: [{ name: 'Location', value: 'https://idp.test/login?state=redirect-state' }, { name: 'Set-Cookie', value: 'AUTH=redirect-cookie; Path=/' }],
+    }]);
+});
+
+// Category 3a — single-JMX response-side absence is degraded evidence, not an error.
+test('Task 1 regression: a single JMX without sidecar is warning-only and records MISSING evidence', async () => {
+    const dir = tmp();
+    const jmx = path.join(dir, 'login.jmx');
+    fs.writeFileSync(jmx, jmxXml([{ method: 'POST', path: '/login' }]));
+
+    const analysis = analyzeInputFiles([jmx]);
+    const issue = analysis.issues.find(item => item.code === 'jmx_missing_sidecar');
+
+    assert.ok(issue);
+    assert.strictEqual(issue.severity, 'warning');
+    const unit = analysis.units.find(item => item.kind === 'jmx');
+    const loaded = await loadUnit(unit);
+    assert.strictEqual(loaded.notes.jmxJtl.status, 'MISSING');
+    assert.strictEqual(loaded.notes.jmxJtl.total, 1);
+});
+
+// Category 3b — paired JMXs report exactly which response sides are present.
+test('Task 1 regression: one-sided dual-JMX sidecar pairing reports PARTIAL coverage', async () => {
+    const dir = tmp();
+    const run1 = path.join(dir, 'login__run1.jmx');
+    const run2 = path.join(dir, 'login__run2.jmx');
+    const sidecar1 = path.join(dir, 'login__run1.recording.xml');
+    const requests = [{ method: 'POST', domain: 'app.test', path: '/login' }];
+    fs.writeFileSync(run1, jmxXml(requests));
+    fs.writeFileSync(run2, jmxXml(requests));
+    fs.writeFileSync(sidecar1, jtlXml([{ method: 'POST', url: 'https://app.test/login' }]));
+
+    const analysis = analyzeInputFiles([run1, run2, sidecar1]);
+    const coverage = analysis.issues.find(item => item.code === 'dual_jmx_sidecar_coverage');
+
+    assert.ok(coverage, 'partial dual-JMX response evidence must be reported');
+    assert.strictEqual(coverage.code, 'dual_jmx_sidecar_coverage');
+    assert.strictEqual(coverage.severity, 'warning');
+    assert.ok(coverage.files.includes(run1));
+    assert.ok(coverage.files.includes(run2));
+    assert.strictEqual(coverage.paired.primary, sidecar1);
+    assert.strictEqual(coverage.paired.secondary, null);
+    const unit = analysis.units.find(item => item.kind === 'dual-jmx');
+    const loaded = await loadUnit(unit);
+    assert.strictEqual(loaded.notes.jmx1JtlPairing.status, 'AVAILABLE');
+    assert.strictEqual(loaded.notes.jmx2JtlPairing.status, 'MISSING');
+});
+
+// Task 2 review regressions: keep parent evidence distinct from redirect children.
+test('Task 2 review: parent response body and headers survive nested redirect evidence', () => {
+    const parsed = runEvidence.summarizeJtlXml(`<testResults>
+  <httpSample lb="Step 01 - GET /start" rc="200" s="true">
+    <responseHeader>Content-Type: application/json
+X-Parent: retained</responseHeader>
+    <responseData>{"parent":true}</responseData>
+    <httpSample lb="Step 01 - GET /start-0" rc="302" s="true">
+      <responseHeader>Location: /next
+Set-Cookie: SID=child</responseHeader>
+      <responseData>child-body</responseData>
+      <java.net.URL>https://app.test/start</java.net.URL>
+    </httpSample>
+  </httpSample>
+</testResults>`);
+
+    assert.strictEqual(parsed[0].responseBody, '{"parent":true}');
+    assert.deepStrictEqual(parsed[0].responseHeaders, [
+        { name: 'Content-Type', value: 'application/json' },
+        { name: 'X-Parent', value: 'retained' },
+    ]);
+    assert.deepStrictEqual(parsed[0].redirects, [{
+        status: 302,
+        url: 'https://app.test/start',
+        location: '/next',
+        setCookies: ['SID=child'],
+        responseBody: 'child-body',
+        responseHeaders: [{ name: 'Location', value: '/next' }, { name: 'Set-Cookie', value: 'SID=child' }],
+    }]);
+});
+
+test('Task 2 review: CDATA response data is decoded without wrappers', () => {
+    const parsed = recordingEvidence.parseSidecarBuffer(`<testResults>
+  <httpSample lb="/data" rc="200"><responseData><![CDATA[{"ok":true}]]></responseData></httpSample>
+</testResults>`);
+
+    assert.strictEqual(parsed.samples[0].body, '{"ok":true}');
+});
+
+test('Task 2 review: unclosed samples retain trailing direct evidence', () => {
+    const parsed = recordingEvidence.parseSidecarBuffer(`<testResults>
+  <httpSample lb="/partial" rc="200"><responseData>partial-body</responseData><responseHeader>X-Trace: retained</responseHeader>tail`);
+
+    assert.strictEqual(parsed.samples[0].body, 'partial-body');
+    assert.deepStrictEqual(parsed.samples[0].headers, [{ name: 'X-Trace', value: 'retained' }]);
+    assert.match(parsed.roots[0].directText, /tail/);
+});
+
+test('Task 2 review: duplicate URL occurrences pair in order without ambiguity', () => {
+    const entries = [
+        entry('POST', 'https://app.test/login'),
+        entry('POST', 'https://app.test/login'),
+    ];
+    const paired = recordingEvidence.parseAndPair(entries, `<testResults>
+  <httpSample lb="/login" rc="302"><java.net.URL>https://app.test/login</java.net.URL></httpSample>
+  <httpSample lb="/login" rc="200"><java.net.URL>https://app.test/login</java.net.URL></httpSample>
+</testResults>`);
+
+    assert.deepStrictEqual(paired.entries.map(item => item.response.status), [302, 200]);
+    assert.strictEqual(paired.coverage.ambiguous, 0);
+    assert.strictEqual(paired.coverage.resolvedDuplicateOccurrences, 1);
+});
+
+test('Task 2 review: methodless sidecar labels provide safe path fallback', () => {
+    const paired = recordingEvidence.parseAndPair(
+        [entry('POST', 'https://app.test/login')],
+        '<testResults><httpSample lb="POST /login" rc="201"/></testResults>'
+    );
+
+    assert.strictEqual(paired.entries[0].response.status, 201);
+    assert.strictEqual(paired.coverage.paired, 1);
+});
+
+test('Task 2 review: intentionally empty parent evidence does not inherit nested child data', () => {
+    const parsed = runEvidence.summarizeJtlXml(`<testResults>
+  <httpSample lb="Step 01 - GET /start" rc="200" s="true">
+    <responseHeader></responseHeader>
+    <responseData></responseData>
+    <httpSample lb="Step 01 - GET /start-0" rc="302" s="true">
+      <responseHeader>Location: /next
+Set-Cookie: SID=child</responseHeader>
+      <responseData>child-body</responseData>
+      <java.net.URL>https://app.test/start</java.net.URL>
+    </httpSample>
+  </httpSample>
+</testResults>`);
+
+    assert.strictEqual(parsed[0].responseBody, '');
+    assert.deepStrictEqual(parsed[0].responseHeaders, []);
+    assert.strictEqual(parsed[0].redirects[0].location, '/next');
+});
+
+test('Task 2 review: three duplicate URL occurrences use non-overcounting diagnostics', () => {
+    const entries = Array.from({ length: 3 }, () => entry('POST', 'https://app.test/login'));
+    const paired = recordingEvidence.parseAndPair(entries, `<testResults>
+  <httpSample lb="/login" rc="201"><java.net.URL>https://app.test/login</java.net.URL></httpSample>
+  <httpSample lb="/login" rc="202"><java.net.URL>https://app.test/login</java.net.URL></httpSample>
+  <httpSample lb="/login" rc="203"><java.net.URL>https://app.test/login</java.net.URL></httpSample>
+</testResults>`);
+
+    assert.deepStrictEqual(paired.entries.map(item => item.response.status), [201, 202, 203]);
+    assert.strictEqual(paired.coverage.ambiguous, 0);
+    assert.strictEqual(paired.coverage.resolvedDuplicateOccurrences, 2);
+});
+
+// Category 4 — duplicate URLs require occurrence-aware extractor placement.
+test('Task 1 regression: duplicate producer URLs attach an extractor to the exact latest occurrence', () => {
+    const token = 'latestToken123456';
+    const first = entry('GET', 'https://app.test/bootstrap', { body: JSON.stringify({ token }) });
+    const second = entry('GET', 'https://app.test/bootstrap', { body: JSON.stringify({ token }) });
+    const consumer = entry('POST', 'https://app.test/submit', {
+        reqHeaders: [{ name: 'X-Token', value: token }],
+    });
+
+    const plan = planExtractor('token', [{ name: 'token', value: token }], [first, second, consumer], 2);
+
+    assert.strictEqual(plan.sourceOrder, 1);
+    assert.match(plan.sourceLabel, /Step 02/);
+});
+
+// Category 5 — a Location query value is not the entire Location header.
+test('Task 1 regression: Location query state exposes exact query-param capture metadata', () => {
+    const state = 'locationState123456';
+    const producer = entry('GET', 'https://app.test/start');
+    producer.response.headers = [{ name: 'Location', value: `https://idp.test/login?state=${state}&client=web` }];
+    const consumer = entry('POST', `https://idp.test/login?state=${state}`);
+
+    const plan = planExtractor('state', [{ name: 'state', value: state }], [producer, consumer], 1);
+
+    assert.ok(plan, 'Location query values should have an extractor plan');
+    assert.deepStrictEqual(plan.source, { kind: 'response-header', name: 'Location' });
+    assert.deepStrictEqual(plan.capture, { kind: 'query-param', name: 'state', value: state });
+});
+
+// Task 3 — additive value ledger/role contract.
+test('Task 3 ledger: classifies sources, sinks, roles, necessity, and unresolved values', () => {
+    const sid = 'sid_server_123456';
+    const saml = 'saml_response_123456';
+    const mystery = 'unexplained-request-value';
+    const entries = [
+        entry('GET', 'https://app.test/start'),
+        entry('GET', 'https://app.test/page', {
+            body: JSON.stringify({ SAMLResponse: saml }),
+            reqHeaders: [{ name: 'Cookie', value: `SID=${sid}` }],
+        }),
+        entry('POST', `https://app.test/acs?RelayState=${saml}`, {
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: `SAMLResponse=${encodeURIComponent(saml)}&username=alice&requestId=550e8400-e29b-41d4-a716-446655440000` },
+            reqHeaders: [{ name: 'X-SAML', value: saml }],
+        }),
+        entry('GET', `https://app.test/config?response_type=code&mystery=${mystery}`),
+    ];
+    entries[0].response.headers = [{ name: 'Set-Cookie', value: `SID=${sid}; Path=/` }];
+
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        secondaryEntries: entries,
+        candidates: [
+            { name: 'SID', value: sid },
+            { name: 'SAMLResponse', value: saml },
+            { name: 'username', value: 'alice' },
+            { name: 'response_type', value: 'code' },
+            { name: 'requestId', value: '550e8400-e29b-41d4-a716-446655440000', algorithm: 'uuid' },
+            { name: 'mystery', value: mystery },
+        ],
+    });
+    const byName = Object.fromEntries(ledger.entries.map(item => [item.name, item]));
+
+    assert.deepStrictEqual(byName.SID.role, 'native-managed-state');
+    assert.deepStrictEqual(byName.SID.producerIndexes, [0]);
+    assert.deepStrictEqual(byName.SID.consumerIndexes, [1]);
+    assert.deepStrictEqual(byName.SID.sinks, [{ entryIndex: 1, location: 'header:Cookie', name: 'Cookie', value: sid }]);
+    assert.strictEqual(byName.SID.necessity, 'native-manager');
+
+    assert.strictEqual(byName.SAMLResponse.role, 'server-issued-correlation');
+    assert.deepStrictEqual(byName.SAMLResponse.producerIndexes, [1]);
+    assert.deepStrictEqual(byName.SAMLResponse.consumerIndexes, [2]);
+    assert.ok(byName.SAMLResponse.sinks.some(s => s.location === 'form:SAMLResponse'));
+    assert.ok(byName.SAMLResponse.sinks.some(s => s.location === 'header:X-SAML'));
+    assert.ok(byName.SAMLResponse.sinks.some(s => s.location === 'url-query:RelayState'));
+    assert.strictEqual(byName.SAMLResponse.necessity, 'required');
+
+    assert.strictEqual(byName.username.role, 'user-test-input');
+    assert.strictEqual(byName.response_type.role, 'static-config');
+    assert.strictEqual(byName.requestId.role, 'client-computed');
+    assert.strictEqual(byName.mystery.role, 'unresolved');
+    assert.deepStrictEqual(ledger.roleCounts, {
+        'native-managed-state': 2,
+        'server-issued-correlation': 3,
+        'user-test-input': 1,
+        'static-config': 1,
+        'client-computed': 1,
+        unresolved: 1,
+    });
+    assert.deepStrictEqual(ledger.unresolvedSinks, [{ name: 'mystery', value: mystery, sinkIndexes: [3] }]);
+});
+
+test('Task 3 review: cookie headers are case-insensitive native-managed state', () => {
+    const value = 'mixed_cookie_123456';
+    const entries = [entry('GET', 'https://app.test/login'), entry('GET', 'https://app.test/home', {
+        reqHeaders: [{ name: 'cOoKiE', value: `SID=${value}` }],
+    })];
+    entries[0].response.headers = [{ name: 'sEt-CoOkIe', value: `SID=${value}; Path=/` }];
+
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        candidates: [{ name: 'SID', value }],
+    });
+
+    assert.strictEqual(ledger.entries[0].role, 'native-managed-state');
+    assert.strictEqual(ledger.entries[0].sinks[0].location, 'header:cOoKiE');
+    assert.strictEqual(ledger.entries[0].producers[0].location, 'response-header:sEt-CoOkIe');
+});
+
+test('Task 3 review: opaque UUID is unresolved without explicit generation algorithm', () => {
+    const value = '550e8400-e29b-41d4-a716-446655440000';
+    const entries = [entry('POST', 'https://app.test/submit', {
+        postData: { mimeType: 'application/json', text: JSON.stringify({ opaque: value, requestId: value }) },
+    })];
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        candidates: [{ name: 'opaque', value }, { name: 'requestId', value, algorithm: 'uuid' }],
+    });
+
+    assert.strictEqual(ledger.entries[0].role, 'unresolved');
+    assert.strictEqual(ledger.entries[1].role, 'client-computed');
+    assert.deepStrictEqual(ledger.entries[1].algorithm, { id: 'uuid', evidence: 'candidate.algorithm' });
+});
+
+test('Task 3 review: consumer links choose exact latest prior producer only', () => {
+    const value = 'rotating_value_123456';
+    const entries = [
+        entry('GET', 'https://app.test/token', { body: JSON.stringify({ token: value }) }),
+        entry('GET', 'https://app.test/token', { body: JSON.stringify({ token: value }) }),
+        entry('POST', 'https://app.test/use', { reqHeaders: [{ name: 'X-Token', value }] }),
+        entry('POST', 'https://app.test/use-again', { reqHeaders: [{ name: 'X-Token', value }] }),
+        entry('GET', 'https://app.test/future', { body: JSON.stringify({ token: value }) }),
+    ];
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        candidates: [{ name: 'token', value }],
+    });
+
+    assert.deepStrictEqual(ledger.entries[0].consumerLinks, [
+        { consumerIndex: 2, producerIndex: 1, location: 'header:X-Token', name: 'X-Token', encoding: 'plain' },
+        { consumerIndex: 3, producerIndex: 1, location: 'header:X-Token', name: 'X-Token', encoding: 'plain' },
+    ]);
+});
+
+test('Task 3 review: structured request sinks retain location and encoding evidence', () => {
+    const value = 'a/b c';
+    const encoded = encodeURIComponent(value);
+    const entries = [entry('POST', `https://app.test/use?urlField=${encoded}`, {
+        query: [{ name: 'queryStringField', value: encoded }],
+        postData: {
+            params: [{ name: 'paramField', value: encoded }],
+            mimeType: 'application/x-www-form-urlencoded',
+            text: `formField=${encoded}`,
+        },
+        reqHeaders: [{ name: 'X-Field', value }],
+    }), entry('POST', 'https://app.test/json', {
+        postData: { mimeType: 'application/json', text: JSON.stringify({ jsonField: value }) },
+    })];
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        candidates: [{ name: 'value', value }],
+    });
+
+    assert.deepStrictEqual(ledger.entries[0].sinks.map(s => [s.location, s.rawValue, s.encoding]), [
+        ['url-query:urlField', encoded, 'percent-encoded'],
+        ['query-string:queryStringField', encoded, 'percent-encoded'],
+        ['post-data-param:paramField', encoded, 'percent-encoded'],
+        ['header:X-Field', undefined, undefined],
+        ['form:formField', encoded, 'percent-encoded'],
+        ['json:jsonField', value, 'plain'],
+    ]);
+});
+
+test('Task 3 review: encoded Location query extractor verifies decoded value without capturing header', () => {
+    const value = 'relay/value+one';
+    const producer = entry('GET', 'https://app.test/start');
+    producer.response.headers = [{ name: 'Location', value: `https://idp.test/login?RelayState=${encodeURIComponent(value)}&client=web` }];
+    const plan = planExtractor('RelayState', [{ name: 'RelayState', value }], [producer, entry('GET', 'https://idp.test/login')], 1);
+
+    assert.strictEqual(plan.origin, 'location-query');
+    assert.strictEqual(plan.queryParam, 'RelayState');
+    assert.strictEqual(plan.extractedValue, value);
+    assert.match(plan.block, /RelayState=([^&amp;]+)/);
+});
+
+test('Task 3 review: auto-correlate admits server-produced protocol state', () => {
+    const state = 'server_state_123456';
+    const first = recEntry('GET', 'https://idp.test/authorize', { respBody: JSON.stringify({ state }) });
+    const consumer = recEntry('POST', 'https://idp.test/login', { body: `state=${state}` });
+    const dynamics = identifyDynamics([first, consumer], [
+        recEntry('GET', 'https://idp.test/authorize', { respBody: JSON.stringify({ state: 'other_state_654321' }) }),
+        recEntry('POST', 'https://idp.test/login', { body: 'state=other_state_654321' }),
+    ]);
+
+    assert.ok(dynamics.some(item => item.name === 'state' && item.value === state));
+});
+
+test('Task 3 review: generation filters correlations through exact ledger roles', () => {
+    const correlations = [
+        { variableName: 'serverToken', value: 'server_token_123456' },
+        { variableName: 'cookie', value: 'cookie_123456' },
+        { variableName: 'opaque', value: 'opaque_123456' },
+    ];
+    const ledger = {
+        entries: [
+            { name: 'serverToken', value: 'server_token_123456', role: 'server-issued-correlation', consumerLinks: [{ consumerIndex: 2, producerIndex: 1 }] },
+            { name: 'cookie', value: 'cookie_123456', role: 'native-managed-state', consumerLinks: [{ consumerIndex: 2, producerIndex: 0 }] },
+            { name: 'opaque', value: 'opaque_123456', role: 'unresolved', consumerLinks: [] },
+        ],
+    };
+    const filtered = generateInternal.filterCorrelationsByLedger(correlations, ledger);
+
+    assert.deepStrictEqual(filtered.kept, [{ variableName: 'serverToken', value: 'server_token_123456', sourceRequestIndex: 1, producerEntryIndex: 1 }]);
+    assert.deepStrictEqual(filtered.removed.map(item => item.role), ['native-managed-state', 'unresolved']);
+});
+
+test('Task 3 important: bogus explicit producer index is rejected without response proof', () => {
+    const value = 'server_code_123456';
+    const entries = [
+        entry('GET', 'https://idp.test/authorize?response_type=code'),
+        entry('POST', 'https://idp.test/token', {
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: `code=${value}` },
+        }),
+        entry('GET', 'https://idp.test/future', { body: JSON.stringify({ code: value }) }),
+    ];
+    const filtered = volatileProtocol.filterVolatileProtocolCorrelations([{
+        variableName: 'code', value, sourceRequestIndex: 0, targetRequestIndex: 1,
+    }], entries);
+
+    assert.strictEqual(filtered.kept.length, 0);
+    assert.strictEqual(filtered.removed.length, 1);
+});
+
+test('Task 3 important: ledger links win and fallback finds params/form consumers', () => {
+    const paramsValue = 'params_code_123456';
+    const formValue = 'form_code_123456';
+    const entries = [
+        entry('GET', 'https://idp.test/authorize?response_type=code', {
+            body: JSON.stringify({ code: paramsValue, state: formValue }),
+        }),
+        entry('POST', 'https://idp.test/token', {
+            postData: { params: [{ name: 'code', value: paramsValue }] },
+        }),
+        entry('POST', 'https://idp.test/continue', {
+            postData: { mimeType: 'application/x-www-form-urlencoded', text: `state=${formValue}` },
+        }),
+    ];
+    const ledger = {
+        entries: [{
+            value: paramsValue,
+            role: 'server-issued-correlation',
+            consumerLinks: [{ consumerIndex: 1, producerIndex: 0 }],
+        }],
+    };
+
+    assert.deepStrictEqual(
+        volatileProtocol._internal.recordedServerProducer(entries, paramsValue, { sourceRequestIndex: 2 }, ledger),
+        { entryIndex: 0 }
+    );
+    assert.deepStrictEqual(
+        volatileProtocol._internal.recordedServerProducer(entries, formValue, {}, null),
+        { entryIndex: 0 }
+    );
+});
+
+// Category 6 — run evidence includes what was rendered and sent.
+test('Task 1 regression: run evidence captures rendered request data, cookies, headers, and redirect sub-results', () => {
+    const jtl = path.join(tmp(), 'request-evidence.jtl');
+    fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - POST /orders?tenant=acme" rc="200" s="true">
+    <samplerData>POST https://app.test/orders?tenant=acme
+{"csrf":"freshToken123"}</samplerData>
+    <requestHeader>Cookie: SID=fresh-cookie
+X-CSRF: freshToken123</requestHeader>
+    <requestData>{"csrf":"freshToken123"}</requestData>
+    <httpSample lb="Step 01 - POST /orders-0" rc="302" s="true">
+      <responseHeader>Location: /orders/complete?receipt=R123</responseHeader>
+      <java.net.URL>https://app.test/orders?tenant=acme</java.net.URL>
+    </httpSample>
+  </httpSample>
+</testResults>`);
+    const samples = runEvidence.buildRunEvidence({
+        entries: [entry('POST', 'https://app.test/orders?tenant=acme')],
+        jtlPath: jtl,
+    }).samples;
+
+    assert.deepStrictEqual(samples[0].renderedRequest, {
+        method: 'POST',
+        url: 'https://app.test/orders?tenant=acme',
+        query: { tenant: 'acme' },
+        headers: [{ name: 'Cookie', value: 'SID=fresh-cookie' }, { name: 'X-CSRF', value: 'freshToken123' }],
+        cookies: [{ name: 'SID', value: 'fresh-cookie' }],
+        body: '{"csrf":"freshToken123"}',
+        evidenceProvenance: { samplerData: true, requestData: true, requestHeaders: true, cookies: false },
+    });
+    assert.strictEqual(samples[0].redirects[0].location, '/orders/complete?receipt=R123');
+});
+
+test('Task 4: validation writer captures request evidence without widening bounded response bodies', () => {
+    const props = runnerInternal.bodyCaptureProperties({});
+    assert.strictEqual(props['jmeter.save.saveservice.samplerData'], 'true');
+    assert.strictEqual(props['jmeter.save.saveservice.requestHeaders'], 'true');
+    assert.strictEqual(props['jmeter.save.saveservice.responseHeaders'], 'true');
+    assert.ok(!('jmeter.save.saveservice.cookies' in props), 'JMeter cookie capture support is not established locally');
+    assert.strictEqual(props['jmeter.save.saveservice.response_data'], 'false');
+    assert.strictEqual(props['jmeter.save.saveservice.response_data.on_error'], 'true');
+    assert.strictEqual(props['httpsampler.max_bytes_to_store_per_sample'], '65536');
+
+    const writer = stripGuiListenersForRun('<jmeterTestPlan><hashTree></hashTree></jmeterTestPlan>', 'C:/tmp/final.jtl').xml;
+    for (const flag of ['samplerData', 'requestHeaders', 'responseHeaders', 'subresults', 'url']) {
+        assert.match(writer, new RegExp(`<${flag}>true</${flag}>`), `${flag} is retained by the final writer`);
+    }
+    assert.match(writer, /<responseData>false<\/responseData>/, 'writer does not capture unlimited response bodies');
+    assert.match(writer, /<responseDataOnError>false<\/responseDataOnError>/,
+        'body behavior remains owned by save-service properties and iteration-JTL backfill');
+});
+
+test('Task 4: JTL request evidence preserves direct parent fields and nested redirects', () => {
+    const parsed = runEvidence.summarizeJtlXml(`<testResults>
+  <httpSample lb="Step 01 - PUT /parent" rc="200" s="true">
+    <samplerData><![CDATA[PUT /parent?z=last&a=one&a=two
+sampler-only-body]]></samplerData>
+    <requestData><![CDATA[{"password":"secret","safe":"&amp;value"}]]></requestData>
+    <requestHeader>Cookie: SID=session-secret; theme=dark
+X-Trace: first
+X-Trace: second
+Authorization: Bearer live-token</requestHeader>
+    <cookies>SID=session-secret; prefs=blue</cookies>
+    <httpSample lb="Step 01 - PUT /parent-0" rc="302" s="true">
+      <samplerData>GET https://evil.test/child</samplerData>
+      <requestData>child-body</requestData>
+      <responseHeader>Location: /next?token=redirect-token</responseHeader>
+      <java.net.URL>https://app.test/parent</java.net.URL>
+    </httpSample>
+  </httpSample>
+</testResults>`);
+
+    assert.deepStrictEqual(parsed[0].renderedRequest, {
+        method: 'PUT',
+        url: 'https://app.test/parent?z=last&a=one&a=two',
+        query: { a: ['one', 'two'], z: 'last' },
+        headers: [
+            { name: 'Cookie', value: 'SID=session-secret; theme=dark' },
+            { name: 'X-Trace', value: 'first' },
+            { name: 'X-Trace', value: 'second' },
+            { name: 'Authorization', value: 'Bearer live-token' },
+        ],
+        cookies: [
+            { name: 'SID', value: 'session-secret' },
+            { name: 'theme', value: 'dark' },
+            { name: 'SID', value: 'session-secret' },
+            { name: 'prefs', value: 'blue' },
+        ],
+        body: '{"password":"secret","safe":"&value"}',
+        evidenceProvenance: { samplerData: true, requestData: true, requestHeaders: true, cookies: true },
+    });
+    assert.deepStrictEqual(parsed[0].redirects, [{
+        status: 302,
+        url: 'https://app.test/parent',
+        location: '/next?token=redirect-token',
+        setCookies: [],
+        responseBody: '',
+        responseHeaders: [{ name: 'Location', value: '/next?token=redirect-token' }],
+    }]);
+    assert.doesNotMatch(parsed[0].renderedRequest.body, /child-body/,
+        'nested child request data never overwrites the rendered parent request');
+});
+
+test('Task 4: external run-evidence report keeps request diagnostics without leaking secrets', () => {
+    const original = {
+        rows: [{
+            label: 'Step 01 - POST /login',
+            observedStatus: 401,
+            observedBodyLength: 129,
+            renderedRequest: {
+                method: 'POST',
+                url: 'https://app.test/login?token=query-token&tenant=acme',
+                query: { tenant: 'acme', token: 'query-token' },
+                headers: [
+                    { name: 'Authorization', value: 'Bearer header-token' },
+                    { name: 'Cookie', value: 'SID=session-cookie; theme=dark' },
+                ],
+                cookies: [{ name: 'SID', value: 'session-cookie' }],
+                body: 'username=alice&password=hunter2&csrf=correlation-value',
+            },
+        }],
+    };
+    const safe = sanitizeRunEvidenceForExternal(original);
+    const printed = JSON.stringify(safe);
+
+    for (const secret of ['query-token', 'header-token', 'session-cookie', 'hunter2']) {
+        assert.ok(!printed.includes(secret), `${secret} does not leave the local evidence boundary`);
+    }
+    assert.deepStrictEqual(safe.rows[0].renderedRequest.headers.map(header => header.name), ['Authorization', 'Cookie']);
+    assert.strictEqual(safe.rows[0].renderedRequest.method, 'POST');
+    assert.strictEqual(safe.rows[0].observedStatus, 401);
+    assert.strictEqual(safe.rows[0].observedBodyLength, 129);
+    assert.strictEqual(safe.rows[0].renderedRequest.body.present, true);
+    assert.ok(!('fingerprint' in safe.rows[0].renderedRequest.body));
+    assert.strictEqual(original.rows[0].renderedRequest.headers[0].value, 'Bearer header-token',
+        'sanitizing an external payload must not mutate raw local adjudication evidence');
+});
+
+test('Task 4 review: LLM prompt renders sanitized run evidence only', () => {
+    const raw = { rows: [{
+        label: 'Step 01 - POST /login', observedStatus: 401, observedBodyLength: 12,
+        renderedRequest: {
+            method: 'POST',
+            url: 'https://app.test/login?csrf=csrf-secret&state=state-secret&code=code-secret&SAMLResponse=saml-secret',
+            query: { csrf: 'csrf-secret', state: 'state-secret', code: 'code-secret', SAMLResponse: 'saml-secret' },
+            headers: [{ name: 'Authorization', value: 'Bearer authorization-secret' }, { name: 'Cookie', value: 'SID=cookie-secret' }],
+            cookies: [{ name: 'SID', value: 'cookie-secret' }],
+            body: 'password=password-secret&RelayState=relay-secret',
+        },
+    }] };
+    const prompt = runnerInternal.buildGeminiFixPrompt({ failures: [], jmxContent: '', evidence: raw });
+    assert.match(prompt.userPrompt, /## RUN EVIDENCE/);
+    assert.match(prompt.userPrompt, /"observedStatus": 401/);
+    for (const secret of ['authorization-secret', 'password-secret', 'cookie-secret', 'csrf-secret', 'state-secret', 'code-secret', 'saml-secret', 'relay-secret']) {
+        assert.doesNotMatch(prompt.userPrompt, new RegExp(secret));
+    }
+});
+
+test('Task 4 review: writer insertion is idempotent, structural, and diagnostic', () => {
+    const root = '<jmeterTestPlan><hashTree><TestPlan testname="Plan"/><hashTree/></hashTree></jmeterTestPlan>';
+    const first = stripGuiListenersForRun(root, 'C:/tmp/final.jtl');
+    assert.strictEqual(first.writerAdded, true);
+    assert.strictEqual(first.reason, 'inserted');
+    assert.strictEqual((first.xml.match(/testname="JTL \(perfscript-local\)"/g) || []).length, 1);
+    assert.ok(first.xml.indexOf('JTL (perfscript-local)') < first.xml.lastIndexOf('</hashTree>'));
+    const second = stripGuiListenersForRun(first.xml, 'C:/tmp/final.jtl');
+    assert.strictEqual(second.writerAdded, false);
+    assert.strictEqual(second.reason, 'already_present');
+    assert.strictEqual((second.xml.match(/testname="JTL \(perfscript-local\)"/g) || []).length, 1);
+
+    const malformed = stripGuiListenersForRun('<jmeterTestPlan><hashTree>', 'C:/tmp/final.jtl');
+    assert.strictEqual(malformed.writerAdded, false);
+    assert.strictEqual(malformed.reason, 'root_hash_tree_not_found');
+    assert.strictEqual(malformed.xml, '<jmeterTestPlan><hashTree>');
+
+    const runnerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'runner.js'), 'utf8');
+    assert.match(runnerSource, /if \(swap\.changed\)/, 'initial runner persists listener and writer repairs');
+    assert.match(runnerSource, /if \(swap\.changed\) fs\.writeFileSync\(gen2\.jmxPath, swap\.xml\)/,
+        'replan runner uses the same writer wiring');
+});
+
+test('review regression: runtime proof fails closed for an applied form link omitted from engine correlations', () => {
+    const proof = require('../src/correlation-runtime-proof').buildCorrelationRuntimeProof({
+        entries: [entry('GET', 'https://app.test/login'), entry('POST', 'https://app.test/login')],
+        correlations: [],
+        ledger: { entries: [] },
+        appliedLinks: [{ variable: 'state', recordedValue: 'recorded-state', producerIndex: 0, consumerIndex: 1, sinkLocation: 'form:state' }],
+        jmx: '<jmeterTestPlan/>',
+        runEvidence: { rows: [
+            { entryIndex: 0, observedStatus: 200, observedBody: '<input name="state" value="fresh-state"/>', success: true },
+            { entryIndex: 1, observedStatus: 200, observedBody: 'ok', success: true, renderedRequest: { body: 'state=fresh-state', evidenceProvenance: { requestData: true } } },
+        ] },
+    });
+    assert.equal(proof.status, 'UNVERIFIED');
+    assert.equal(proof.firstDivergence.kind, 'native_extractor_missing');
+});
+
+test('review regression: ledger merges engine and inferred request sinks without inventing a producer', () => {
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: [entry('POST', 'https://app.test/use?querySink=query-value', {
+            reqHeaders: [{ name: 'X-Trace', value: 'header-value' }],
+            query: [{ name: 'queryStringSink', value: 'query-string-value' }],
+            postData: {
+                params: [{ name: 'paramSink', value: 'param-value' }],
+                text: 'formSink=form-value&ignored=plain',
+            },
+        }), entry('POST', 'https://app.test/json', {
+            postData: { text: JSON.stringify({ jsonSink: 'json-value' }) },
+        })],
+        candidates: [{ name: 'engineOnly', value: 'engine-value' }],
+    });
+    const names = new Set(ledger.entries.map(item => item.name));
+    for (const name of ['engineOnly', 'querySink', 'queryStringSink', 'X-Trace', 'paramSink', 'formSink', 'jsonSink']) {
+        assert.ok(names.has(name), `${name} is audited`);
+    }
+    assert.equal(ledger.entries.find(item => item.name === 'jsonSink').role, 'user-test-input');
+});
+
+test('review regression: nested transaction wrappers flatten HTTP samples in original order', () => {
+    const samples = runEvidence.summarizeJtlXml(`<testResults>
+<sample lb="Transaction" rc="200" s="true">
+  <httpSample lb="Step 01 - GET /one" rc="200" s="true"><samplerData>GET https://app.test/one</samplerData></httpSample>
+  <httpSample lb="Step 02 - POST /two" rc="200" s="true"><samplerData>POST https://app.test/two\nbody</samplerData></httpSample>
+</sample></testResults>`);
+    assert.deepEqual(samples.map(sample => sample.label), ['Step 01 - GET /one', 'Step 02 - POST /two']);
+    assert.equal(samples[1].renderedRequest.url, 'https://app.test/two');
+});
+
+test('review regression: native extractor ownership accepts formatted sampler sibling trees', () => {
+    const runtimeProof = require('../src/correlation-runtime-proof');
+    const defs = runtimeProof._internal.nativeExtractors(`<HTTPSamplerProxy testname="Step 01 - GET /token" enabled="true"></HTTPSamplerProxy>
+  \n  <hashTree>
+    <RegexExtractor><stringProp name="RegexExtractor.refname">token</stringProp><stringProp name="RegexExtractor.regex">token=(\\w+)</stringProp></RegexExtractor>
+    <hashTree/>
+  </hashTree>`);
+    assert.equal(defs.length, 1);
+    assert.equal(defs[0].ownerIndex, 0);
+});
+
+test('review regression: evidence writer preserves named writer and disables only other listeners', () => {
+    const root = `<jmeterTestPlan><hashTree><TestPlan testname="Plan"/><hashTree>
+<ResultCollector testname="JTL (perfscript-local)" enabled="true"/><hashTree/>
+<ResultCollector testname="GUI listener" enabled="true"/><hashTree/>
+</hashTree></hashTree></jmeterTestPlan>`;
+    const result = stripGuiListenersForRun(root, 'C:/tmp/final.jtl');
+    assert.match(result.xml, /ResultCollector\b[^>]*testname="JTL \(perfscript-local\)" enabled="true"/);
+    assert.match(result.xml, /ResultCollector testname="GUI listener" enabled="false"/);
+    assert.equal((result.xml.match(/testname="JTL \(perfscript-local\)"/g) || []).length, 1);
+});
+
+test('review recheck: runtime proof uses emitted duplicate identity and excludes native cookie links', () => {
+    const { buildCorrelationRuntimeProof, _internal } = require('../src/correlation-runtime-proof');
+    const recorded = 'recorded-state-two';
+    const ledger = { entries: [
+        { name: 'state', value: recorded, role: 'server-issued-correlation', consumerLinks: [{ producerIndex: 0, consumerIndex: 1, location: 'form:state' }] },
+        { name: 'SID', value: 'cookie-secret', role: 'native-managed-state', consumerLinks: [{ producerIndex: 0, consumerIndex: 1, location: 'header:Cookie' }] },
+    ] };
+    const correlation = { variableName: 'state_2', value: recorded, producerEntryIndex: 0, targetRequestIndex: 1, sinkLocation: 'form:state' };
+    assert.deepEqual(_internal.correlationLinks({ correlations: [correlation], ledger }).map(link => link.variable), ['state_2']);
+
+    const entries = [
+        entry('GET', 'https://app.test/login', { body: `<input name="state" value="${recorded}">` }),
+        entry('POST', 'https://app.test/login', { postData: { text: `state=${recorded}` } }),
+    ];
+    const proof = buildCorrelationRuntimeProof({
+        entries, correlations: [correlation], ledger,
+        runEvidence: runEvidence.buildRunEvidence({ entries, samples: [
+            { label: 'Step 01', responseCode: 200, responseBody: '<input name="state" value="fresh-state-two">', renderedRequest: { url: 'https://app.test/login', evidenceProvenance: { samplerData: true } } },
+            { label: 'Step 02', responseCode: 200, renderedRequest: { url: 'https://app.test/login', body: 'state=fresh-state-two', evidenceProvenance: { requestData: true, samplerData: true } } },
+        ] }),
+        jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree><RegexExtractor><stringProp name="RegexExtractor.refname">state_2</stringProp><stringProp name="RegexExtractor.regex">value="([^"]+)"</stringProp></RegexExtractor><hashTree/></hashTree>`,
+    });
+    assert.equal(proof.status, 'VERIFIED');
+    assert.equal(proof.links[0].variable, 'state_2');
+});
+
+test('review recheck: relevant unresolved sink blocks an otherwise proved runtime proof without value disclosure', () => {
+    const { buildCorrelationRuntimeProof } = require('../src/correlation-runtime-proof');
+    const entries = [
+        entry('GET', 'https://app.test/token', { body: '{"token":"recorded-token"}' }),
+        entry('POST', 'https://app.test/order', { postData: { text: 'token=recorded-token&opaque=unresolved-secret' } }),
+    ];
+    const proof = buildCorrelationRuntimeProof({
+        entries,
+        correlations: [{ variableName: 'token', value: 'recorded-token', producerEntryIndex: 0, targetRequestIndex: 1, sinkLocation: 'form:token' }],
+        ledger: { entries: [
+            { name: 'token', value: 'recorded-token', role: 'server-issued-correlation', consumerLinks: [{ producerIndex: 0, consumerIndex: 1, location: 'form:token' }] },
+            { name: 'opaque', value: 'unresolved-secret', role: 'unresolved', necessity: 'investigate', consumerIndexes: [1], sinks: [{ entryIndex: 1, location: 'form:opaque' }] },
+            { name: 'SID', value: 'cookie-secret', role: 'native-managed-state', consumerIndexes: [1] },
+        ] },
+        runEvidence: runEvidence.buildRunEvidence({ entries, samples: [
+            { label: 'Step 01', responseCode: 200, responseBody: '{"token":"fresh-token"}', renderedRequest: { url: 'https://app.test/token', evidenceProvenance: { samplerData: true } } },
+            { label: 'Step 02', responseCode: 201, renderedRequest: { url: 'https://app.test/order', body: 'token=fresh-token&opaque=unresolved-secret', evidenceProvenance: { requestData: true, samplerData: true } } },
+        ] }),
+        jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree><JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">token</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor><hashTree/></hashTree>`,
+    });
+    assert.equal(proof.status, 'UNVERIFIED');
+    assert.equal(proof.firstDivergence.kind, 'unresolved_required_sink');
+    assert.equal(JSON.stringify(proof.firstDivergence).includes('unresolved-secret'), false);
+});
+
+test('review recheck: stale perfscript writer is repaired and runner persists every writer change', () => {
+    const stale = `<jmeterTestPlan><hashTree><TestPlan testname="Plan"/><hashTree>
+<ResultCollector guiclass="SimpleDataWriter" testclass="ResultCollector" testname="JTL (perfscript-local)" enabled="false"><stringProp name="filename">C:/stale.jtl</stringProp></ResultCollector><hashTree/>
+</hashTree></hashTree></jmeterTestPlan>`;
+    const repaired = stripGuiListenersForRun(stale, 'C:/stable/final.jtl');
+    assert.equal(repaired.writerAdded, false);
+    assert.equal(repaired.changed, true);
+    assert.match(repaired.xml, /C:\/stable\/final\.jtl/);
+    assert.match(repaired.xml, /<samplerData>true<\/samplerData>/);
+    assert.match(repaired.xml, /<requestHeaders>true<\/requestHeaders>/);
+    assert.equal(stripGuiListenersForRun(repaired.xml, 'C:/stable/final.jtl').changed, false);
+
+    const runnerSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'runner.js'), 'utf8');
+    assert.match(runnerSource, /if \(swap\.changed\) fs\.writeFileSync\(gen2\.jmxPath, swap\.xml\)/);
+    assert.match(runnerSource, /if \(swap\.changed\) \{\s*fs\.writeFileSync\(gen\.jmxPath, swap\.xml\)/);
+});
+
+test('review recheck: production ledger preserves sink identity and prefers emitted duplicate names', () => {
+    const runtimeProof = require('../src/correlation-runtime-proof');
+    const first = 'recorded-state-one';
+    const second = 'recorded-state-two';
+    const entries = [
+        entry('GET', 'https://app.test/one', { body: `<input value="${first}">` }),
+        entry('POST', 'https://app.test/one', { postData: { text: `state=${first}` } }),
+        entry('GET', 'https://app.test/two', { body: `<input value="${second}">` }),
+        entry('POST', 'https://app.test/two', { postData: { text: `state=${second}` } }),
+    ];
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        candidates: [{ name: 'state', value: first }, { name: 'state', value: second }],
+    });
+    const [firstLedger, secondLedger] = ledger.entries.filter(item => item.name === 'state');
+    assert.deepEqual(firstLedger.consumerLinks, [{ producerIndex: 0, consumerIndex: 1, location: 'form:state', name: 'state', encoding: 'plain' }]);
+    assert.deepEqual(secondLedger.consumerLinks, [{ producerIndex: 2, consumerIndex: 3, location: 'form:state', name: 'state', encoding: 'plain' }]);
+
+    const appliedLinks = [
+        { variableName: 'state', value: first, producerEntryIndex: 0, targetRequestIndex: 1, sinkLocation: 'form:state', role: 'server-issued-correlation' },
+        { variableName: 'state_2', value: second, producerEntryIndex: 2, targetRequestIndex: 3, sinkLocation: 'form:state', role: 'server-issued-correlation' },
+    ];
+    const proof = runtimeProof.buildCorrelationRuntimeProof({
+        entries, ledger, appliedLinks,
+        runEvidence: runEvidence.buildRunEvidence({ entries, samples: [
+            { label: 'Step 01', responseCode: 200, responseBody: '<input value="fresh-one">', renderedRequest: { url: 'https://app.test/one', evidenceProvenance: { samplerData: true } } },
+            { label: 'Step 02', responseCode: 200, renderedRequest: { url: 'https://app.test/one', body: 'state=fresh-one', evidenceProvenance: { requestData: true, samplerData: true } } },
+            { label: 'Step 03', responseCode: 200, responseBody: '<input value="fresh-two">', renderedRequest: { url: 'https://app.test/two', evidenceProvenance: { samplerData: true } } },
+            { label: 'Step 04', responseCode: 200, renderedRequest: { url: 'https://app.test/two', body: 'state=fresh-two', evidenceProvenance: { requestData: true, samplerData: true } } },
+        ] }),
+        jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree><RegexExtractor><stringProp name="RegexExtractor.refname">state</stringProp><stringProp name="RegexExtractor.regex">value="([^"]+)"</stringProp></RegexExtractor><hashTree/></hashTree>
+<HTTPSamplerProxy testname="Step 02" enabled="true"></HTTPSamplerProxy><hashTree/>
+<HTTPSamplerProxy testname="Step 03" enabled="true"></HTTPSamplerProxy><hashTree><RegexExtractor><stringProp name="RegexExtractor.refname">state_2</stringProp><stringProp name="RegexExtractor.regex">value="([^"]+)"</stringProp></RegexExtractor><hashTree/></hashTree>`,
+    });
+    assert.equal(proof.status, 'VERIFIED');
+    assert.deepEqual(proof.links.map(link => link.variable), ['state', 'state_2']);
+});
+
+test('review recheck: inferred ordinary request fields stay non-blocking while producerless csrf remains unresolved', () => {
+    const entries = [entry('POST', 'https://app.test/orders', {
+        reqHeaders: [
+            { name: 'Accept', value: 'application/json' },
+            { name: 'User-Agent', value: 'perfscript-local' },
+            { name: 'Content-Type', value: 'application/json' },
+            { name: 'Cookie', value: 'SID=recorded-session' },
+        ],
+        postData: { text: JSON.stringify({ productId: 'widget-42', quantity: 2, comment: 'ordinary business input', csrf: 'producerless-csrf' }) },
+    })];
+    const ledger = correlationLedger.buildCorrelationLedger({ primaryEntries: entries });
+    const roleByName = Object.fromEntries(ledger.entries.map(item => [item.name, item.role]));
+    for (const name of ['Accept', 'User-Agent', 'Content-Type', 'productId', 'quantity', 'comment', 'Cookie']) {
+        assert.notEqual(roleByName[name], 'unresolved', `${name} is not an unresolved correlation`);
+    }
+    assert.equal(roleByName.csrf, 'unresolved');
+    assert.deepEqual(ledger.unresolvedSinks.map(item => item.name), ['csrf']);
+    const proof = require('../src/correlation-runtime-proof').buildCorrelationRuntimeProof({
+        entries, ledger, runEvidence: { rows: [] },
+    });
+    assert.equal(proof.status, 'UNVERIFIED');
+    assert.equal(proof.firstDivergence.kind, 'unresolved_required_sink');
+    assert.equal(proof.firstDivergence.name, 'csrf');
+});
+
+test('review recheck: transport precedence and protocol-context roles avoid false correlations', () => {
+    const entries = [
+        entry('GET', 'https://app.test/bootstrap', { body: '{"mime":"application/json"}' }),
+        entry('POST', 'https://app.test/orders', {
+            reqHeaders: [
+                { name: 'Content-Type', value: 'application/json' },
+                { name: 'Authorization', value: 'Bearer producerless-auth' },
+                { name: 'sid', value: 'producerless-sid' },
+            ],
+            postData: { text: JSON.stringify({ code: 'business-otp-123' }) },
+        }),
+        entry('GET', 'https://idp.test/oauth/callback?code=producerless-oauth-code'),
+    ];
+    const ledger = correlationLedger.buildCorrelationLedger({ primaryEntries: entries });
+    const byNameValue = new Map(ledger.entries.map(item => [`${item.name}:${item.value}`, item]));
+    assert.equal(byNameValue.get('Content-Type:application/json').role, 'static-config');
+    assert.equal(byNameValue.get('Authorization:Bearer producerless-auth').role, 'unresolved');
+    assert.equal(byNameValue.get('sid:producerless-sid').role, 'unresolved');
+    assert.equal(byNameValue.get('code:producerless-oauth-code').role, 'unresolved');
+    assert.equal(byNameValue.get('code:business-otp-123').role, 'user-test-input');
+});
+
+test('review recheck: runtime proof rejects fresh values in wrong URL header form and JSON fields', () => {
+    const { buildCorrelationRuntimeProof } = require('../src/correlation-runtime-proof');
+    const cases = [
+        { location: 'url-query:target', name: 'target', rendered: { url: 'https://live.test/use?other=fresh-value', evidenceProvenance: { samplerData: true } } },
+        { location: 'header:X-Target', name: 'X-Target', rendered: { url: 'https://live.test/use', headers: [{ name: 'X-Other', value: 'fresh-value' }], evidenceProvenance: { requestHeaders: true, samplerData: true } } },
+        { location: 'form:target', name: 'target', rendered: { url: 'https://live.test/use', body: 'other=fresh-value', evidenceProvenance: { requestData: true, samplerData: true } } },
+        { location: 'json:payload.target', name: 'payload.target', rendered: { url: 'https://live.test/use', body: '{"payload":{"other":"fresh-value"}}', evidenceProvenance: { requestData: true, samplerData: true } } },
+    ];
+    for (const item of cases) {
+        const entries = [
+            entry('GET', 'https://app.test/token', { body: '{"token":"recorded-value"}' }),
+            entry('POST', 'https://app.test/use'),
+        ];
+        const proof = buildCorrelationRuntimeProof({
+            entries,
+            correlations: [{ variableName: 'token', value: 'recorded-value', producerEntryIndex: 0, targetRequestIndex: 1, sinkLocation: item.location, sinkName: item.name, sinkEncoding: 'plain' }],
+            runEvidence: runEvidence.buildRunEvidence({ entries, samples: [
+                { label: 'Step 01', responseCode: 200, responseBody: '{"token":"fresh-value"}', renderedRequest: { url: 'https://live.test/token', evidenceProvenance: { samplerData: true } } },
+                { label: 'Step 02', responseCode: 200, renderedRequest: item.rendered },
+            ] }),
+            jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree><JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">token</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor><hashTree/></hashTree>`,
+        });
+        assert.equal(proof.status, 'FAILED', item.location);
+        assert.equal(proof.firstDivergence.kind, 'fresh_value_not_transmitted', item.location);
+    }
+});
+
+test('final review: explicit transport candidate and nested JSON ledger paths retain production identities', () => {
+    const value = 'application/json';
+    const entries = [
+        entry('GET', 'https://app.test/bootstrap', { body: JSON.stringify({ mime: value, csrf: 'nested-token' }) }),
+        entry('POST', 'https://app.test/use', {
+            reqHeaders: [{ name: 'Content-Type', value }],
+            postData: { text: JSON.stringify({ payload: { items: [{ csrf: 'nested-token' }] } }) },
+        }),
+    ];
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        candidates: [{ name: 'Content-Type', value }, { name: 'csrf', value: 'nested-token' }],
+    });
+    assert.equal(ledger.entries.find(item => item.name === 'Content-Type').role, 'static-config');
+    const nested = ledger.entries.find(item => item.name === 'csrf');
+    assert.equal(nested.sinks[0].location, 'json:payload.items[0].csrf');
+    assert.equal(nested.consumerLinks[0].name, 'payload.items[0].csrf');
+});
+
+test('final review: exact replay substitutions clone requests and preserve encoded form sinks', () => {
+    const responseEvidence = require('../src/response-evidence');
+    const original = entry('POST', 'https://app.test/use?token=old', {
+        reqHeaders: [{ name: 'X-Token', value: 'old' }],
+        postData: { text: 'token=old&other=old' },
+    });
+    const cloned = responseEvidence._internal.applyProvenCorrelationLinks(original, 0, {
+        links: [{ status: 'VERIFIED', consumerIndex: 0, sinkLocation: 'form:token', sinkName: 'token', value: 'fresh value', consumer: { transmitted: true } }],
+    });
+    assert.match(cloned.request.postData.text, /token=fresh%20value/);
+    assert.match(cloned.request.postData.text, /other=old/);
+    assert.equal(original.request.postData.text, 'token=old&other=old');
+});
+
+test('final review: diagnostic replay accepts fresh transmitted failed-business links and preserves Bearer wrappers', () => {
+    const responseEvidence = require('../src/response-evidence');
+    const original = entry('POST', 'https://app.test/use', { reqHeaders: [{ name: 'Authorization', value: 'Bearer recorded-token' }] });
+    const clone = responseEvidence._internal.applyProvenCorrelationLinks(original, 0, {
+        links: [{ status: 'FAILED', consumerIndex: 0, sinkLocation: 'header:Authorization', sinkName: 'Authorization', recordedValue: 'recorded-token', value: 'fresh-token', consumer: { transmitted: true } }],
+    });
+    assert.equal(clone.request.headers[0].value, 'Bearer fresh-token');
+    assert.equal(original.request.headers[0].value, 'Bearer recorded-token');
+});
+
+test('final review: fast replay serializes params-only form data with URL encoding', async () => {
+    const { replayOne } = require('../src/fast-replay');
+    const seen = [];
+    const server = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => { seen.push({ body: Buffer.concat(chunks).toString(), type: req.headers['content-type'] }); res.end('ok'); });
+    });
+    const port = await listenLocal(server);
+    try {
+        await replayOne({
+            entry: entry('POST', 'http://recorded.test/submit', { postData: { params: [{ name: 'token', value: 'fresh value' }] } }),
+            vars: {}, cookieJar: new Map(), targetBaseUrl: `http://127.0.0.1:${port}`, insecure: true,
+        });
+        assert.deepEqual(seen[0], { body: 'token=fresh+value', type: 'application/x-www-form-urlencoded' });
+    } finally { await closeServer(server); }
+});
+
+test('final review: proof-aware request diff ignores exact substitution but retains unrelated drift', () => {
+    const responseEvidence = require('../src/response-evidence');
+    const requestDiff = require('../src/request-diff');
+    const original = entry('POST', 'https://app.test/use?token=recorded&other=recorded-other', {
+        reqHeaders: [{ name: 'Authorization', value: 'Bearer recorded' }],
+    });
+    const proof = { links: [{ status: 'FAILED', consumerIndex: 0, sinkLocation: 'url-query:token', sinkName: 'token', recordedValue: 'recorded', value: 'fresh', consumer: { transmitted: true } }] };
+    const expected = responseEvidence._internal.applyProvenCorrelationLinks(original, 0, proof);
+    const result = requestDiff.compareRecordedRequestToObserved({
+        entry: expected,
+        observedRequest: { url: 'https://app.test/use?token=fresh&other=drift', headers: { authorization: 'Bearer recorded' } },
+    });
+    assert.ok(!result.issues.some(issue => issue.name === 'token'));
+    assert.ok(result.issues.some(issue => issue.name === 'other'));
+});
+
+test('final review: failed consumer remains fresh when extraction and transmission proved', () => {
+    const responseEvidence = require('../src/response-evidence');
+    const result = responseEvidence._internal.generatedSubstitutionEvidence({
+        targetIndex: 1,
+        runtimeProof: { links: [{ variable: 'token', consumerIndex: 1, status: 'FAILED', value: 'fresh-token', consumer: { transmitted: true, success: false } }] },
+    });
+    assert.deepEqual(result.generatedSubstitutions, [{ variable: 'token', status: 'FAILED', fresh: true, consumerSuccess: false }]);
+});
+
+test('final review: only proven header sinks suppress still-recorded diagnostics', () => {
+    const requestDiff = require('../src/request-diff');
+    const issues = requestDiff.compareRecordedRequestToObserved({
+        entry: entry('GET', 'https://app.test/', { reqHeaders: [{ name: 'Authorization', value: 'Bearer old' }, { name: 'X-Token', value: 'old' }] }),
+        observedRequest: { url: 'https://app.test/', headers: { authorization: 'Bearer old', 'x-token': 'old' } },
+        ignoreHeaderStillRecorded: ['authorization'],
+    }).issues;
+    assert.ok(!issues.some(issue => issue.name === 'authorization'));
+    assert.ok(issues.some(issue => issue.name === 'x-token'));
+});
+
+test('final review: params-only substitutions retain params without creating text', () => {
+    const responseEvidence = require('../src/response-evidence');
+    const original = entry('POST', 'https://app.test/use', { postData: { params: [{ name: 'token', value: 'old' }] } });
+    const clone = responseEvidence._internal.applyProvenCorrelationLinks(original, 0, { links: [{ consumerIndex: 0, sinkLocation: 'post-data-param:token', sinkName: 'token', value: 'fresh', consumer: { transmitted: true } }] });
+    assert.equal(clone.request.postData.text, undefined);
+    assert.equal(clone.request.postData.params[0].value, 'fresh');
+});
+
+test('Task 4 review: parent empty direct fields never inherit child request or response data', () => {
+    const sample = runEvidence.summarizeJtlXml(`<testResults>
+<httpSample lb="Step 01 - POST /parent" rc="200" s="true">
+  <responseData></responseData><responseHeader></responseHeader><requestData></requestData><samplerData></samplerData>
+  <httpSample lb="Step 01 - POST /parent-0" rc="302" s="true">
+    <responseData>child-response</responseData><requestData>child-request</requestData>
+    <requestHeader>X-Child: only-child</requestHeader>
+    <responseHeader>Location: /child-next</responseHeader><java.net.URL>https://app.test/parent</java.net.URL>
+  </httpSample>
+</httpSample></testResults>`)[0];
+    assert.strictEqual(sample.responseBody, '');
+    assert.deepStrictEqual(sample.responseHeaders, []);
+    assert.strictEqual(sample.renderedRequest.body, '');
+    assert.deepStrictEqual(sample.renderedRequest.headers, []);
+    assert.strictEqual(sample.redirects[0].location, '/child-next');
+
+    const absent = runEvidence.summarizeJtlXml(`<testResults>
+<httpSample lb="Step 02 - GET /absent" rc="200" s="true">
+  <httpSample lb="Step 02 - GET /absent-0" rc="302" s="true">
+    <responseData>child-only-response</responseData><responseHeader>Location: /child-only</responseHeader>
+  </httpSample>
+</httpSample></testResults>`)[0];
+    assert.strictEqual(absent.responseBody, '');
+    assert.deepStrictEqual(absent.responseHeaders, []);
+    assert.strictEqual(absent.redirects[0].location, '/child-only');
+});
+
+test('Task 4 review: samplerData parses request payload instead of metadata', () => {
+    const samples = runEvidence.summarizeJtlXml(`<testResults>
+<httpSample lb="Step 01 - POST /submit" rc="200" s="true">
+  <samplerData><![CDATA[POST data:
+Cookie: SID=metadata-cookie
+Request Headers:
+X-Trace: metadata
+
+actual-body=only-this]]></samplerData>
+  <requestHeader><![CDATA[Cookie: SID=header-cookie
+X-Trace: header]]></requestHeader><java.net.URL>https://app.test/submit</java.net.URL>
+</httpSample>
+<httpSample lb="Step 02 - GET /next" rc="200" s="true"><samplerData><![CDATA[GET https://app.test/next
+Request Headers:
+X-Meta: ignored]]></samplerData></httpSample>
+</testResults>`);
+    assert.strictEqual(samples[0].renderedRequest.method, 'POST');
+    assert.strictEqual(samples[0].renderedRequest.body, 'actual-body=only-this');
+    assert.deepStrictEqual(samples[0].renderedRequest.headers, [{ name: 'Cookie', value: 'SID=header-cookie' }, { name: 'X-Trace', value: 'header' }]);
+    assert.strictEqual(samples[1].renderedRequest.method, 'GET');
+    assert.strictEqual(samples[1].renderedRequest.body, '');
+});
+
+test('Task 4 review: external sanitizer redacts protocol secrets without exported fingerprints', () => {
+    const secrets = ['api-key-secret', 'auth-secret', 'password-secret', 'cookie-secret', 'csrf-secret', 'xsrf-secret', 'state-secret', 'code-secret', 'saml-secret', 'relay-secret', 'token-secret', 'session-secret'];
+    const safe = sanitizeRunEvidenceForExternal({ rows: [{
+        renderedRequest: {
+            method: 'POST',
+            url: `https://app.test/cb?x-api-key=${secrets[0]}&csrf=${secrets[4]}&state=${secrets[6]}&code=${secrets[7]}&SAMLResponse=${secrets[8]}&RelayState=${secrets[9]}&token=${secrets[10]}&session=${secrets[11]}`,
+            query: Object.fromEntries(['x-api-key', 'authorization', 'password', 'cookie', 'csrf', 'xsrf', 'state', 'code', 'SAMLResponse', 'RelayState', 'token', 'session'].map((name, index) => [name, secrets[index]])),
+            headers: [{ name: 'X-Api-Key', value: secrets[0] }, { name: 'Authorization', value: secrets[1] }, { name: 'Cookie', value: `SID=${secrets[3]}` }],
+            cookies: [{ name: 'SID', value: secrets[3] }],
+            body: `password=${secrets[2]}&csrf=${secrets[4]}&state=${secrets[6]}&SAMLResponse=${secrets[8]}`,
+        },
+    }] });
+    const printed = JSON.stringify(safe);
+    for (const secret of secrets) assert.ok(!printed.includes(secret), `${secret} is redacted`);
+    assert.doesNotMatch(printed, /fingerprint/i, 'deterministic/reversible fingerprints are not exported');
+    assert.equal(safe.rows[0].renderedRequest.body.present, true);
+    assert.equal(safe.rows[0].renderedRequest.body.length > 0, true);
+});
+
+test('Task 4 blocker: parent headers stay direct while each redirect uses child direct headers', () => {
+    const parsed = recordingEvidence.parseSidecarBuffer(`<testResults>
+<httpSample lb="parent" rc="200">
+  <responseHeader>X-Parent: keep</responseHeader>
+  <httpSample lb="redirect-one" rc="302"><responseHeader>Location: /one
+Set-Cookie: ONE=1</responseHeader></httpSample>
+  <httpSample lb="redirect-two" rc="302"><responseHeader>Location: /two
+Set-Cookie: TWO=2</responseHeader></httpSample>
+</httpSample></testResults>`).samples[0];
+    assert.deepStrictEqual(parsed.headers, [{ name: 'X-Parent', value: 'keep' }]);
+    assert.deepStrictEqual(parsed.sourceHeaders, [
+        { name: 'X-Parent', value: 'keep' },
+        { name: 'Location', value: '/one' },
+        { name: 'Set-Cookie', value: 'ONE=1' },
+        { name: 'Location', value: '/two' },
+        { name: 'Set-Cookie', value: 'TWO=2' },
+    ]);
+    assert.deepStrictEqual(parsed.redirects, [
+        { status: 302, url: '', location: '/one', setCookies: ['ONE=1'], responseBody: '', responseHeaders: [{ name: 'Location', value: '/one' }, { name: 'Set-Cookie', value: 'ONE=1' }] },
+        { status: 302, url: '', location: '/two', setCookies: ['TWO=2'], responseBody: '', responseHeaders: [{ name: 'Location', value: '/two' }, { name: 'Set-Cookie', value: 'TWO=2' }] },
+    ]);
+});
+
+test('Task 4 blocker: external sanitizer elides sensitive auth-route path tokens', () => {
+    const safe = sanitizeRunEvidenceForExternal({ rows: [{
+        renderedRequest: {
+            method: 'GET',
+            url: 'https://app.test/oauth/callback/code-path-secret/reset/reset-path-secret/token/token-path-secret',
+            query: {}, headers: [], cookies: [], body: '',
+        },
+    }] });
+    assert.doesNotMatch(safe.rows[0].renderedRequest.url, /code-path-secret|reset-path-secret|token-path-secret/);
+    assert.match(safe.rows[0].renderedRequest.url, /REDACTED/);
+});
+
+test('Task 4 blocker: URL-first samplerData extracts later POST data payload only', () => {
+    const sample = runEvidence.summarizeJtlXml(`<testResults>
+<httpSample lb="Step 01 - POST /submit" rc="200" s="true">
+  <samplerData><![CDATA[https://app.test/submit
+POST data:
+Cookie: SID=metadata
+Request Headers:
+X-Trace: metadata
+
+actual=payload]]></samplerData>
+</httpSample></testResults>`)[0];
+    assert.strictEqual(sample.renderedRequest.method, 'POST');
+    assert.strictEqual(sample.renderedRequest.url, 'https://app.test/submit');
+    assert.strictEqual(sample.renderedRequest.body, 'actual=payload');
+});
+
+test('Task 4 blocker: non-step duplicate final JTL samples use last occurrence', () => {
+    const evidence = runEvidence.buildRunEvidence({
+        entries: [entry('GET', 'https://app.test/dashboard')],
+        samples: [
+            { label: 'dashboard', url: 'https://app.test/dashboard', responseCode: 500, responseBody: 'first' },
+            { label: 'dashboard', url: 'https://app.test/dashboard', responseCode: 200, responseBody: 'last' },
+            { label: 'profile', url: 'https://app.test/profile', responseCode: 200, responseBody: 'distinct' },
+        ],
+    });
+    assert.strictEqual(evidence.rows.length, 1);
+    assert.strictEqual(evidence.rows[0].sampleIndex, 1);
+    assert.strictEqual(evidence.rows[0].observedStatus, 200);
+    assert.strictEqual(evidence.rows[0].observedBody, 'last');
+});
+
+// Category 7 — runtime proof rejects invalid values and proves fresh transmission.
+test('Task 1 regression: runtime proof derives invalid classifications from evidence and proves fresh consumer transmission', async () => {
+    const seen = [];
+    const server = http.createServer((req, res) => {
+        seen.push(req.headers['x-token'] || '');
+        if (req.url === '/token') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end('{"token":"freshLiveToken123"}');
+            return;
+        }
+        res.writeHead(req.headers['x-token'] === 'freshLiveToken123' ? 200 : 401);
+        res.end('ok');
+    });
+    const port = await listenLocal(server);
+    try {
+        const recorded = 'recordedToken123';
+        const jtl = path.join(tmp(), 'runtime-proof.jtl');
+        fs.writeFileSync(jtl, `<?xml version="1.0" encoding="UTF-8"?>
+<testResults>
+  <httpSample lb="Step 01 - GET /token" rc="200" s="true">
+    <samplerData>GET https://app.test/token</samplerData>
+  </httpSample>
+  <httpSample lb="Step 02 - GET /consumer" rc="200" s="true">
+    <samplerData>GET https://app.test/consumer?notFound=_NOTFOUND&amp;empty=&amp;stale=${recorded}&amp;unresolved=\${unresolved}</samplerData>
+    <requestHeader>X-Token: freshLiveToken123</requestHeader>
+  </httpSample>
+</testResults>`);
+        const evidence = runEvidence.buildRunEvidence({
+            entries: [
+                entry('GET', 'http://recorded.test/token', { body: `{"token":"${recorded}"}` }),
+                entry('GET', 'http://recorded.test/consumer', { reqHeaders: [{ name: 'X-Token', value: recorded }] }),
+            ],
+            jtlPath: jtl,
+        });
+        const result = await correlateAndReplay({
+            entries: evidence.rows.map(row => row.entry),
+            runEvidence: evidence,
+            targetBaseUrl: `http://127.0.0.1:${port}`,
+            skipPatterns: [],
+        });
+
+        assert.deepStrictEqual(result.runtimeProof, {
+            rejected: [
+                { value: '_NOTFOUND', reason: 'not_found' },
+                { value: '', reason: 'empty' },
+                { value: recorded, reason: 'stale_recorded' },
+                { value: '${unresolved}', reason: 'unresolved_variable' },
+            ],
+            consumers: [{ index: 1, variable: 'c_1', transmitted: 'freshLiveToken123', fresh: true }],
+        });
+        assert.deepStrictEqual(seen, ['', 'freshLiveToken123']);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+// Category 8 — Gate 0 scans raw POST bodies, including legal CDATA serialization.
+test('Task 1 regression: rendered-request static gate scans CDATA raw POST bodies', () => {
+    const xml = `<HTTPSamplerProxy testname="Step 01 - POST /login" enabled="true">
+  <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+  <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+    <collectionProp name="Arguments.arguments">
+      <elementProp name="" elementType="HTTPArgument">
+        <stringProp name="Argument.value"><![CDATA[username=alice&csrf=\${missingCsrf}]]></stringProp>
+      </elementProp>
+    </collectionProp>
+  </elementProp>
+</HTTPSamplerProxy><hashTree/>`;
+
+    const gate = checkRenderedRequests({ xml, outDir: tmp() });
+
+    assert.ok(gate.findings.some(item => item.kind === 'undefined-variable' && item.variable === 'missingCsrf'));
+});
+
+test('Task 5: runtime correlation proof verifies native JSON extraction and fresh protected consumer transmission', () => {
+    const correlationRuntimeProof = require('../src/correlation-runtime-proof');
+    const entries = [
+        entry('GET', 'https://recorded.test/token', { body: '{"token":"recordedToken123"}' }),
+        entry('POST', 'https://recorded.test/order', { body: 'created', reqHeaders: [{ name: 'X-Token', value: 'recordedToken123' }] }),
+    ];
+    const evidence = runEvidence.buildRunEvidence({
+        entries,
+        samples: [
+            {
+                label: 'Step 01 - GET /token',
+                responseCode: 200,
+                success: true,
+                responseBody: '{"token":"freshToken456"}',
+                renderedRequest: { method: 'GET', url: 'https://live.test/token', headers: [], body: '' },
+            },
+            {
+                label: 'Step 02 - POST /order',
+                responseCode: 201,
+                success: true,
+                responseBody: '{"id":"1"}',
+                renderedRequest: {
+                    method: 'POST', url: 'https://live.test/order',
+                    headers: [{ name: 'X-Token', value: 'freshToken456' }], body: '{"name":"order"}',
+                    evidenceProvenance: { samplerData: true, requestHeaders: true, requestData: true },
+                },
+            },
+        ],
+    });
+    const proof = correlationRuntimeProof.buildCorrelationRuntimeProof({
+        entries,
+        runEvidence: evidence,
+        correlations: [{ variableName: 'token', value: 'recordedToken123', producerEntryIndex: 0, targetRequestIndex: 1 }],
+        jmx: `<HTTPSamplerProxy testname="Step 01 - GET /token" enabled="true"></HTTPSamplerProxy><hashTree>
+<JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">token</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp><stringProp name="JSONPostProcessor.defaultValues">token_NOTFOUND</stringProp></JSONPostProcessor><hashTree/>
+</hashTree>`,
+        protectedIndexes: [1],
+    });
+
+    assert.strictEqual(proof.status, 'VERIFIED');
+    assert.strictEqual(proof.counts.verified, 1);
+    assert.strictEqual(proof.links[0].value, 'freshToken456');
+    assert.strictEqual(proof.links[0].consumer.transmitted, true);
+});
+
+test('Task 5: runtime correlation proof rejects stale or missing runtime evidence without false green', () => {
+    const correlationRuntimeProof = require('../src/correlation-runtime-proof');
+    const entries = [
+        entry('GET', 'https://recorded.test/token', { body: '{"token":"recordedToken123"}' }),
+        entry('GET', 'https://recorded.test/consumer?token=recordedToken123'),
+    ];
+    const proof = correlationRuntimeProof.buildCorrelationRuntimeProof({
+        entries,
+        runEvidence: runEvidence.buildRunEvidence({
+            entries,
+            samples: [
+                { label: 'Step 01 - GET /token', responseCode: 200, success: true, responseBody: '{"token":"freshToken456"}' },
+                { label: 'Step 02 - GET /consumer', responseCode: 401, success: false, renderedRequest: { url: 'https://live.test/consumer?token=recordedToken123', headers: [], body: '', evidenceProvenance: { samplerData: true } } },
+            ],
+        }),
+        correlations: [{ variableName: 'token', value: 'recordedToken123', producerEntryIndex: 0, targetRequestIndex: 1 }],
+        jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree><JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">token</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor></hashTree>`,
+        protectedIndexes: [1],
+    });
+
+    assert.strictEqual(proof.status, 'FAILED');
+    assert.strictEqual(proof.firstDivergence.kind, 'stale_recorded_value');
+});
+
+test('Task 5 review: zero links, structural ownership, and direct request provenance fail closed', () => {
+    const { buildCorrelationRuntimeProof } = require('../src/correlation-runtime-proof');
+    assert.strictEqual(buildCorrelationRuntimeProof({ entries: [{ response: {} }], runEvidence: { rows: [] } }).status, 'UNVERIFIED');
+
+    const entries = [entry('GET', 'https://recorded.test/token', { body: '{"token":"old"}' }), entry('POST', 'https://recorded.test/order', { postData: { text: 'token=old' } })];
+    const evidence = runEvidence.buildRunEvidence({ entries, samples: [
+        { label: 'Step 01 - GET /token', responseCode: 200, responseBody: '{"token":"new"}' },
+        { label: 'Step 02 - POST /order', responseCode: 200, renderedRequest: { url: 'https://live.test/order', headers: [{ name: 'X-Token', value: 'new' }], body: '', evidenceProvenance: { requestHeaders: true } } },
+    ] });
+    const wrongOwner = buildCorrelationRuntimeProof({
+        entries, runEvidence: evidence,
+        correlations: [{ variableName: 'token', value: 'old', producerEntryIndex: 0, targetRequestIndex: 1 }],
+        jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree/>
+<HTTPSamplerProxy testname="Step 02" enabled="true"></HTTPSamplerProxy><hashTree><JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">token</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor><hashTree/></hashTree>`,
+    });
+    assert.strictEqual(wrongOwner.status, 'UNVERIFIED');
+    assert.strictEqual(wrongOwner.firstDivergence.kind, 'extractor_wrong_producer');
+
+    const headerOnlyBody = buildCorrelationRuntimeProof({
+        entries, runEvidence: evidence,
+        correlations: [{ variableName: 'token', value: 'old', producerEntryIndex: 0, targetRequestIndex: 1 }],
+        jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree><JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">token</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor><hashTree/></hashTree>`,
+    });
+    assert.strictEqual(headerOnlyBody.status, 'UNVERIFIED');
+    assert.strictEqual(headerOnlyBody.firstDivergence.kind, 'request_body_evidence_missing');
+});
+
+test('Task 5 review: native evaluators are constrained, ordered, and redirect-aware', () => {
+    const proof = require('../src/correlation-runtime-proof');
+    assert.strictEqual(proof._internal.jsonValue('{"nested":{"token":"fresh"},"a-b":[{"token":"array"}]}', '$..token').value, 'fresh');
+    assert.strictEqual(proof._internal.jsonValue('{"a-b":[{"token":"array"}]}', "$['a-b'][0]['token']").value, 'array');
+    assert.strictEqual(proof._internal.jsonValue('{"token":"fresh"}', '$[?(@.token)]').supported, false);
+    assert.strictEqual(proof._internal.regexValue('A\nTOKEN=fresh-42', '(?ims)^token=(\\w+)-(\\d+)$', '$2$:$1$', 1, '').value, '42:fresh');
+    assert.strictEqual(proof._internal.regexValue('v=one v=two', 'v=(\\w+)', '$1$', -1, '').supported, false);
+    assert.strictEqual(proof._internal.cssValue('<input type="hidden" name="csrf" value="fresh">', 'input[type="hidden"][name="csrf"]', 'value').value, 'fresh');
+    assert.strictEqual(proof._internal.cssValue('<input name="csrf" value="fresh">', 'input:nth-child(1)', 'value').supported, false);
+});
+
+test('Task 5 review: first runtime divergence is sorted by source and sink', () => {
+    const { buildCorrelationRuntimeProof } = require('../src/correlation-runtime-proof');
+    const proof = buildCorrelationRuntimeProof({
+        correlations: [
+            { variableName: 'z', value: 'old-z', producerEntryIndex: 2, targetRequestIndex: 3 },
+            { variableName: 'a', value: 'old-a', producerEntryIndex: 0, targetRequestIndex: 4 },
+        ],
+    });
+    assert.strictEqual(proof.firstDivergence.producerIndex, 0);
+    assert.strictEqual(proof.firstDivergence.consumerIndex, 4);
+});
+
+test('Task 5 remaining: non-positive regex match numbers are unsupported', () => {
+    const runtimeProof = require('../src/correlation-runtime-proof');
+    assert.strictEqual(runtimeProof._internal.regexValue('token=one token=two', 'token=(\\w+)', '$1$', 0, '').supported, false);
+    assert.strictEqual(runtimeProof._internal.regexValue('token=one token=two', 'token=(\\w+)', '$1$', -1, '').supported, false);
+});
+
+test('Task 5 remaining: extractors require enabled exact sibling hashTree ownership', () => {
+    const runtimeProof = require('../src/correlation-runtime-proof');
+    const xml = `<HTTPSamplerProxy testname="one" enabled="true"></HTTPSamplerProxy><hashTree></hashTree>
+<HTTPSamplerProxy testname="two" enabled="false"></HTTPSamplerProxy><hashTree><JSONPostProcessor enabled="false"><stringProp name="JSONPostProcessor.referenceNames">late</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor><hashTree/></hashTree>
+<JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">outside</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor>`;
+    const defs = runtimeProof._internal.nativeExtractors(xml);
+    assert.strictEqual(defs.find(item => item.variable === 'late').ownerIndex, 1);
+    assert.strictEqual(defs.find(item => item.variable === 'late').enabled, false);
+    assert.strictEqual(defs.some(item => item.variable === 'outside'), false);
+});
+
+test('Task 5 remaining: JSON extractor fields pair positionally and reject ambiguous cardinality', () => {
+    const runtimeProof = require('../src/correlation-runtime-proof');
+    const xml = `<HTTPSamplerProxy testname="one" enabled="true"></HTTPSamplerProxy><hashTree><JSONPostProcessor>
+<stringProp name="JSONPostProcessor.referenceNames">a;b</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.a;$.b</stringProp><stringProp name="JSONPostProcessor.defaultValues">A_MISSING;B_MISSING</stringProp><stringProp name="JSONPostProcessor.match_numbers">1;1</stringProp>
+</JSONPostProcessor><hashTree/></hashTree>`;
+    const defs = runtimeProof._internal.nativeExtractors(xml);
+    assert.deepStrictEqual(defs.map(item => [item.variable, item.expression, item.defaultValue]), [['a', '$.a', 'A_MISSING'], ['b', '$.b', 'B_MISSING']]);
+    const ambiguous = runtimeProof._internal.nativeExtractors(xml.replace('$.a;$.b', '$.a'));
+    assert.strictEqual(ambiguous[0].supported, false);
+});
+
+test('Task 5 remaining: encoded form transmission is proven from body evidence only', () => {
+    const runtimeProof = require('../src/correlation-runtime-proof');
+    assert.strictEqual(runtimeProof._internal.renderedContains({ body: 'token=fresh%2Bvalue' }, 'fresh+value', 'body'), true);
+    assert.strictEqual(runtimeProof._internal.renderedContains({ url: 'https://x/?token=fresh%2Bvalue' }, 'fresh+value', 'body'), false);
+});
+
+test('Task 5 remaining: protected failure and runtime root remain additive through gates', () => {
+    const runtimeProof = { status: 'FAILED', firstDivergence: { kind: 'protected_business_consumer_failed', producerIndex: 0, consumerIndex: 1, reason: 'business rejected', link: { variable: 'token' } }, links: [], counts: {} };
+    const analysis = failureForensics.analyzeFailureForensics({ runtimeProof });
+    const gate = finalGreenGate.evaluateFinalGreenGate({ result: { success: true, statusRootCause: { rootCause: { category: 'status' } } }, runtimeProof });
+    assert.strictEqual(analysis.rootCause.category, 'upstream_correlation_runtime_failure');
+    assert.ok(gate.categories.includes('correlation_runtime_proof'));
+});
+
+test('Task 5 final: full proof uses decoded ledger form sink and encoded rendered body', () => {
+    const runtimeProof = require('../src/correlation-runtime-proof');
+    const entries = [
+        entry('GET', 'https://recorded.test/token', { body: '{"token":"old+token"}' }),
+        entry('POST', 'https://recorded.test/submit', { postData: { text: 'token=old%2Btoken' } }),
+    ];
+    const evidence = runEvidence.buildRunEvidence({ entries, samples: [
+        { label: 'Step 01 - GET /token', responseCode: 200, success: true, responseBody: '{"token":"fresh+token"}' },
+        { label: 'Step 02 - POST /submit', responseCode: 200, success: true, renderedRequest: {
+            url: 'https://live.test/submit', body: 'token=fresh%2Btoken', headers: [],
+            evidenceProvenance: { requestData: true },
+        } },
+    ] });
+    const proof = runtimeProof.buildCorrelationRuntimeProof({
+        entries, runEvidence: evidence,
+        ledger: { entries: [{ name: 'token', value: 'old+token', role: 'server-issued-correlation', consumerLinks: [{ producerIndex: 0, consumerIndex: 1, location: 'form:token', encoding: 'percent-encoded' }] }] },
+        jmx: `<HTTPSamplerProxy testname="Step 01" enabled="true"></HTTPSamplerProxy><hashTree><JSONPostProcessor><stringProp name="JSONPostProcessor.referenceNames">token</stringProp><stringProp name="JSONPostProcessor.jsonPathExprs">$.token</stringProp></JSONPostProcessor><hashTree/></hashTree>`,
+    });
+    assert.strictEqual(proof.status, 'VERIFIED');
+    assert.strictEqual(proof.links[0].consumer.transmitted, true);
+});
+
+// Category 9 — edited consumers retain auth/session/cookie prerequisites in replay.
+test('Task 1 regression: fast repair replays auth and cookie prerequisites before an edited consumer', async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url === '/login') {
+            res.writeHead(200, { 'Set-Cookie': 'SID=live-session; Path=/' });
+            res.end('logged in');
+            return;
+        }
+        res.writeHead(req.headers.cookie === 'SID=live-session' ? 200 : 401);
+        res.end('consumer');
+    });
+    const port = await listenLocal(server);
+    try {
+        const entries = [
+            entry('POST', 'http://recorded.test/login', { body: 'logged in' }),
+            entry('POST', 'http://recorded.test/submit', {
+                reqHeaders: [{ name: 'X-Note', value: 'recorded-note' }],
+                body: 'consumer',
+            }),
+        ];
+        const xml = `<HTTPSamplerProxy testname="Step 01 - POST /login" enabled="true"></HTTPSamplerProxy><hashTree/>
+<HTTPSamplerProxy testname="Step 02 - POST /submit" enabled="true"></HTTPSamplerProxy><hashTree/>`;
+
+        const result = await fastRepairLoop.runFastRepairLoop({
+            xml,
+            entries,
+            fixes: [{
+                kind: 'replaceValueWithVar',
+                sampler: 'Step 02 - POST /submit',
+                value: 'recorded-note',
+                variable: 'note',
+            }],
+            targetBaseUrl: `http://127.0.0.1:${port}`,
+            insecure: true,
+        });
+
+        assert.deepStrictEqual(result.replayedIndexes, [0, 1]);
+        assert.strictEqual(result.replay.ok, true);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('Task 6: planner recursively includes exact producers before its consumer', () => {
+    const entries = [
+        entry('GET', 'https://recorded.test/bootstrap', { body: '{"seed":"seed-1"}' }),
+        entry('POST', 'https://recorded.test/token', { postData: { text: 'seed=seed-1' }, body: '{"token":"token-1"}' }),
+        entry('POST', 'https://recorded.test/submit', { postData: { text: 'token=token-1' } }),
+    ];
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries,
+        candidates: [{ name: 'seed', value: 'seed-1' }, { name: 'token', value: 'token-1' }],
+    });
+    const plan = replayDependencies.planReplayDependencies({
+        entries, targetIndexes: [2], correlationLedger: ledger,
+        enabledBySampler: new Map([['GET https://recorded.test/bootstrap', true], ['POST https://recorded.test/token', true], ['POST https://recorded.test/submit', true]]),
+    });
+    assert.deepStrictEqual(plan.indexes, [0, 1, 2]);
+    assert.deepStrictEqual(plan.requiredProducers, [0, 1]);
+    assert.strictEqual(plan.blocked, false);
+});
+
+test('Task 6: planner retains login cookie state but isolated GET replays alone', () => {
+    const entries = [
+        entry('POST', 'https://recorded.test/login', { body: 'logged in' }),
+        entry('GET', 'https://recorded.test/protected'),
+        entry('GET', 'https://recorded.test/health'),
+    ];
+    entries[0].response.headers.push({ name: 'Set-Cookie', value: 'SID=live; Path=/' });
+    entries[1].request.headers.push({ name: 'Cookie', value: 'SID=live' });
+    const ledger = correlationLedger.buildCorrelationLedger({
+        primaryEntries: entries, candidates: [{ name: 'Cookie', value: 'SID=live' }],
+    });
+    const protectedPlan = replayDependencies.planReplayDependencies({ entries, targetIndexes: [1], correlationLedger: ledger });
+    const getPlan = replayDependencies.planReplayDependencies({ entries, targetIndexes: [2], correlationLedger: ledger });
+    assert.deepStrictEqual(protectedPlan.indexes, [0, 1]);
+    assert.deepStrictEqual(getPlan.indexes, [2]);
+});
+
+test('Task 6: unresolved session starts at flow entry and disabled producer blocks replay', () => {
+    const entries = [
+        entry('POST', 'https://recorded.test/login'),
+        entry('GET', 'https://recorded.test/protected', { reqHeaders: [{ name: 'Authorization', value: 'Bearer unknown' }] }),
+    ];
+    const plan = replayDependencies.planReplayDependencies({
+        entries, targetIndexes: [1],
+        correlationLedger: { entries: [{ name: 'authorization', role: 'unresolved', consumerIndexes: [1], producerIndexes: [] }] },
+        enabledBySampler: new Map([['POST https://recorded.test/login', false], ['GET https://recorded.test/protected', true]]),
+    });
+    assert.deepStrictEqual(plan.indexes, [0, 1]);
+    assert.strictEqual(plan.blocked, true);
+    assert.strictEqual(plan.blockedRequirements[0].kind, 'required_disabled_producer');
+});
+
+test('Task 6: planner blocks unsafe mutating business prerequisites', () => {
+    const entries = [
+        entry('POST', 'https://recorded.test/orders', { postData: { text: '{"item":"A"}' } }),
+        entry('GET', 'https://recorded.test/orders/42'),
+    ];
+    const plan = replayDependencies.planReplayDependencies({
+        entries, targetIndexes: [1],
+        correlationLedger: { entries: [{ name: 'session', role: 'unresolved', consumerIndexes: [1], producerIndexes: [] }] },
+    });
+    assert.strictEqual(plan.blocked, true);
+    assert.strictEqual(plan.blockedRequirements[0].kind, 'unsafe_mutating_prerequisite');
+    assert.deepStrictEqual(plan.indexes, [1]);
+});
+
+test('Task 6: response evidence identifies earliest prerequisite divergence and preserves prefix context', async () => {
+    const requests = [];
+    const server = http.createServer((req, res) => {
+        requests.push({ url: req.url, cookie: req.headers.cookie || '' });
+        if (req.url === '/login') {
+            res.writeHead(500, { 'Set-Cookie': 'SID=live; Path=/' });
+            res.end('login diverged');
+            return;
+        }
+        res.writeHead(req.headers.cookie === 'SID=live' ? 200 : 401);
+        res.end('protected');
+    });
+    const port = await listenLocal(server);
+    try {
+        const entries = [
+            entry('POST', 'http://recorded.test/login', { body: 'recorded login' }),
+            entry('GET', 'http://recorded.test/protected', { body: 'protected' }),
+        ];
+        entries[0].response.headers.push({ name: 'Set-Cookie', value: 'SID=recorded; Path=/' });
+        entries[1].request.headers.push({ name: 'Cookie', value: 'SID=recorded' });
+        const evidence = await responseEvidence.collectFailingResponseEvidence({
+            entries, failures: [{ index: 1 }], targetBaseUrl: `http://127.0.0.1:${port}`, insecure: true,
+            correlationLedger: correlationLedger.buildCorrelationLedger({ primaryEntries: entries, candidates: [{ name: 'Cookie', value: 'SID=recorded' }] }),
+        });
+        assert.deepStrictEqual(evidence[0].prerequisiteIndexes, [0]);
+        assert.deepStrictEqual(evidence[0].replayedIndexes, [0, 1]);
+        assert.strictEqual(evidence[0].firstDivergence.index, 0);
+        assert.strictEqual(evidence[0].upstream, true);
+        assert.strictEqual(evidence[0].casualty, true);
+        assert.deepStrictEqual(requests.map(item => item.url), ['/login', '/protected']);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('Task 6: response evidence resets cookie context across flows and fails closed without a baseline', async () => {
+    const requests = [];
+    const server = http.createServer((req, res) => {
+        requests.push({ url: req.url, cookie: req.headers.cookie || '' });
+        if (req.url === '/login-a') {
+            res.writeHead(200, { 'Set-Cookie': 'SID=A; Path=/' });
+            res.end('login A');
+            return;
+        }
+        if (req.url === '/login-b') {
+            res.writeHead(200, { 'Set-Cookie': 'SID=B; Path=/' });
+            res.end('login B');
+            return;
+        }
+        res.writeHead(req.url === '/target-a' && req.headers.cookie === 'SID=A' || req.url === '/target-b' && req.headers.cookie === 'SID=B' ? 200 : 401);
+        res.end('target');
+    });
+    const port = await listenLocal(server);
+    try {
+        const entries = [
+            entry('POST', 'http://flow-a.test/login-a', { body: 'login A' }),
+            entry('GET', 'http://flow-a.test/target-a', { body: 'target' }),
+            entry('POST', 'http://flow-b.test/login-b', { body: 'login B' }),
+            entry('GET', 'http://flow-b.test/target-b', { body: 'target' }),
+        ];
+        for (const [login, target, value] of [[0, 1, 'A'], [2, 3, 'B']]) {
+            entries[login].response.headers.push({ name: 'Set-Cookie', value: `SID=${value}; Path=/` });
+            entries[target].request.headers.push({ name: 'Cookie', value: `SID=${value}` });
+        }
+        const evidence = await responseEvidence.collectFailingResponseEvidence({
+            entries, failures: [{ index: 3 }, { index: 1 }], targetBaseUrl: `http://127.0.0.1:${port}`, insecure: true,
+            correlationLedger: correlationLedger.buildCorrelationLedger({
+                primaryEntries: entries, candidates: [{ name: 'Cookie', value: 'SID=A' }, { name: 'Cookie', value: 'SID=B' }],
+            }),
+        });
+        assert.deepStrictEqual(evidence.map(item => item.index), [1, 3]);
+        assert.deepStrictEqual(requests, [
+            { url: '/login-a', cookie: '' }, { url: '/target-a', cookie: 'SID=A' },
+            { url: '/login-b', cookie: '' }, { url: '/target-b', cookie: 'SID=B' },
+        ]);
+
+        entries[0].response = {};
+        const unverified = await responseEvidence.collectFailingResponseEvidence({
+            entries, failures: [{ index: 1 }], targetBaseUrl: `http://127.0.0.1:${port}`, insecure: true,
+            correlationLedger: correlationLedger.buildCorrelationLedger({
+                primaryEntries: entries, candidates: [{ name: 'Cookie', value: 'SID=A' }],
+            }),
+        });
+        assert.strictEqual(unverified[0].status, 'UNVERIFIED');
+        assert.match(unverified[0].error, /baseline is absent/i);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('Task 6 review: non-contiguous replay indexes retain original sample and drift indexes', async () => {
+    const server = http.createServer((req, res) => {
+        res.writeHead(req.url === '/three' ? 500 : 200);
+        res.end(req.url === '/three' ? 'bad' : 'ok');
+    });
+    const port = await listenLocal(server);
+    try {
+        const entries = [
+            entry('GET', 'http://recorded.test/zero', { body: 'ok' }),
+            entry('GET', 'http://recorded.test/one'),
+            entry('GET', 'http://recorded.test/two'),
+            entry('GET', 'http://recorded.test/three', { body: 'ok' }),
+        ];
+        const replay = await replayAll({
+            entries: [entries[0], entries[3]], originalIndexes: [0, 3],
+            targetBaseUrl: `http://127.0.0.1:${port}`, insecure: true,
+        });
+        assert.deepStrictEqual(replay.samples.map(item => item.index), [0, 3]);
+        assert.strictEqual(replay.drift[0].index, 3);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('Task 6 review: exact server-issued producer POST is allowed but unknown mutation blocks', () => {
+    const entries = [
+        entry('POST', 'https://recorded.test/derive', { postData: { text: 'seed=1' } }),
+        entry('POST', 'https://recorded.test/order', { postData: { text: 'item=1' } }),
+        entry('GET', 'https://recorded.test/consumer'),
+    ];
+    const exactLedger = { entries: [{
+        name: 'derived', role: 'server-issued-correlation',
+        consumerLinks: [{ producerIndex: 0, consumerIndex: 2 }],
+    }] };
+    const allowed = replayDependencies.planReplayDependencies({ entries, targetIndexes: [2], correlationLedger: exactLedger });
+    assert.strictEqual(allowed.blocked, false);
+    assert.deepStrictEqual(allowed.indexes, [0, 2]);
+    const blocked = replayDependencies.planReplayDependencies({
+        entries, targetIndexes: [2],
+        correlationLedger: { entries: [{ name: 'state', role: 'unresolved', consumerIndexes: [2] }] },
+    });
+    assert.strictEqual(blocked.blocked, true);
+    assert.ok(blocked.blockedRequirements.some(item => item.risk === 'business_mutation'));
+});
+
+test('Task 6 review: cookie helper observes Domain Path and Secure boundaries', () => {
+    const jar = new Map();
+    replayInternal.rememberSetCookie(jar, 'login.example.test', [
+        'SID=one; Domain=.example.test; Path=/app; Secure',
+        'BAD=no; Domain=evil.test; Path=/',
+    ], true);
+    assert.strictEqual(replayInternal.joinCookies(jar, 'app.example.test', '/app/home', true), 'SID=one');
+    assert.strictEqual(replayInternal.joinCookies(jar, 'app.example.test', '/other', true), '');
+    assert.strictEqual(replayInternal.joinCookies(jar, 'app.example.test', '/app', false), '');
+    assert.strictEqual(replayInternal.joinCookies(jar, 'evil.test', '/', true), '');
+});
+
+test('Task 6 review: target host map preserves IdP and app routing', async () => {
+    const received = [];
+    const server = http.createServer((req, res) => {
+        received.push({ url: req.url, cookie: req.headers.cookie || '' });
+        if (req.url === '/login') {
+            res.writeHead(200, { 'Set-Cookie': 'APP=live; Domain=127.0.0.1; Path=/' });
+            res.end('login');
+            return;
+        }
+        res.writeHead(req.headers.cookie === 'APP=live' ? 200 : 401);
+        res.end('app');
+    });
+    const port = await listenLocal(server);
+    try {
+        const replay = await replayAll({
+            entries: [
+                entry('GET', 'https://idp.example.test/login', { body: 'login' }),
+                entry('GET', 'https://app.example.test/home', { body: 'app' }),
+            ],
+            targetHostMap: {
+                'idp.example.test': `http://127.0.0.1:${port}`,
+                'app.example.test': `http://127.0.0.1:${port}`,
+            },
+            insecure: true,
+        });
+        assert.strictEqual(replay.ok, true);
+        assert.deepStrictEqual(received, [{ url: '/login', cookie: '' }, { url: '/home', cookie: 'APP=live' }]);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('Task 6 review: failure normalization dedupes sorts then bounds', () => {
+    assert.deepStrictEqual(
+        responseEvidence._internal.normalizeFailures([{ index: 5 }, { index: 1 }, { index: 5 }, { samplerIndex: 2 }], 2),
+        [{ index: 1 }, { index: 2 }],
+    );
+});
+
+test('Task 6 review: generated substitution evidence requires JMeter provenance', () => {
+    const summary = responseEvidence._internal.generatedSubstitutionEvidence({
+        runEvidence: { rows: [{ index: 2, renderedRequest: { evidenceProvenance: { requestData: true } } }] },
+        runtimeProof: { links: [{ consumerIndex: 2, variable: 'token', status: 'VERIFIED', value: 'fresh', consumer: { transmitted: true } }] },
+        targetIndex: 2,
+    });
+    assert.deepStrictEqual(summary, { jmeterRenderedRequest: 'VERIFIED', generatedSubstitutions: [{ variable: 'token', status: 'VERIFIED', fresh: true, consumerSuccess: true }] });
+    assert.strictEqual(responseEvidence._internal.generatedSubstitutionEvidence({ targetIndex: 2 }).jmeterRenderedRequest, 'UNVERIFIED');
+});
+
+test('Task 6 review: prefix root preserves prerequisite and target indices for forensics', () => {
+    const result = { samples: [], replayPrefixDivergence: { prerequisiteIndex: 1, producerIndex: 1, consumerIndex: 3, reason: 'login diverged' } };
+    runnerInternal.attachFailureForensics({ result, entries: [entry('GET', 'https://x/'), entry('POST', 'https://x/login'), entry('GET', 'https://x/'), entry('GET', 'https://x/target')] });
+    assert.strictEqual(result.failureForensics.rootCause.runtimeProof.producerIndex, 1);
+    assert.strictEqual(result.failureForensics.rootCause.runtimeProof.consumerIndex, 3);
+});
+
+test('Task 6 remaining: generated proof reads real run-evidence entryIndex rows', () => {
+    const summary = responseEvidence._internal.generatedSubstitutionEvidence({
+        runEvidence: { rows: [{ entryIndex: 7, renderedRequest: { evidenceProvenance: { requestData: true } } }] },
+        runtimeProof: { links: [{ consumerIndex: 7, variable: 'csrf', status: 'VERIFIED' }] },
+        targetIndex: 7,
+    });
+    assert.strictEqual(summary.jmeterRenderedRequest, 'VERIFIED');
+});
+
+test('Task 6 remaining: target override keys cookies to live mapped host', async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url === '/login') {
+            res.writeHead(200, { 'Set-Cookie': 'SID=live; Domain=127.0.0.1; Path=/' });
+            res.end('login');
+            return;
+        }
+        res.writeHead(req.headers.cookie === 'SID=live' ? 200 : 401);
+        res.end('app');
+    });
+    const port = await listenLocal(server);
+    try {
+        const replay = await replayAll({
+            entries: [
+                entry('GET', 'http://prod.example.test/login', { body: 'login' }),
+                entry('GET', 'http://prod.example.test/app/home', { body: 'app' }),
+            ],
+            targetHostMap: { 'prod.example.test': `http://127.0.0.1:${port}` },
+            insecure: true,
+        });
+        assert.strictEqual(replay.ok, true);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('Task 6 remaining: runner config carries fast replay host map', () => {
+    const map = { 'prod.example.test': 'https://staging.example.test' };
+    assert.deepStrictEqual(runnerInternal.fastReplayTargetHostMap({ fastReplay: { targetHostMap: map } }), map);
+});
+
+test('Task 6 remaining: prefix root preserves issues in forensics output', () => {
+    const divergence = runnerInternal.toReplayPrefixDivergence({
+        prerequisiteIndex: 1, producerIndex: 1, consumerIndex: 4,
+        issues: [{ kind: 'statusDiff', recorded: 200, observed: 500 }],
+    });
+    const result = { samples: [], replayPrefixDivergence: divergence };
+    runnerInternal.attachFailureForensics({ result, entries: Array.from({ length: 5 }, () => entry('GET', 'https://x/')) });
+    assert.deepStrictEqual(result.failureForensics.rootCause.runtimeProof.issues, divergence.issues);
+    assert.strictEqual(result.failureForensics.rootCause.runtimeProof.prerequisiteIndex, 1);
+    assert.strictEqual(result.failureForensics.rootCause.runtimeProof.consumerIndex, 4);
 });

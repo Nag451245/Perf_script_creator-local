@@ -28,8 +28,9 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { HarParser, jmxSource, jtlParser, harComparator: HarComparator } = require('./engine');
+const { HarParser, jmxSource, harComparator: HarComparator } = require('./engine');
 const uploadFiles = require('./upload-files');
+const recordingEvidence = require('./recording-evidence-adapter');
 
 // File-extension recognition. Recording sidecars for JMX are JMeter-style JTLs
 // (or our own recording.xml, which uses the same testResults schema), so we
@@ -700,12 +701,20 @@ function analyzeInputFiles(files) {
             issues.push({
                 code: 'jmx_missing_sidecar',
                 file: u.primary,
-                // NOT a warning: without responses, correlation is not merely
-                // degraded, it is IMPOSSIBLE — every dynamic token ships as the
-                // recorded literal and the script cannot work on any replay.
-                // Shipping that quietly is worse than refusing to ship.
-                severity: 'error',
+                severity: 'warning',
                 message: `${path.basename(u.primary)} has no response sidecar (recording.xml/JTL): a JMX carries only REQUESTS, so there is nothing to correlate FROM and every dynamic value (tokens, session ids) would ship hardcoded. Upload the recording XML/JTL captured with this script.`,
+            });
+        }
+        if (u.kind === 'dual-jmx' && (!u.sidecars?.primary || !u.sidecars?.secondary)) {
+            issues.push({
+                code: 'dual_jmx_sidecar_coverage',
+                severity: 'warning',
+                files: [u.primary, u.secondary],
+                paired: {
+                    primary: u.sidecars?.primary || null,
+                    secondary: u.sidecars?.secondary || null,
+                },
+                message: `${path.basename(u.primary)} and ${path.basename(u.secondary)} have partial response-side coverage; generation will continue with the available sidecar evidence.`,
             });
         }
     }
@@ -929,21 +938,20 @@ async function loadUnit(unit) {
             let pairing = null;
             if (sidecarPath) {
                 try {
-                    const jtl = jtlParser.parseJtlBuffer(fs.readFileSync(sidecarPath));
-                    const paired = jtlParser.pairJmxWithJtl(entries, jtl.byKey);
-                    entries = paired.entries;
-                    pairing = { paired: paired.paired, unmatched: paired.unmatched, sidecar: path.basename(sidecarPath) };
+                    const evidence = recordingEvidence.parseAndPair(entries, fs.readFileSync(sidecarPath), sidecarPath);
+                    entries = evidence.entries;
+                    pairing = pairingNote(evidence);
                 } catch (e) {
                     notes[`${label}SidecarError`] = `failed to pair ${path.basename(sidecarPath)}: ${e.message}`;
                 }
             }
-            return { har: { log: { entries, pages } }, pairing };
+            return { har: { log: { entries, pages } }, pairing: pairing || missingPairingNote(entries.length) };
         };
 
         const a = parseOne(unit.primary, unit.sidecars?.primary, 'jmx1');
         const b = parseOne(unit.secondary, unit.sidecars?.secondary, 'jmx2');
-        if (a.pairing) notes.jmx1JtlPairing = a.pairing;
-        if (b.pairing) notes.jmx2JtlPairing = b.pairing;
+        notes.jmx1JtlPairing = a.pairing;
+        notes.jmx2JtlPairing = b.pairing;
 
         compareAndAnnotate(a.har, b.har, unit.secondary, notes, 'dualJmx', 'dualJmxError');
         // Mirror under the dualHar key too so downstream code that only knows
@@ -967,19 +975,45 @@ async function loadUnit(unit) {
         const pages = har.log?.pages || [];
         if (unit.secondary) {
             try {
-                const jtlBuf = fs.readFileSync(unit.secondary);
-                const jtl = jtlParser.parseJtlBuffer(jtlBuf);
-                const paired = jtlParser.pairJmxWithJtl(entries, jtl.byKey);
-                entries = paired.entries;
-                notes.jmxJtl = { paired: paired.paired, unmatched: paired.unmatched, sidecar: path.basename(unit.secondary) };
+                const evidence = recordingEvidence.parseAndPair(entries, fs.readFileSync(unit.secondary), unit.secondary);
+                entries = evidence.entries;
+                notes.jmxJtl = pairingNote(evidence);
             } catch (e) {
                 notes.jmxJtlError = `failed to pair sidecar ${path.basename(unit.secondary)}: ${e.message}`;
             }
+        } else {
+            notes.jmxJtl = missingPairingNote(entries.length);
         }
         return { entries, pages, mode: 'jmx', notes, sourceFile: unit.primary };
     }
 
     throw new Error(`Unknown ingest kind: ${unit.kind}`);
+}
+
+function pairingNote(evidence) {
+    return {
+        status: evidence.coverage.lowCoverage || evidence.coverage.unmatched || evidence.coverage.ambiguous ? 'PARTIAL' : 'AVAILABLE',
+        paired: evidence.coverage.paired,
+        unmatched: evidence.coverage.unmatched,
+        total: evidence.coverage.total,
+        ambiguous: evidence.coverage.ambiguous,
+        resolvedDuplicateOccurrences: evidence.coverage.resolvedDuplicateOccurrences,
+        lowCoverage: evidence.coverage.lowCoverage,
+        sidecar: evidence.sidecar.name,
+        sidecarIdentity: evidence.sidecar,
+    };
+}
+
+function missingPairingNote(total) {
+    return {
+        status: 'MISSING',
+        paired: 0,
+        unmatched: Number(total) || 0,
+        total: Number(total) || 0,
+        ambiguous: 0,
+        lowCoverage: true,
+        sidecar: null,
+    };
 }
 
 /**

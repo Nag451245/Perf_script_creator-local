@@ -103,4 +103,99 @@ function redactForExternal(value) {
     return out;
 }
 
-module.exports = { scrubRecordingXml, redactForExternal, SECRET_FIELD_NAMES, REDACT };
+function sanitizeRunEvidenceForExternal(evidence = {}) {
+    const rows = Array.isArray(evidence.rows) ? evidence.rows : [];
+    return {
+        observedBodiesBackfilled: Number(evidence.observedBodiesBackfilled || 0),
+        rows: rows.map(row => ({
+            entryIndex: row.entryIndex,
+            sampleIndex: row.sampleIndex,
+            label: row.label,
+            method: row.method,
+            recordedStatus: row.recordedStatus,
+            observedStatus: row.observedStatus,
+            recordedBodyLength: row.recordedBodyLength,
+            observedBodyLength: row.observedBodyLength,
+            assertionFailure: redactForExternal(row.assertionFailure || ''),
+            success: row.success,
+            renderedRequest: sanitizeRenderedRequestForExternal(row.renderedRequest),
+            redirects: (row.redirects || []).map(redirect => ({
+                status: redirect.status,
+                url: sanitizeUrl(redirect.url),
+                location: sanitizeUrl(redirect.location),
+                setCookies: (redirect.setCookies || []).map(value => ({ present: Boolean(value) })),
+            })),
+        })),
+    };
+}
+
+function sanitizeRenderedRequestForExternal(request) {
+    if (!request) return null;
+    const headers = (request.headers || []).map(header => ({
+        name: String(header.name || ''),
+        value: sensitiveName(header.name) || String(header.name || '').toLowerCase() === 'cookie'
+            ? REDACT : redactForExternal(String(header.value || '')),
+        present: Boolean(header.value),
+    }));
+    const query = {};
+    for (const [name, value] of Object.entries(request.query || {})) {
+        query[name] = sensitiveName(name) ? REDACT : redactForExternal(value);
+    }
+    return {
+        method: request.method || '',
+        url: sanitizeUrl(request.url),
+        query,
+        headers,
+        cookies: (request.cookies || []).map(cookie => ({
+            name: String(cookie.name || ''),
+            value: REDACT,
+            present: Boolean(cookie.value),
+        })),
+        body: {
+            present: Boolean(request.body),
+            length: String(request.body || '').length,
+        },
+    };
+}
+
+function sanitizeUrl(value) {
+    const raw = String(value || '');
+    try {
+        const url = new URL(raw);
+        for (const [name] of url.searchParams) {
+            if (sensitiveName(name)) url.searchParams.set(name, REDACT);
+        }
+        const parts = url.pathname.split('/');
+        for (let index = 1; index < parts.length - 1; index++) {
+            if (!isSensitiveRoute(parts[index])) continue;
+            if (isKnownAuthRoute(parts[index + 1])) continue;
+            parts[index + 1] = REDACT;
+        }
+        url.pathname = parts.join('/');
+        return url.toString();
+    } catch {
+        return redactForExternal(raw);
+    }
+}
+
+function isSensitiveRoute(segment) {
+    return /^(?:auth|callback|reset|token|authorize|sso)$/i.test(String(segment || ''));
+}
+
+function isKnownAuthRoute(segment) {
+    return /^(?:callback|reset|token|authorize|sso)$/i.test(String(segment || ''));
+}
+
+function sensitiveName(name) {
+    const normalized = String(name || '').toLowerCase().replace(/[-_\s]/g, '');
+    return SECRET_FIELD_NAMES.some(secret => secret.replace(/[-_]/g, '') === normalized) ||
+        /(?:token|session|cookie|authorization|password|secret|csrf|xsrf|state|code|saml|relay)/i.test(normalized);
+}
+
+module.exports = {
+    scrubRecordingXml,
+    redactForExternal,
+    sanitizeRunEvidenceForExternal,
+    SECRET_FIELD_NAMES,
+    REDACT,
+};

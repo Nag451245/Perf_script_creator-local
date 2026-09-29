@@ -24,7 +24,7 @@ const escXml = (s) => String(s == null ? '' : s)
 // nonce/code/state + the PKCE pair are auth0/OIDC flow values — JMeter carries
 // them via redirect-following + the Cookie Manager, so they must NOT be
 // correlated (extracting/substituting them breaks the interactive login).
-const NOISE_NAME = /^(content-length|user-agent|host|cache-control|accept|accept-.*|sec-.*|upgrade-insecure-requests|connection|referer|origin|x-goog.*|priority|pragma|dnt|te|date|content-type|x-client-data|cookie|nonce|code|state|code_verifier|code_challenge|code_challenge_method|max_age|auth0.*|_auth0.*)$/i;
+const NOISE_NAME = /^(content-length|user-agent|host|cache-control|accept|accept-.*|sec-.*|upgrade-insecure-requests|connection|referer|origin|x-goog.*|priority|pragma|dnt|te|date|content-type|x-client-data|cookie|code_verifier|code_challenge|code_challenge_method|max_age|auth0.*|_auth0.*)$/i;
 const THIRDPARTY = /dynatrace|pendo|gvt2|beacons|googleapis|gstatic|safebrowsing|ruxit|newrelic|nr-data/i;
 
 // The JTL parser stores a POST/GraphQL body in request.queryString (array of
@@ -89,8 +89,10 @@ function identifyDynamics(e1, e2) {
  * Returns { producerUrl, kind, refName, expr, attr?, useHeaders?, prefix? } or
  * { kind:'synthesize' } when no server produces it (client-generated).
  */
-function deriveExtractor(value, entries, varName) {
-    for (const e of entries) {
+function deriveExtractor(value, entries, varName, consumerEntryIndex = entries.length) {
+    const horizon = Math.min(Number.isInteger(consumerEntryIndex) ? consumerEntryIndex : entries.length, entries.length);
+    for (let producerEntryIndex = horizon - 1; producerEntryIndex >= 0; producerEntryIndex--) {
+        const e = entries[producerEntryIndex];
         const r = e.response || {};
         const body = (r.content && r.content.text) || '';
         const hdrs = (r.headers || []).map(h => `${h.name}: ${h.value}`).join('\n');
@@ -98,22 +100,27 @@ function deriveExtractor(value, entries, varName) {
 
         // Set-Cookie (or any response header) — RegexExtractor useHeaders.
         let m = hdrs.match(new RegExp('([\\w.-]+)=' + escRe(value)));        // Set-Cookie: NAME=VALUE
-        if (m) return { producerUrl: url, kind: 'regex', useHeaders: true, refName: varName, expr: `${escRe(m[1])}=([^;\\s]+)` };
+        if (m) return { producerEntryIndex, producerUrl: url, kind: 'regex', useHeaders: true, refName: varName, expr: `${escRe(m[1])}=([^;\\s]+)` };
         m = hdrs.match(new RegExp('([\\w-]+):\\s*' + escRe(value)));          // Header: VALUE
-        if (m) return { producerUrl: url, kind: 'regex', useHeaders: true, refName: varName, expr: `${escRe(m[1])}:\\s*([^\\r\\n;]+)` };
+        if (m) return { producerEntryIndex, producerUrl: url, kind: 'regex', useHeaders: true, refName: varName, expr: `${escRe(m[1])}:\\s*([^\\r\\n;]+)` };
 
         // HTML hidden field — CSS/JQuery extractor.
         m = body.match(new RegExp('<input[^>]*name="([^"]+)"[^>]*value="' + escRe(value)))
             || body.match(new RegExp('value="' + escRe(value) + '"[^>]*name="([^"]+)"'));
-        if (m) return { producerUrl: url, kind: 'css', refName: varName, expr: `input[name="${m[1]}"]`, attr: 'value' };
+        if (m) return { producerEntryIndex, producerUrl: url, kind: 'css', refName: varName, expr: `input[name="${m[1]}"]`, attr: 'value' };
 
         // JSON field — JSON Extractor.
         m = body.match(new RegExp('"(\\w+)"\\s*:\\s*"' + escRe(value)));
-        if (m) return { producerUrl: url, kind: 'json', refName: varName, expr: `$..${m[1]}` };
+        if (m) return { producerEntryIndex, producerUrl: url, kind: 'json', refName: varName, expr: `$..${m[1]}` };
 
         // Redirect Location / URL param — RegexExtractor.
-        m = (hdrs + '\n' + body).match(new RegExp('[?&](\\w+)=' + escRe(value)));
-        if (m) return { producerUrl: url, kind: 'regex', useHeaders: /location/i.test(hdrs), refName: varName, expr: `${escRe(m[1])}=([^&"\\s]+)` };
+        const location = (r.headers || []).find(header => /^location$/i.test(header.name || ''));
+        m = location && String(location.value || '').match(new RegExp('[?&]([\\w.-]+)=' + escRe(value)));
+        if (m) return {
+            producerEntryIndex, producerUrl: url, kind: 'regex', useHeaders: true, refName: varName,
+            expr: `(?:[?&])${escRe(m[1])}=([^&\\r\\n]+)`,
+            origin: 'location-query', headerName: 'Location', queryParam: m[1], extractedValue: value,
+        };
     }
     return { kind: 'synthesize', refName: varName };
 }
@@ -164,8 +171,10 @@ function extractorXml(d) {
  * verified extractors get applied; everything else is left as the input had it.
  */
 function verifyExtractor(der, value, entries) {
-    const e = entries.find(x => (x.request && x.request.url) === der.producerUrl)
-        || entries.find(x => pathOf(x.request && x.request.url) === pathOf(der.producerUrl));
+    const e = Number.isInteger(der.producerEntryIndex)
+        ? entries[der.producerEntryIndex]
+        : entries.find(x => (x.request && x.request.url) === der.producerUrl)
+            || entries.find(x => pathOf(x.request && x.request.url) === pathOf(der.producerUrl));
     if (!e) return false;
     const r = e.response || {};
     const body = (r.content && r.content.text) || '';
@@ -245,13 +254,14 @@ function correlateJmx(jmxXml, dynamics, entries) {
     const plans = [];
     for (const d of dynamics) {
         const varName = nameVar(d.name, d.value);
-        const der = deriveExtractor(d.value, entries, varName);
+        const consumerEntryIndex = entries.findIndex(entry => requestBlob(entry).includes(d.value));
+        const der = deriveExtractor(d.value, entries, varName, consumerEntryIndex < 0 ? entries.length : consumerEntryIndex);
         if (der.kind === 'synthesize') { synthesize.push({ name: d.name, value: d.value, var: varName }); continue; }
         // Only wire extractors that VERIFIABLY capture the recorded value — never
         // substitute a ${var} backed by a non-matching extractor (it would inject
         // the DEFAULT and break the request).
         if (!verifyExtractor(der, d.value, entries)) { synthesize.push({ name: d.name, value: d.value, var: varName, reason: 'extractor-unverified' }); continue; }
-        plans.push({ d, der, varName });
+        plans.push({ d, der, varName, consumerEntryIndex });
     }
     // Inject each extractor INTO its producer sampler's child hashTree (the only
     // valid place for a post-processor). Match producer entry → JMX sampler by
@@ -260,12 +270,18 @@ function correlateJmx(jmxXml, dynamics, entries) {
     for (const p of plans) {
         const samplers = indexJmxSamplers(xml);
         const prodPath = pathOf(p.der.producerUrl);
-        const order = samplers.findIndex(s => s.path && (s.path.split('?')[0] === prodPath || s.path.startsWith(prodPath)));
+        const order = Number.isInteger(p.der.producerEntryIndex)
+            ? p.der.producerEntryIndex
+            : samplers.findIndex(s => s.path && (s.path.split('?')[0] === prodPath || s.path.startsWith(prodPath)));
         if (order < 0) continue;
         const next = injectAfterSampler(xml, order, extractorXml(p.der));
         if (next && next !== xml) {
             xml = next;
-            applied.push({ name: p.d.name, var: p.varName, kind: p.der.kind, producer: prodPath });
+            applied.push({
+                name: p.d.name, value: p.d.value, var: p.varName, kind: p.der.kind, producer: prodPath,
+                producerEntryIndex: p.der.producerEntryIndex,
+                consumerEntryIndex: p.consumerEntryIndex,
+            });
         }
     }
 
@@ -287,6 +303,15 @@ function correlateJmx(jmxXml, dynamics, entries) {
     return { xml, applied, synthesize, substitutions: n };
 }
 
+function requestBlob(entry) {
+    const request = entry && entry.request || {};
+    return [
+        request.url || '',
+        reqBody(entry),
+        ...(request.headers || []).map(header => `${header.name}=${header.value}`),
+    ].join('\n');
+}
+
 /**
  * App integration entry point: given an already-generated JMX and BOTH recordings
  * (variance pair), add the body/session correlations the engine's pass missed.
@@ -304,5 +329,5 @@ function correlateBodyDynamics(jmxXml, primaryEntries, secondaryEntries) {
 
 module.exports = {
     identifyDynamics, deriveExtractor, correlateJmx, correlateBodyDynamics,
-    _internal: { indexJmxSamplers, extractorXml, reqBody, verifyExtractor },
+    _internal: { indexJmxSamplers, extractorXml, reqBody, verifyExtractor, requestBlob },
 };

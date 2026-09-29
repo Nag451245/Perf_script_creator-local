@@ -43,26 +43,50 @@ function cookieDomainMatches(host, domain) {
     return h.length > d.length && h.endsWith(`.${d}`);
 }
 
-function joinCookies(cookieJar, host) {
+function joinCookies(cookieJar, host, requestPath = '/', isSecure = false) {
     const items = [];
     for (const [k, v] of cookieJar.entries()) {
-        const [domain, name] = k.split('|');
-        if (cookieDomainMatches(host, domain)) items.push(`${name}=${v}`);
+        const [domain, path, name] = k.split('|');
+        const cookie = typeof v === 'object' ? v : { value: v, path: '/', secure: false };
+        const legacy = name === undefined;
+        const cookieName = legacy ? path : name;
+        const cookiePath = legacy ? '/' : (cookie.path || path || '/');
+        if (cookieDomainMatches(host, domain) && pathMatches(requestPath, cookiePath) && (!cookie.secure || isSecure)) {
+            items.push(`${cookieName}=${cookie.value}`);
+        }
     }
     return items.join('; ');
 }
-function rememberSetCookie(cookieJar, host, raw) {
+function pathMatches(requestPath, cookiePath) {
+    const request = String(requestPath || '/');
+    const path = String(cookiePath || '/');
+    return request === path || (request.startsWith(path) && (path.endsWith('/') || request.charAt(path.length) === '/'));
+}
+function rememberSetCookie(cookieJar, host, raw, isSecure = false, requestPath = '/') {
     if (!raw) return;
     const arr = Array.isArray(raw) ? raw : [raw];
     for (const line of arr) {
-        const [pair] = String(line).split(';');
+        const pieces = String(line).split(';').map(item => item.trim());
+        const [pair] = pieces;
         const eq = pair.indexOf('=');
         if (eq < 0) continue;
         const name = pair.substring(0, eq).trim();
         const value = pair.substring(eq + 1).trim();
         if (!name) continue;
-        cookieJar.set(`${host}|${name}`, value);
+        const attrs = new Map(pieces.slice(1).map(item => {
+            const split = item.indexOf('=');
+            return [split < 0 ? item.toLowerCase() : item.slice(0, split).trim().toLowerCase(), split < 0 ? true : item.slice(split + 1).trim()];
+        }));
+        const domain = String(attrs.get('domain') || host).replace(/^\./, '').toLowerCase();
+        if (!cookieDomainMatches(host, domain)) continue;
+        const path = String(attrs.get('path') || defaultCookiePath(requestPath));
+        cookieJar.set(`${domain}|${path}|${name}`, { value, path, secure: attrs.has('secure') });
     }
+}
+function defaultCookiePath(requestPath) {
+    const path = String(requestPath || '/');
+    const slash = path.lastIndexOf('/');
+    return slash <= 0 ? '/' : path.slice(0, slash);
 }
 
 function pickClient(u) { return u.protocol === 'https:' ? https : http; }
@@ -75,7 +99,7 @@ function substituteVars(text, vars) {
 /**
  * Replay one entry. Returns { status, headers, body, durationMs }.
  */
-function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs }) {
+function replayOne({ entry, vars, cookieJar, targetBaseUrl, targetHostMap = null, insecure, timeoutMs }) {
     return new Promise((resolve, reject) => {
         // Substitute ${vars} into the URL FIRST so parameterized recordings
         // (e.g. `/users/${userId}`) replay correctly. Headers/body get the
@@ -83,7 +107,8 @@ function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs 
         const rawUrl = substituteVars(entry.request.url, vars);
         const recUrl = new URL(rawUrl);
         let u = recUrl;
-        if (targetBaseUrl) {
+        const mappedBase = targetHostMap && targetHostMap[recUrl.hostname] || targetBaseUrl;
+        if (mappedBase) {
             // Always honor the override base. The recording's host is treated
             // as the primary; the override is the test environment for it.
             // Third-party hosts in a recording (CDNs, analytics, payment
@@ -92,7 +117,7 @@ function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs 
             // only ever passes one base, so we apply it across the board for
             // the same reason JMeter's "domain override" plugin does: the
             // user picked this target on purpose.
-            const t = new URL(targetBaseUrl);
+            const t = new URL(mappedBase);
             u = new URL(recUrl.pathname + recUrl.search, `${t.protocol}//${t.host}`);
         }
         const headers = {};
@@ -101,12 +126,16 @@ function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs 
             if (/^(host|content-length|connection)$/i.test(n)) continue;
             headers[n] = substituteVars(String(h.value || ''), vars);
         }
-        const cookieHeader = joinCookies(cookieJar, u.hostname);
+        const cookieHeader = joinCookies(cookieJar, u.hostname, u.pathname, u.protocol === 'https:');
         if (cookieHeader) headers['Cookie'] = cookieHeader;
 
         let body;
         const pd = entry.request.postData;
         if (pd && typeof pd.text === 'string') body = substituteVars(pd.text, vars);
+        if (pd && body == null && Array.isArray(pd.params) && pd.params.length) {
+            body = pd.params.map(param => `${encodeURIComponent(param.name || '')}=${encodeURIComponent(substituteVars(String(param.value || ''), vars)).replace(/%20/g, '+')}`).join('&');
+            if (!Object.keys(headers).some(name => /^content-type$/i.test(name))) headers['Content-Type'] = 'application/x-www-form-urlencoded';
+        }
 
         const start = Date.now();
         const method = (entry.request.method || 'GET').toUpperCase();
@@ -122,7 +151,7 @@ function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs 
             res.on('data', c => chunks.push(c));
             res.on('end', () => {
                 const buf = Buffer.concat(chunks);
-                rememberSetCookie(cookieJar, u.hostname, res.headers['set-cookie']);
+                rememberSetCookie(cookieJar, u.hostname, res.headers['set-cookie'], u.protocol === 'https:', u.pathname);
                 resolve({
                     status: res.statusCode || 0,
                     headers: res.headers,
@@ -148,7 +177,7 @@ function replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs 
  *   ok:boolean, samples: Array, drift:Array, errors:Array, durationMs:number
  * }>}
  */
-async function replayAll({ entries, vars = {}, targetBaseUrl = null, insecure = false, timeoutMs, onLog = () => {} }) {
+async function replayAll({ entries, originalIndexes = null, vars = {}, targetBaseUrl = null, targetHostMap = null, insecure = false, timeoutMs, onLog = () => {} }) {
     const cookieJar = new Map();
     const samples = [];
     const drift = [];
@@ -157,9 +186,10 @@ async function replayAll({ entries, vars = {}, targetBaseUrl = null, insecure = 
 
     for (let i = 0; i < (entries || []).length; i++) {
         const e = entries[i];
+        const originalIndex = Array.isArray(originalIndexes) && Number.isInteger(originalIndexes[i]) ? originalIndexes[i] : i;
         if (!e || !e.request || !e.request.url) continue;
         try {
-            const r = await replayOne({ entry: e, vars, cookieJar, targetBaseUrl, insecure, timeoutMs });
+            const r = await replayOne({ entry: e, vars, cookieJar, targetBaseUrl, targetHostMap, insecure, timeoutMs });
             const recStatus = Number(e.response?.status || 0);
             const recBody = (e.response?.content?.text) || '';
             const recShape = safeJsonShape(recBody);
@@ -183,15 +213,15 @@ async function replayAll({ entries, vars = {}, targetBaseUrl = null, insecure = 
                     headers: r.headers || {},
                 },
                 sampler: `${e.request.method} ${e.request.url}`,
-                index: i,
+                index: originalIndex,
             });
             for (const issue of semantic.issues) issues.push({ ...issue, kind: issue.kind || 'semanticDiff' });
-            samples.push({ index: i, url: e.request.url, status: r.status, durationMs: r.durationMs, success: r.status > 0 && r.status < 400 && issues.length === 0 });
-            if (issues.length) drift.push({ index: i, sampler: `${e.request.method} ${e.request.url}`, issues });
+            samples.push({ index: originalIndex, url: e.request.url, status: r.status, durationMs: r.durationMs, success: r.status > 0 && r.status < 400 && issues.length === 0 });
+            if (issues.length) drift.push({ index: originalIndex, sampler: `${e.request.method} ${e.request.url}`, issues });
         } catch (err) {
-            errors.push({ index: i, url: e.request.url, message: err.message });
-            samples.push({ index: i, url: e.request.url, status: 0, durationMs: 0, success: false });
-            onLog(`fast-replay #${i} error: ${err.message}`);
+            errors.push({ index: originalIndex, url: e.request.url, message: err.message });
+            samples.push({ index: originalIndex, url: e.request.url, status: 0, durationMs: 0, success: false });
+            onLog(`fast-replay #${originalIndex} error: ${err.message}`);
         }
     }
     const ok = errors.length === 0 && drift.length === 0;
@@ -203,4 +233,4 @@ function contentTypeFromHar(headers = []) {
     return h ? String(h.value || '') : '';
 }
 
-module.exports = { replayAll, replayOne, _internal: { substituteVars, joinCookies, rememberSetCookie, cookieDomainMatches, contentTypeFromHar } };
+module.exports = { replayAll, replayOne, _internal: { substituteVars, joinCookies, rememberSetCookie, cookieDomainMatches, pathMatches, contentTypeFromHar } };

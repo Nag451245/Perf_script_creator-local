@@ -5,6 +5,7 @@ const { applyLlmPatches, validateLlmPatches } = require('./llm-patcher');
 const { _internal: { indexSamplers } } = require('./business-guard');
 const { _internal: { samplerLabel } } = require('./value-flow-decisions');
 const { _internal: { safeJsonShape } } = require('./verifier');
+const { planReplayDependencies } = require('./replay-dependencies');
 
 async function runFastRepairLoop({
     xml,
@@ -17,6 +18,8 @@ async function runFastRepairLoop({
     insecure = false,
     timeoutMs,
     onLog = () => {},
+    correlationLedger = null,
+    targetHostMap = null,
 } = {}) {
     const fastReplayable = (fixes || []).filter(f => f && isFastReplayableKind(f.kind));
     if (!targetBaseUrl || !fastReplayable.length) {
@@ -46,6 +49,8 @@ async function runFastRepairLoop({
             insecure,
             timeoutMs,
             onLog,
+            correlationLedger,
+            targetHostMap,
         });
         return {
             skipped: false,
@@ -55,21 +60,27 @@ async function runFastRepairLoop({
             replay: replay.replay,
             replayedIndexes: replay.replayedIndexes,
             extractedVariables: replay.extractedVariables,
+            dependencyPlan: replay.dependencyPlan,
             accepted: replay.replay.ok ? validation.accepted : [],
         };
     }
 
-    const replayedIndexes = [];
-    const replayEntries = [];
-    for (let i = 0; i < entries.length; i++) {
-        const label = samplerLabel(entries[i], i);
-        if (enabledBySampler.get(label) === false) continue;
-        replayedIndexes.push(i);
-        replayEntries.push(entries[i]);
+    const targetIndexes = extractorPlan.replaceIndexes.length
+        ? extractorPlan.replaceIndexes
+        : entries.length ? [entries.length - 1] : [];
+    const dependencyPlan = planReplayDependencies({ entries, targetIndexes, correlationLedger, enabledBySampler });
+    if (dependencyPlan.blocked) {
+        return {
+            skipped: false, validation, applied: patched.applied, skippedPatches: patched.skipped,
+            replay: { ok: false, status: 'UNVERIFIED', blockedRequirements: dependencyPlan.blockedRequirements, samples: [], drift: [], errors: [] },
+            replayedIndexes: dependencyPlan.indexes, dependencyPlan, accepted: [],
+        };
     }
+    const replayedIndexes = dependencyPlan.indexes;
+    const replayEntries = replayedIndexes.map(index => entries[index]);
 
     onLog(`fast repair loop: replaying ${replayEntries.length}/${entries.length} enabled sampler(s)`);
-    const replay = await replayAll({ entries: replayEntries, targetBaseUrl, insecure, timeoutMs, onLog });
+    const replay = await replayAll({ entries: replayEntries, originalIndexes: replayedIndexes, targetBaseUrl, targetHostMap, insecure, timeoutMs, onLog });
     return {
         skipped: false,
         validation,
@@ -77,6 +88,7 @@ async function runFastRepairLoop({
         skippedPatches: patched.skipped,
         replay,
         replayedIndexes,
+        dependencyPlan,
         accepted: replay.ok ? validation.accepted : [],
     };
 }
@@ -142,7 +154,7 @@ function replaceInRequest(entry, value, replacement) {
     }
 }
 
-async function replayWithExtractors({ entries, enabledBySampler, extractorPlan, targetBaseUrl, insecure, timeoutMs, onLog }) {
+async function replayWithExtractors({ entries, enabledBySampler, extractorPlan, targetBaseUrl, targetHostMap, insecure, timeoutMs, onLog, correlationLedger }) {
     const cookieJar = new Map();
     const vars = {};
     const samples = [];
@@ -155,12 +167,22 @@ async function replayWithExtractors({ entries, enabledBySampler, extractorPlan, 
         extractorsByIndex.set(extractor.index, list);
     }
 
-    const replayedIndexes = segmentIndexes(entries, enabledBySampler, extractorPlan);
+    const targetIndexes = [...new Set([...extractorPlan.extractors.map(item => item.index), ...extractorPlan.replaceIndexes])];
+    const dependencyPlan = planReplayDependencies({ entries, targetIndexes, correlationLedger, enabledBySampler });
+    if (dependencyPlan.blocked) {
+        return {
+            replayedIndexes: dependencyPlan.indexes,
+            extractedVariables: vars,
+            dependencyPlan,
+            replay: { ok: false, status: 'UNVERIFIED', blockedRequirements: dependencyPlan.blockedRequirements, samples: [], drift: [], errors: [] },
+        };
+    }
+    const replayedIndexes = dependencyPlan.indexes;
     const start = Date.now();
     for (const index of replayedIndexes) {
         const entry = entries[index];
         try {
-            const response = await replayOne({ entry, vars, cookieJar, targetBaseUrl, insecure, timeoutMs });
+            const response = await replayOne({ entry, vars, cookieJar, targetBaseUrl, targetHostMap, insecure, timeoutMs });
             for (const extractor of extractorsByIndex.get(index) || []) {
                 const value = extractVariable(response, extractor);
                 if (value != null) vars[extractor.variable] = value;
@@ -185,23 +207,9 @@ async function replayWithExtractors({ entries, enabledBySampler, extractorPlan, 
     return {
         replayedIndexes,
         extractedVariables: vars,
+        dependencyPlan,
         replay: { ok, samples, drift, errors, durationMs: Date.now() - start },
     };
-}
-
-function segmentIndexes(entries, enabledBySampler, extractorPlan) {
-    const interesting = [
-        ...extractorPlan.extractors.map(e => e.index),
-        ...extractorPlan.replaceIndexes,
-    ].filter(n => n >= 0);
-    const start = interesting.length ? Math.min(...interesting) : 0;
-    const end = interesting.length ? Math.max(...interesting) : entries.length - 1;
-    const out = [];
-    for (let i = start; i <= end; i++) {
-        if (enabledBySampler.get(samplerLabel(entries[i], i)) === false) continue;
-        out.push(i);
-    }
-    return out;
 }
 
 function responseIssues(entry, response) {
@@ -329,5 +337,6 @@ module.exports = {
         applyReplaceFixesToEntries,
         extractVariable,
         extractJsonPath,
+        planReplayDependencies,
     },
 };

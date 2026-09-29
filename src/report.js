@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const peNaming = require('./pe-naming');
 const { embeddedDocs } = require('./report-docs');
+const { summarizeFirstCorrelationDivergence } = require('./operator-diagnostics');
 
 const esc = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -156,7 +157,7 @@ function writeHtmlReport(outDir, name, data = {}) {
     const {
         mode = 'generate', verdict = 'generated', stats = {}, samples = [],
         baselineDiff = null, memoryMatches = [], learnedLessons = null, correlations = [], dualHar = null, loadProfile = null, reasoning = [], businessVerification = null, disableDecisions = null,
-        action = null, changeSummary = '', llmUsed = null,
+        action = null, changeSummary = '', llmUsed = null, verificationStatus = 'GENERATED', runtimeProof = null,
     } = data;
     const reqs = (samples || []).filter(s => !s.isTransaction);
     const passed = reqs.filter(s => s.success).length;
@@ -168,6 +169,29 @@ function writeHtmlReport(outDir, name, data = {}) {
     const decisionBySampler = buildDecisionMap(requestAdjudication || disableDecisions || data.samplerDecisions || (data.lineage && data.lineage.disableDecisions));
 
     const verdictClass = verdict === 'GREEN' ? 'ok' : (verdict === 'generated' ? 'neutral' : 'bad');
+    const divergence = summarizeFirstCorrelationDivergence(runtimeProof && runtimeProof.firstDivergence);
+    const verificationClass = verificationStatus === 'VERIFIED' ? 'ok' : (verificationStatus === 'GENERATED' ? 'neutral' : 'bad');
+    const verificationSection = `<h2>Verification status</h2>
+      <p><span class="badge ${verificationClass}">${esc(verificationStatus)}</span>
+      <span class="muted">Runtime proof: ${esc(runtimeProof && runtimeProof.status || 'not run')}</span></p>
+      ${divergence ? `<p class="muted">First correlation divergence: <code>${esc(divergence.kind)}</code> · producer step ${esc(divergence.producerIndex)} → consumer step ${esc(divergence.consumerIndex)} · variable <code>${esc(divergence.variable)}</code> · ${esc(divergence.reason)}</p>` : ''}`;
+    const responseEvidence = stats.responseEvidence || {};
+    const pairingCoverage = stats.pairingCoverage || {};
+    const roleCounts = Object.entries(stats.ledgerRoleCounts || {})
+        .map(([role, count]) => `${role}: ${Number(count) || 0}`).join(' · ') || 'none';
+    const limitWarnings = [
+        stats.engineLimitRisk && stats.engineLimitRisk.entryCapReached ? '500-entry processing ceiling reached' : '',
+        stats.engineLimitRisk && stats.engineLimitRisk.rawCorrelationCapReached ? '100-correlation processing ceiling reached' : '',
+    ].filter(Boolean);
+    const correlationEvidenceSection = `<h2>Correlation Evidence</h2>
+      <p><span class="badge ${stats.correlationEvidence === 'AVAILABLE' ? 'ok' : (stats.correlationEvidence ? 'bad' : 'neutral')}">${esc(stats.correlationEvidence || 'not recorded')}</span></p>
+      <ul>
+        <li>Response coverage: status ${esc(responseEvidence.withStatus ?? '–')}/${esc(responseEvidence.total ?? '–')} · body ${esc(responseEvidence.withBody ?? '–')}/${esc(responseEvidence.total ?? '–')} · headers ${esc(responseEvidence.withHeaders ?? '–')}/${esc(responseEvidence.total ?? '–')} · captured ${esc(responseEvidence.withCapturedEvidence ?? '–')}/${esc(responseEvidence.total ?? '–')}</li>
+        <li>Pairing: ${esc(pairingCoverage.paired ?? 0)}/${esc(pairingCoverage.total ?? 0)} paired · ${esc(pairingCoverage.unmatched ?? 0)} unmatched · ${esc(pairingCoverage.ambiguous ?? 0)} ambiguous</li>
+        <li>Ledger roles: ${esc(roleCounts)} · unresolved sinks: ${esc(stats.unresolvedSinks ?? 0)}</li>
+        <li>Form correlations skipped by cap: ${esc(stats.formCorrelationCapSkipped ?? 0)} · killed producers: ${esc((stats.killedProducers && stats.killedProducers.count) ?? 0)}</li>
+        ${limitWarnings.length ? `<li>Coverage warnings: ${esc(limitWarnings.join(' · '))}</li>` : ''}
+      </ul>`;
 
     // The report opens with the same instruction as 00_OPEN_THIS_FIRST.txt.
     // A verdict word alone left the reader to work out whether to run the thing;
@@ -457,6 +481,10 @@ details{border:1px solid #d9e2e1;border-radius:8px;margin:8px 0;background:#fff}
         : ' · <span class="badge neutral" title="No LLM was called. Generation, correlation and repair were deterministic and nothing left this machine.">NO_LLM</span>')}</div>
 
   ${actionBanner}
+
+  ${verificationSection}
+
+  ${correlationEvidenceSection}
 
   ${falsePassSection}
 

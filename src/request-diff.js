@@ -1,6 +1,6 @@
 'use strict';
 
-function compareRecordedRequestToObserved({ entry = {}, observedRequest = {}, index = null, sampler = '' } = {}) {
+function compareRecordedRequestToObserved({ entry = {}, observedRequest = {}, index = null, sampler = '', ignoreHeaderStillRecorded = [] } = {}) {
     const issues = [];
     const recordedRequest = entry.request || {};
     const recordedUrl = parseUrl(recordedRequest.url);
@@ -21,7 +21,7 @@ function compareRecordedRequestToObserved({ entry = {}, observedRequest = {}, in
         const observedValue = observedHeaders[name];
         if (observedValue == null) {
             issues.push({ kind: 'headerMissing', name, recorded: recordedValue });
-        } else if (observedValue === recordedValue && isLikelyDynamicHeader(name, recordedValue)) {
+        } else if (observedValue === recordedValue && isLikelyDynamicHeader(name, recordedValue) && !ignoreHeaderStillRecorded.includes(name)) {
             issues.push({ kind: 'headerStillRecorded', name, recorded: recordedValue, observed: observedValue });
         } else if (observedValue !== recordedValue && !isExpectedHeaderDrift(name)) {
             issues.push({ kind: 'headerValueDiff', name, recorded: recordedValue, observed: observedValue });

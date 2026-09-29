@@ -11,11 +11,23 @@ function analyzeFailureForensics({
     evidence = null,
     baselineDiff = null,
     responseEvidence = [],
+    runtimeProof = null,
 } = {}) {
     const normalized = evidence && Array.isArray(evidence.rows)
         ? normalizeEvidence(evidence)
         : { entries, samples: normalizeSamples(samples) };
     const divergences = buildDivergenceLedger(normalized.entries, normalized.samples, baselineDiff);
+    const proofDivergence = runtimeProof && runtimeProof.firstDivergence;
+    if (proofDivergence) {
+        divergences.unshift({
+            index: Number(proofDivergence.producerIndex),
+            sampler: `Correlation ${proofDivergence.link && proofDivergence.link.variable || 'link'}`,
+            category: 'upstream_correlation_runtime_failure',
+            relevance: 'correlation_failure',
+            repairHint: proofDivergence.reason || 'Repair the earliest correlation source/sink link before downstream symptoms.',
+            runtimeProof: proofDivergence,
+        });
+    }
     const rootCause = divergences[0] || null;
     const redirects = buildRedirectLedger(normalized.entries, normalized.samples, rootCause);
     const authSession = buildAuthSessionProof(normalized.entries, normalized.samples, rootCause);

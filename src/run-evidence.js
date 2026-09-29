@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const peNaming = require('./pe-naming');
+const { parseSidecarBuffer } = require('./recording-evidence-adapter');
 
 function buildRunEvidence({ entries = [], jtlPath = '', samples = [] } = {}) {
     const observedSamples = samples.length ? samples.map(normalizeSample) : summarizeJtlFast(jtlPath);
@@ -27,6 +28,8 @@ function buildRunEvidence({ entries = [], jtlPath = '', samples = [] } = {}) {
             observedResponseHeaders,
             observedHeaderValues,
             observedLocation: firstHeaderValue(observedResponseHeaders, 'location'),
+            redirects: sample.redirects || [],
+            renderedRequest: sample.renderedRequest || null,
             recordedBody,
             observedBody,
             recordedBodyLength: String(recordedBody || '').length,
@@ -81,6 +84,19 @@ function summarizeJtlFast(jtlPath) {
 }
 
 function summarizeJtlXml(xml) {
+    const parsedSidecar = parseSidecarBuffer(xml).samples;
+    const evidenceByLabel = new Map();
+    for (const sample of parsedSidecar) {
+        const label = String(sample.label || '');
+        if (!evidenceByLabel.has(label)) evidenceByLabel.set(label, []);
+        evidenceByLabel.get(label).push(sample);
+    }
+    const evidenceOccurrences = new Map();
+    const nextEvidence = label => {
+        const index = evidenceOccurrences.get(label) || 0;
+        evidenceOccurrences.set(label, index + 1);
+        return (evidenceByLabel.get(label) || [])[index] || null;
+    };
     const re = /<(httpSample|sample)\b([^>]*)>/g;
     const raw = [];
     const labels = new Set();
@@ -98,12 +114,16 @@ function summarizeJtlXml(xml) {
         const urls = urlsFromSampleBody(body);
         const responseBody = responseDataFromSampleBody(body);
         const responseHeaders = responseHeadersFromSampleBody(body);
-        raw.push({ tag, label, responseCode, responseMessage, success, failureMessage, urls, responseBody, responseHeaders });
+        raw.push({
+            tag, label, responseCode, responseMessage, success, body, failureMessage, urls, responseBody, responseHeaders,
+            directEvidence: nextEvidence(label),
+        });
         labels.add(label);
     }
 
     return raw
         .filter(sample => {
+            if (sample.tag === 'sample' && /<httpSample\b/i.test(sample.body)) return false;
             const sub = /^(.+)-\d+$/.exec(sample.label);
             return !(sub && labels.has(sub[1]));
         })
@@ -117,8 +137,11 @@ function summarizeJtlXml(xml) {
             failureMessage: sample.failureMessage,
             finalUrl: sample.urls.length ? sample.urls[sample.urls.length - 1] : '',
             urls: sample.urls,
-            responseBody: sample.responseBody,
-            responseHeaders: sample.responseHeaders,
+            responseBody: sample.directEvidence ? sample.directEvidence.body : sample.responseBody,
+            responseHeaders: sample.directEvidence ? sample.directEvidence.directHeaders : sample.responseHeaders,
+            redirects: sample.directEvidence ? sample.directEvidence.redirects : [],
+            directUrl: sample.directEvidence ? sample.directEvidence.directUrl : '',
+            renderedRequest: sample.directEvidence ? renderedRequestFromEvidence(sample.directEvidence) : null,
         }));
 }
 
@@ -135,8 +158,102 @@ function normalizeSample(sample = {}) {
         urls,
         responseBody: sample.responseBody || sample.body || '',
         responseHeaders: normalizeHeaders(sample.responseHeaders || sample.headers || []),
+        redirects: sample.redirects || [],
+        renderedRequest: sample.renderedRequest || null,
         failureMessage: sample.failureMessage || '',
     };
+}
+
+function renderedRequestFromEvidence(sample = {}) {
+    const provenance = {
+        samplerData: !!sample.hasSamplerData,
+        requestData: !!sample.hasRequestData,
+        requestHeaders: Array.isArray(sample.requestHeaders) && sample.requestHeaders.length > 0,
+        cookies: Array.isArray(sample.cookies) && sample.cookies.length > 0,
+    };
+    if (!provenance.samplerData && !provenance.requestData && !provenance.requestHeaders && !provenance.cookies) return null;
+    const samplerData = String(sample.samplerData || '');
+    const parsedSamplerData = parseSamplerData(samplerData);
+    const method = parsedSamplerData.method;
+    const samplerUrl = parsedSamplerData.url;
+    // A JTL URL may supply only the origin needed to resolve a direct
+    // samplerData request target. It never becomes request evidence by itself.
+    const baseUrl = sample.directUrl || (sample.urls || []).find(isAbsoluteUrl) || '';
+    const url = samplerUrl ? resolveRenderedUrl(samplerUrl, baseUrl) : '';
+    const headers = normalizeHeaders(sample.requestHeaders || []);
+    const cookies = [
+        ...headers.filter(header => String(header.name).toLowerCase() === 'cookie')
+            .flatMap(header => parseCookies(header.value)),
+        ...(sample.cookies || []).flatMap(value => String(value).split(/\r?\n/).flatMap(parseCookies)),
+    ];
+    return {
+        method,
+        url,
+        query: queryValues(url),
+        headers,
+        cookies,
+        body: sample.hasRequestData ? sample.requestData : parsedSamplerData.body,
+        evidenceProvenance: provenance,
+    };
+}
+
+function parseSamplerData(value) {
+    const samplerData = String(value || '').replace(/\r\n/g, '\n');
+    const urlFirst = /^(\w+:\/\/[^\n]+)\nPOST data:\n([\s\S]*)$/i.exec(samplerData);
+    if (urlFirst) {
+        const separator = urlFirst[2].indexOf('\n\n');
+        return {
+            method: 'POST',
+            url: urlFirst[1].trim(),
+            body: separator >= 0 ? urlFirst[2].slice(separator + 2) : '',
+        };
+    }
+    const requestLine = /^([A-Z]+)\s+([^\n]+)(?:\n|$)/.exec(samplerData);
+    if (!requestLine) return { method: '', url: '', body: samplerData };
+    const method = requestLine[1];
+    const target = requestLine[2].trim();
+    const remainder = samplerData.slice(requestLine[0].length);
+    if (/^data:$/i.test(target)) {
+        const separator = remainder.indexOf('\n\n');
+        return { method, url: '', body: separator >= 0 ? remainder.slice(separator + 2) : '' };
+    }
+    if (method === 'GET' || method === 'HEAD') return { method, url: target, body: '' };
+    return { method, url: target, body: remainder };
+}
+
+function isAbsoluteUrl(value) {
+    try { new URL(value); return true; } catch { return false; }
+}
+
+function resolveRenderedUrl(value, baseUrl) {
+    if (!value) return '';
+    try {
+        return new URL(value, isAbsoluteUrl(baseUrl) ? baseUrl : undefined).toString();
+    } catch {
+        return value;
+    }
+}
+
+function queryValues(url) {
+    try {
+        const parsed = new URL(url);
+        const grouped = new Map();
+        for (const [name, value] of parsed.searchParams) {
+            if (!grouped.has(name)) grouped.set(name, []);
+            grouped.get(name).push(value);
+        }
+        return Object.fromEntries([...grouped.entries()].sort(([a], [b]) => a.localeCompare(b))
+            .map(([name, values]) => [name, values.length === 1 ? values[0] : values]));
+    } catch {
+        return {};
+    }
+}
+
+function parseCookies(value) {
+    return String(value || '').split(/;\s*/).map(part => {
+        const index = part.indexOf('=');
+        return index > 0 ? { name: part.slice(0, index).trim(), value: part.slice(index + 1).trim() } : null;
+    }).filter(Boolean);
 }
 
 function alignRecordingSamples(entries, samples) {
@@ -170,9 +287,18 @@ function alignRecordingSamples(entries, samples) {
         for (const sampleIndex of indexes) usedSampleIndexes.add(sampleIndex);
     }
 
-    let fallbackEntryIndex = 0;
+    const fallbackIndexes = [];
+    const lastFallbackByKey = new Map();
     for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
         if (usedSampleIndexes.has(sampleIndex)) continue;
+        const sample = samples[sampleIndex] || {};
+        const key = fallbackSampleKey(sample);
+        if (key) lastFallbackByKey.set(key, sampleIndex);
+        else fallbackIndexes.push(sampleIndex);
+    }
+    const collapsedFallbackIndexes = [...fallbackIndexes, ...lastFallbackByKey.values()].sort((a, b) => a - b);
+    let fallbackEntryIndex = 0;
+    for (const sampleIndex of collapsedFallbackIndexes) {
         while (fallbackEntryIndex < entries.length && usedEntryIndexes.has(fallbackEntryIndex)) fallbackEntryIndex++;
         if (fallbackEntryIndex >= entries.length) break;
         pairs.push({ entryIndex: fallbackEntryIndex, sampleIndex, sample: samples[sampleIndex] || {} });
@@ -181,6 +307,12 @@ function alignRecordingSamples(entries, samples) {
     }
 
     return pairs.sort((a, b) => a.entryIndex - b.entryIndex || a.sampleIndex - b.sampleIndex);
+}
+
+function fallbackSampleKey(sample = {}) {
+    const label = String(sample.label || sample.name || '').trim();
+    const url = String(sample.finalUrl || sample.url || (sample.urls || []).at(-1) || '').split('?')[0];
+    return label || url ? `${label}|${url}` : '';
 }
 
 function stepNumberFromLabel(label) {
@@ -317,6 +449,7 @@ module.exports = {
     summarizeJtlXml,
     _internal: {
         alignRecordingSamples,
+        fallbackSampleKey,
         stepNumberFromLabel,
         extractTagBody,
         firstAssertionFailure,
@@ -326,5 +459,9 @@ module.exports = {
         parseHttpHeaderBlock,
         headerValuesByName,
         unescapeXml,
+        renderedRequestFromEvidence,
+        parseSamplerData,
+        queryValues,
+        parseCookies,
     },
 };

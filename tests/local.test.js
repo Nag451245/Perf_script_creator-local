@@ -10654,3 +10654,57 @@ test('Task 6 remaining: prefix root preserves issues in forensics output', () =>
     assert.strictEqual(result.failureForensics.rootCause.runtimeProof.prerequisiteIndex, 1);
     assert.strictEqual(result.failureForensics.rootCause.runtimeProof.consumerIndex, 4);
 });
+
+// ── No enabled sampler may ship a variable nothing defines ───────────────
+test('unresolvable vars: a ${var} with no producer is restored, not sent to JMeter', () => {
+    const { repairDeadExtractorConsumers, undefinedVarsUsed } = require('../src/transforms');
+
+    // The exact shape seen live: a correlation pass dropped the producer for
+    // state_6 but left the substitution in the login URL. JMeter cannot build
+    // "?state=${state_6}" into a URI, so the request is never sent — and when
+    // the casualty is the login, every later result is noise.
+    const xml = `<?xml version="1.0"?><jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="SC01_T01 - GET /u/login/identifier" enabled="true">
+        <stringProp name="HTTPSampler.path">/u/login/identifier?state=\${state_6}</stringProp>
+      </HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="SC01_T09 - GET /u/login/identifier" enabled="false">
+        <stringProp name="HTTPSampler.path">/u/login/identifier?state=\${state_9}</stringProp>
+      </HTTPSamplerProxy><hashTree/>
+    </hashTree></jmeterTestPlan>`;
+
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/u/login/identifier?state=hKFo2SBZTjMtLVlF', headers: [] },
+            response: { status: 200, content: { mimeType: 'text/html', text: 'ok' } } },
+    ];
+
+    // Only the ENABLED sampler is a problem. The disabled one never runs, so
+    // reporting it would be noise and rewriting it would edit a dead request.
+    assert.deepEqual([...undefinedVarsUsed(xml)], ['state_6']);
+
+    const fixed = repairDeadExtractorConsumers(xml, entries);
+    assert.equal(fixed.restored.length, 1);
+    assert.equal(fixed.restored[0].var, 'state_6');
+    assert.deepEqual([...undefinedVarsUsed(fixed.xml)], [], 'nothing unresolvable survives in an enabled sampler');
+    assert.match(fixed.xml, /state=hKFo2SBZTjMtLVlF/, 'the recorded literal is restored');
+    assert.match(fixed.xml, /state=\$\{state_9\}/, 'the disabled sampler is left alone');
+});
+
+test('unresolvable vars: a query parameter falls back to its recorded value', () => {
+    const { repairDeadExtractorConsumers } = require('../src/transforms');
+    // No positional match and no prefix/suffix evidence on this sampler, but the
+    // recording carries that parameter elsewhere. Keeping the recorded literal
+    // is the call the OAuth pass already makes: a stale token gets a visible
+    // rejection from the server, where a bare ${var} is never sent at all.
+    const xml = `<?xml version="1.0"?><jmeterTestPlan><hashTree>
+      <HTTPSamplerProxy testname="Step 40 - GET /authorize" enabled="true">
+        <stringProp name="HTTPSampler.path">/authorize?state=\${state_42}</stringProp>
+      </HTTPSamplerProxy><hashTree/>
+    </hashTree></jmeterTestPlan>`;
+    const entries = [
+        { request: { method: 'GET', url: 'https://app.test/somewhere/else?state=RECORDED_STATE_VALUE', headers: [] },
+            response: { status: 200, content: { mimeType: 'text/html', text: 'ok' } } },
+    ];
+    const fixed = repairDeadExtractorConsumers(xml, entries);
+    assert.match(fixed.xml, /state=RECORDED_STATE_VALUE/);
+    assert.doesNotMatch(fixed.xml, /\$\{state_42\}/);
+});

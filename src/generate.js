@@ -1414,12 +1414,16 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
     // the dud extractor and mint the value natively (__RandomString, Java-safe).
     // Self-gating: no-op unless an /authorize?client_id... URL uses ${state}/
     // ${nonce}, so it never touches server-issued suffixed session tokens.
-    const oauthRewire = rewireClientMintedOauthVars(xml);
+    const oauthRewire = rewireClientMintedOauthVars(xml, flat);
     xml = oauthRewire.xml;
     if (oauthRewire.rewired && oauthRewire.rewired.length) note('oauth-client-minted-state',
         `${oauthRewire.rewired.length} bare OAuth2 state/nonce value(s) minted client-side`,
         `client-minted /authorize state/nonce have no server producer to extract from`,
         `stripped dud extractor(s) and used native __RandomString: ${oauthRewire.rewired.join(', ')}`);
+    if (oauthRewire.serverIssued && oauthRewire.serverIssued.length) note('oauth-server-issued-state',
+        `${oauthRewire.serverIssued.join(', ')} IS issued by the server here — kept its extractor`,
+        'the recording shows a prior response carrying this exact value (302 Location or body), so the IdP minted it',
+        'left the correlation in place; generating it instead makes the IdP reject a value it never issued');
 
     // PKCE (RFC 7636): 'plain' is Java-safe (challenge==verifier); 'S256' needs
     // SHA-256(base64url) which JMeter cannot do Java-safe — flag it precisely
@@ -1453,6 +1457,21 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         `${formCorr.wired.length} form hidden-input value(s) must be fresh per run`,
         formCorr.wired.map(w => `${w.input} produced by "${w.producerSampler}" (recorded page body carries the hidden input; later requests consume it)`).join('; '),
         `emitted CSS extractor per producer + substituted \${var} at ${formCorr.wired.reduce((n, w) => n + w.substitutions, 0)} consumer field(s)`);
+
+    // RUN THE AUTH0 STATE REPAIR AGAIN, now that form correlation has actually
+    // created the extractors it is meant to repair. It also runs above, before
+    // this pass exists — so on an Auth0 Universal Login flow it found nothing
+    // and the login kept reading `state` from a hidden input the IdP does not
+    // populate. The recording shows that value arriving in the 302 Location
+    // from /authorize; a state the IdP never issued is rejected, which is the
+    // 403 chain through /u/login/identifier, /u/login/password and everything
+    // behind them.
+    const auth0StateLate = repairAuth0LoginStateExtractors(xml, flat);
+    xml = auth0StateLate.xml;
+    if (auth0StateLate.repaired) note('auth0-login-state',
+        `${auth0StateLate.repaired} login state extractor(s) were reading a hidden input`,
+        'the recording shows this state issued in the /authorize 302 Location, not in the page',
+        're-pointed them at the Location header — the IdP rejects a state it did not issue');
 
     // The engine's generic page-text miner stays OFF. It asserted whatever text
     // it found in one capture, overfitted headings like "WebPT Dashboard", and

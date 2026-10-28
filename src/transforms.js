@@ -645,7 +645,48 @@ function setBoolProp(block, name, value) {
  * ─────────────────────────────────────────────────────────────────── */
 const OAUTH_REWIRE_SENTINEL = 'OAuth state/nonce synthesizer (perfscript-local)';
 
-function rewireClientMintedOauthVars(xml) {
+/**
+ * Does the RECORDING prove this OAuth parameter was issued by the server?
+ *
+ * The standard correlation question, asked of the evidence instead of a prior:
+ * take the value a request sent, and look for it in an EARLIER response — a
+ * Location header on a 302, or a body. If it is there, the server minted it and
+ * the script must extract it. If it appears nowhere, the browser minted it and
+ * the script must generate it.
+ *
+ * This matters because the two cases are indistinguishable from the request
+ * side, and getting it backwards is fatal either way round. On a WebPT/Auth0
+ * recording the bare `state` IS server-issued — 302 /authorize →
+ * "Location: /u/login/identifier?state=hKFo2SB…" — and replacing it with a
+ * random string makes Auth0 answer "Oops!, something went wrong" on the login
+ * POST, which is exactly what it did.
+ */
+function oauthParamIsServerIssued(entries, paramName) {
+    const list = Array.isArray(entries) ? entries : [];
+    const wanted = [];
+    for (let i = 0; i < list.length; i++) {
+        let url;
+        try { url = new URL(list[i].request.url); } catch { continue; }
+        const value = url.searchParams.get(paramName);
+        if (value && value.length >= 8) wanted.push({ at: i, value });
+    }
+    if (!wanted.length) return false;
+    for (const { at, value } of wanted) {
+        // Only EARLIER responses can be the producer.
+        for (let j = 0; j < at; j++) {
+            const res = list[j] && list[j].response;
+            if (!res) continue;
+            for (const h of res.headers || []) {
+                if (String(h.value || '').includes(value)) return true;
+            }
+            const body = (res.content && res.content.text) || '';
+            if (body && body.includes(value)) return true;
+        }
+    }
+    return false;
+}
+
+function rewireClientMintedOauthVars(xml, flatEntries) {
     // Only rewire the BARE OAuth2 client-side state/nonce. Suffixed
     // variants (state_2, state_3, …) are almost always Auth0/OIDC
     // universal-login session tokens that the IdP issues server-side
@@ -666,6 +707,20 @@ function rewireClientMintedOauthVars(xml) {
         }
     }
     if (varsUsedInAuthorize.size === 0) return { xml, rewired: [] };
+
+    // EVIDENCE BEATS THE PRIOR. "A bare /authorize state is client-minted" is a
+    // sound default for a browser SPA, but it is only a default — and this pass
+    // used to apply it without ever opening the recording. Where the recording
+    // shows a prior response issuing that value, the server owns it: keep the
+    // extractor and correlate it, or the IdP rejects a state it never minted.
+    const serverIssued = [];
+    for (const name of [...varsUsedInAuthorize]) {
+        if (oauthParamIsServerIssued(flatEntries, name)) {
+            varsUsedInAuthorize.delete(name);
+            serverIssued.push(name);
+        }
+    }
+    if (varsUsedInAuthorize.size === 0) return { xml, rewired: [], serverIssued };
 
     const rewired = [];
 
@@ -694,8 +749,39 @@ function rewireClientMintedOauthVars(xml) {
     return { xml: out, rewired: allVars };
 }
 
-function repairAuth0LoginStateExtractors(xml) {
+/**
+ * Does THIS recording show the login state arriving in a redirect Location?
+ *
+ * Both shapes are real and they need opposite extractors:
+ *   - Auth0 Universal Login: 302 /authorize -> "Location: /u/login/identifier?state=…"
+ *     The state must be read from the Location HEADER.
+ *   - A classic server-rendered form: <input name="state" value="…"> in the body.
+ *     The state must be read from the page.
+ * Guessing either way round breaks the login, so ask the recording instead of
+ * assuming. Nothing but the evidence distinguishes them.
+ */
+function loginStateComesFromLocationHeader(flatEntries) {
+    for (const entry of Array.isArray(flatEntries) ? flatEntries : []) {
+        const res = entry && entry.response;
+        if (!res) continue;
+        const status = Number(res.status || 0);
+        if (status < 300 || status >= 400) continue;
+        for (const h of res.headers || []) {
+            if (!/^location$/i.test(h.name)) continue;
+            if (/[?&]state=[^&\s]+/.test(String(h.value || ''))) return true;
+        }
+    }
+    return false;
+}
+
+function repairAuth0LoginStateExtractors(xml, flatEntries) {
     let repaired = 0;
+    // Only when the recording proves it. On a flow whose state really is a
+    // hidden form input, re-pointing the extractor at a Location header that
+    // does not exist would break a login that worked.
+    if (flatEntries !== undefined && !loginStateComesFromLocationHeader(flatEntries)) {
+        return { xml, repaired: 0 };
+    }
     const rxBlock = (refname) => `
             <RegexExtractor guiclass="RegexExtractorGui" testclass="RegexExtractor" testname="Extract ${escXmlAttr(refname)} (Auth0 Location)" enabled="true">
               <stringProp name="RegexExtractor.useHeaders">true</stringProp>
@@ -707,8 +793,14 @@ function repairAuth0LoginStateExtractors(xml) {
               <stringProp name="Sample.scope">all</stringProp>
             </RegexExtractor>`;
 
+    // Match every suffix shape, not just the numeric one. The form-correlation
+    // pass names its variables state_f2 / state_f3, and those are exactly the
+    // ones the Universal Login pages consume — so a `state_\d+` pattern missed
+    // the only extractor that mattered and left the login reading a hidden
+    // input that Auth0 does not populate. Measured on the LOGI recording: the
+    // login chain 403s because the state it sends was never issued.
     const out = xml.replace(
-        /<HtmlExtractor\b[^>]*>[\s\S]*?<stringProp name="HtmlExtractor\.refname">(state_\d+)<\/stringProp>[\s\S]*?<\/HtmlExtractor>/g,
+        /<HtmlExtractor\b[^>]*>[\s\S]*?<stringProp name="HtmlExtractor\.refname">(state(?:_[A-Za-z0-9]+)?)<\/stringProp>[\s\S]*?<\/HtmlExtractor>/g,
         (_block, refname) => {
             repaired++;
             return rxBlock(refname);
@@ -1127,11 +1219,13 @@ module.exports = {
     wrapPollingInWhileController,
     injectGhostSynthesizers,
     rewireClientMintedOauthVars,
+    oauthParamIsServerIssued,
     injectAssertionsFromMined,
     injectGaussianTimers,
     applyLoadProfile,
     stripGuiListenersForRun,
     repairAuth0LoginStateExtractors,
+    loginStateComesFromLocationHeader,
     correlateFormHiddenInputs,
     repairDeadExtractorConsumers,
     undefinedVarsUsed,

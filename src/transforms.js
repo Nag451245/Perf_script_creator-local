@@ -344,8 +344,8 @@ function injectAssertionsFromMined(xml, flatEntries, correlationValues = []) {
 /**
  * Every variable name the plan DEFINES: extractor refnames, User Defined
  * Variables, CSV columns, and anything a JSR223 block puts into vars.
- * Deliberately generous — wrongly believing a name is defined only means a
- * reference is left alone, which is the behaviour that already existed.
+ * Deliberately generous — wrongly believing a name is defined only costs us a
+ * warning we do not print.
  */
 function definedVarNames(xml) {
     const defined = new Set();
@@ -362,9 +362,15 @@ function definedVarNames(xml) {
 /**
  * Variables an ENABLED sampler consumes that nothing in the plan defines.
  *
- * Disabled samplers are excluded deliberately: they never execute, so an
- * unresolvable ${var} sitting in one is inert. Reporting it would be noise, and
- * "repairing" it would rewrite a request the run does not make.
+ * REPORTING ONLY — on purpose. JMeter cannot build a URI containing a literal
+ * "${state_6}", so those requests are never sent, and naming them tells the
+ * operator exactly which correlations are missing. Substituting the recorded
+ * literal instead was measured and made the script WORSE: a stale per-session
+ * token is not "not sent", it is "sent and rejected 403", and the run lost a
+ * passing request. Diagnose it; do not paper over it.
+ *
+ * Disabled samplers are excluded: they never execute, so an unresolvable
+ * ${var} in one is inert and reporting it is noise.
  */
 function undefinedVarsUsed(xml) {
     const defined = definedVarNames(xml);
@@ -380,21 +386,6 @@ function undefinedVarsUsed(xml) {
         }
     }
     return used;
-}
-
-/** The recorded value of a query parameter, from anywhere in the recording. */
-function recordedParamValue(entries, param, esc) {
-    for (const e of entries || []) {
-        let search = '';
-        try { search = new URL(e.request.url).search; } catch { search = ''; }
-        if (!search) continue;
-        for (const m of search.matchAll(/[?&]([^=&]+)=([^&]*)/g)) {
-            if (decodeURIComponent(m[1]) !== param) continue;
-            const value = m[2];
-            if (value && !value.includes('${')) return esc(value);
-        }
-    }
-    return null;
 }
 
 function repairDeadExtractorConsumers(xml, flatEntries) {
@@ -420,18 +411,6 @@ function repairDeadExtractorConsumers(xml, flatEntries) {
     }
     // A var also produced by an ENABLED extractor is alive — leave it.
     for (const ref of liveVars) deadVars.delete(ref);
-
-    // ...AND the case that is not about extractors at all: a ${var} that NOTHING
-    // in the plan defines. A correlation pass that drops a producer but leaves
-    // the substitution behind ships "?state=${state_6}" in a URL. JMeter cannot
-    // build that URI (URISyntaxException), so the request is never sent — and
-    // when the casualty is the login step, every later "failure" is noise from a
-    // flow that never started. Seen live after a correlation filter began
-    // excluding links it could not prove. Whatever drops the producer, the
-    // consumer must fall back to the recorded literal rather than kill the request.
-    for (const ref of undefinedVarsUsed(xml)) {
-        if (!deadVars.has(ref)) deadVars.set(ref, '(nothing in the plan defines it)');
-    }
     if (!deadVars.size) return { xml, restored: [], dead: [] };
 
     const escXmlText = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -446,26 +425,9 @@ function repairDeadExtractorConsumers(xml, flatEntries) {
             if (/enabled="false"/.test(out.substring(s.position, openEnd + 1))) continue;
             const seg = out.substring(s.position, s.endPosition);
             if (!seg.includes(token)) continue;
-            // Positional alignment FIRST, then any recorded request with the
-            // same path. Disabled samplers and folded redirect hops shift the
-            // index, and when it slipped the restore found no evidence and left
-            // "${state_6}" in the URL — the exact failure this repair exists to
-            // prevent.
-            const samplerPath = (seg.match(/<stringProp name="HTTPSampler\.path">([^<]*)</) || [])[1] || '';
-            const barePath = String(samplerPath).split('?')[0];
-            const recordedPathOf = (e) => {
-                try { return new URL(e.request.url).pathname; }
-                catch { return String((e && e.request && e.request.url) || '').split('?')[0]; }
-            };
-            const sources = [entries[k]];
-            if (barePath) {
-                for (const e of entries) {
-                    if (e && e.request && recordedPathOf(e) === barePath) sources.push(e);
-                }
-            }
+            const entry = entries[k];
             const candidatesRaw = [];
-            for (const entry of sources.filter(Boolean)) {
-                if (!entry.request) continue;
+            if (entry?.request) {
                 try {
                     const u = new URL(entry.request.url);
                     candidatesRaw.push(u.pathname + u.search);
@@ -495,26 +457,7 @@ function repairDeadExtractorConsumers(xml, flatEntries) {
                             const cand = rc.slice(start, end);
                             if (cand && cand.length <= 512 && !cand.includes('<') && !cand.includes('${')) { literal = cand; break; }
                         }
-                        // LAST RESORT for a query parameter: take the recorded
-                        // value of that same parameter from anywhere in the
-                        // recording. This is the call the OAuth pass already
-                        // makes — a value we cannot correlate keeps its recorded
-                        // literal. A stale token gets a visible, diagnosable
-                        // rejection from the server; a bare ${var} in a URL
-                        // stops the request being sent at all.
-                        if (literal == null) {
-                            const paramMatch = prefix.match(/[?&]([A-Za-z0-9_.-]+)=$/);
-                            if (paramMatch) literal = recordedParamValue(entries, paramMatch[1], escXmlText);
-                        }
-                        if (literal == null) {
-                            // Still nothing. Skip PAST this occurrence instead
-                            // of abandoning the field — one unrecoverable token
-                            // used to strand every later one with it.
-                            const next = c.indexOf(token, idx + token.length);
-                            if (next < 0) break;
-                            idx = next;
-                            continue;
-                        }
+                        if (literal == null) break; // no evidence — leave as-is
                         c = c.slice(0, idx) + literal + c.slice(idx + token.length);
                         restored.push({ var: ref, sampler: s.name, literal: literal.slice(0, 60) });
                     }

@@ -10655,14 +10655,13 @@ test('Task 6 remaining: prefix root preserves issues in forensics output', () =>
     assert.strictEqual(result.failureForensics.rootCause.runtimeProof.consumerIndex, 4);
 });
 
-// ── No enabled sampler may ship a variable nothing defines ───────────────
-test('unresolvable vars: a ${var} with no producer is restored, not sent to JMeter', () => {
-    const { repairDeadExtractorConsumers, undefinedVarsUsed } = require('../src/transforms');
+// ── Unresolvable variables: diagnose, do not paper over ─────────────────
+test('unresolvable vars: an enabled sampler referencing an undefined ${var} is named', () => {
+    const { undefinedVarsUsed } = require('../src/transforms');
 
-    // The exact shape seen live: a correlation pass dropped the producer for
-    // state_6 but left the substitution in the login URL. JMeter cannot build
-    // "?state=${state_6}" into a URI, so the request is never sent — and when
-    // the casualty is the login, every later result is noise.
+    // The shape seen live: a correlation pass dropped the producer for state_6
+    // but left the substitution in the login URL. JMeter cannot build
+    // "?state=${state_6}" into a URI, so that request is never sent.
     const xml = `<?xml version="1.0"?><jmeterTestPlan><hashTree>
       <HTTPSamplerProxy testname="SC01_T01 - GET /u/login/identifier" enabled="true">
         <stringProp name="HTTPSampler.path">/u/login/identifier?state=\${state_6}</stringProp>
@@ -10670,41 +10669,37 @@ test('unresolvable vars: a ${var} with no producer is restored, not sent to JMet
       <HTTPSamplerProxy testname="SC01_T09 - GET /u/login/identifier" enabled="false">
         <stringProp name="HTTPSampler.path">/u/login/identifier?state=\${state_9}</stringProp>
       </HTTPSamplerProxy><hashTree/>
+      <HTTPSamplerProxy testname="SC01_T02 - GET /ok" enabled="true">
+        <stringProp name="HTTPSampler.path">/ok?csrf=\${csrf_1}&amp;n=\${__UUID}</stringProp>
+        <stringProp name="RegexExtractor.refname">csrf_1</stringProp>
+      </HTTPSamplerProxy><hashTree/>
     </hashTree></jmeterTestPlan>`;
 
-    const entries = [
-        { request: { method: 'GET', url: 'https://app.test/u/login/identifier?state=hKFo2SBZTjMtLVlF', headers: [] },
-            response: { status: 200, content: { mimeType: 'text/html', text: 'ok' } } },
-    ];
-
-    // Only the ENABLED sampler is a problem. The disabled one never runs, so
-    // reporting it would be noise and rewriting it would edit a dead request.
-    assert.deepEqual([...undefinedVarsUsed(xml)], ['state_6']);
-
-    const fixed = repairDeadExtractorConsumers(xml, entries);
-    assert.equal(fixed.restored.length, 1);
-    assert.equal(fixed.restored[0].var, 'state_6');
-    assert.deepEqual([...undefinedVarsUsed(fixed.xml)], [], 'nothing unresolvable survives in an enabled sampler');
-    assert.match(fixed.xml, /state=hKFo2SBZTjMtLVlF/, 'the recorded literal is restored');
-    assert.match(fixed.xml, /state=\$\{state_9\}/, 'the disabled sampler is left alone');
+    const found = [...undefinedVarsUsed(xml)];
+    assert.deepEqual(found, ['state_6'], 'only the enabled sampler with no producer');
+    // A disabled sampler never runs, so its unresolvable var is inert.
+    assert.ok(!found.includes('state_9'));
+    // A var the plan DOES define, and a JMeter function, are both fine.
+    assert.ok(!found.includes('csrf_1'));
+    assert.ok(!found.includes('__UUID'));
 });
 
-test('unresolvable vars: a query parameter falls back to its recorded value', () => {
+test('unresolvable vars: the recorded literal is NOT substituted in', () => {
+    // Measured against real JMeter on the createtask flow: substituting the
+    // recorded value removed 2 URISyntaxException but turned a passing request
+    // into a 403 — a stale per-session token is not "not sent", it is "sent and
+    // rejected". Net 34 passed -> 33. Reporting keeps the better script.
     const { repairDeadExtractorConsumers } = require('../src/transforms');
-    // No positional match and no prefix/suffix evidence on this sampler, but the
-    // recording carries that parameter elsewhere. Keeping the recorded literal
-    // is the call the OAuth pass already makes: a stale token gets a visible
-    // rejection from the server, where a bare ${var} is never sent at all.
     const xml = `<?xml version="1.0"?><jmeterTestPlan><hashTree>
-      <HTTPSamplerProxy testname="Step 40 - GET /authorize" enabled="true">
-        <stringProp name="HTTPSampler.path">/authorize?state=\${state_42}</stringProp>
+      <HTTPSamplerProxy testname="Step 01 - GET /u/login/identifier" enabled="true">
+        <stringProp name="HTTPSampler.path">/u/login/identifier?state=\${state_6}</stringProp>
       </HTTPSamplerProxy><hashTree/>
     </hashTree></jmeterTestPlan>`;
     const entries = [
-        { request: { method: 'GET', url: 'https://app.test/somewhere/else?state=RECORDED_STATE_VALUE', headers: [] },
+        { request: { method: 'GET', url: 'https://app.test/u/login/identifier?state=STALE_RECORDED', headers: [] },
             response: { status: 200, content: { mimeType: 'text/html', text: 'ok' } } },
     ];
-    const fixed = repairDeadExtractorConsumers(xml, entries);
-    assert.match(fixed.xml, /state=RECORDED_STATE_VALUE/);
-    assert.doesNotMatch(fixed.xml, /\$\{state_42\}/);
+    const out = repairDeadExtractorConsumers(xml, entries);
+    assert.match(out.xml, /state=\$\{state_6\}/, 'left alone for the report to name');
+    assert.doesNotMatch(out.xml, /STALE_RECORDED/, 'a stale session token is never substituted in');
 });

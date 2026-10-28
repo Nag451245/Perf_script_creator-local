@@ -2118,27 +2118,17 @@ function generate(entriesRaw, pages, outDir, name, opts = {}) {
         `labels use SCxx_Txx_<request>-<step> format for PE spreadsheet readability`,
         `troubleshooting alignment remains available through ${name}_label_map.json`);
 
-    // LAST GUARD BEFORE WE SHIP: no ENABLED sampler may carry a ${var} that
-    // nothing defines. Earlier passes each repair their own damage, but a later
-    // pass can re-introduce a reference after that cleanup has run — and the
-    // casualty is not a soft failure. JMeter cannot build a URI containing a
-    // literal "${state_6}", so the request is never sent; when that request is
-    // the login, every subsequent result is noise from a flow that never
-    // started. This runs last on purpose, after every rewrite.
-    const finalDeadFix = repairDeadExtractorConsumers(xml, flat);
-    if (finalDeadFix.restored.length) {
-        xml = finalDeadFix.xml;
+    // A ${var} nothing defines means JMeter cannot even build that request's
+    // URI, so it is never sent. Name them: it is the most actionable
+    // correlation gap there is. Do NOT substitute the recorded literal — that
+    // was measured and cost a passing request, because a stale per-session
+    // token is not "not sent", it is "sent and rejected".
+    const unresolvable = [...undefinedVarsUsed(xml)];
+    if (unresolvable.length) {
         note('unresolvable-vars',
-            `${finalDeadFix.restored.length} consumer field(s) referenced a variable nothing in the plan defines`,
-            finalDeadFix.restored.map(r => `\${${r.var}} in "${r.sampler}"`).slice(0, 6).join('; '),
-            'restored the recorded literal at each — a stale value gets a diagnosable rejection, a bare ${var} in a URL is never sent at all');
-    }
-    const stillUnresolvable = [...undefinedVarsUsed(xml)];
-    if (stillUnresolvable.length) {
-        note('unresolvable-vars',
-            `${stillUnresolvable.length} variable(s) remain undefined in an ENABLED sampler: ${stillUnresolvable.join(', ')}`,
-            'no recorded literal could be recovered for them',
-            'these requests will fail to send — treat as a correlation gap, not a server problem');
+            `${unresolvable.length} variable(s) have no producer: ${unresolvable.join(', ')}`,
+            'an enabled sampler references them, nothing in the plan defines them',
+            'JMeter cannot build those requests, so they are never sent — correlate these before reading anything into the rest of the run');
     }
 
     // Re-validate after our edits so reported stats reflect what we ship.
